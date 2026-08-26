@@ -5,18 +5,18 @@
 # Path to the official proton-drive binary. Leave as-is to find it on $PATH.
 binary = "proton-drive"
 # Flags appended to `filesystem upload` so an existing remote file is overwritten
-# when the local copy changed. The exact spelling varies by CLI version - run
-# `neutronsync doctor` if uploads misbehave. Known variants:
-#   ["--conflict-strategy", "replace"]      (Proton blog example)
-#   ["-f", "replace", "-d", "merge"]        (early community wrapper)
-upload_flags = ["--conflict-strategy", "replace"]
+# when the local copy changed. cli-drive ≥ 0.8.0 uses separate file/folder
+# strategies (the old --conflict-strategy flag was removed). Legacy configs with
+# --conflict-strategy are rewritten on load.
+upload_flags = ["--file-conflict-strategy", "replace", "--folder-conflict-strategy", "replace"]
 # Concurrent folder-listers for the remote tree scan (0 = auto, capped at 8).
 # scan_threads = 8
 # Concurrent file downloads during a sync (0 = auto, ~4). Downloads are
 # bandwidth-bound, so more isn't always faster and can hit rate limits.
 # download_threads = 4
-# download also prompts without a strategy; overwrite the local copy on download.
-download_flags = ["--conflict-strategy", "replace"]
+# download also prompts without a strategy; overwrite the local copy on download
+# (0.8 renamed the overwrite strategy from replace → remove).
+download_flags = ["--file-conflict-strategy", "remove", "--folder-conflict-strategy", "remove"]
 # Optional: force where the CLI stores your session credentials.
 # One of "keychain", "pass", "unsafe_file". Omit to use the CLI default.
 # credentials_store = "keychain"

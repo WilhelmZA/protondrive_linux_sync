@@ -330,17 +330,8 @@ impl EventSink for StateSink {
             }
             SyncEvent::Auth { signed_in } => {
                 s.signed_out = !*signed_in;
-                if *signed_in {
-                    s.push(
-                        ActivityKind::Info,
-                        "Signed back in to Proton — resuming sync".to_string(),
-                    );
-                } else {
-                    s.push(
-                        ActivityKind::Error,
-                        "Signed out of Proton — sign in on the Account tab to resume".to_string(),
-                    );
-                }
+                // Banner-only: auth state is not a file operation and clutters
+                // the activity feed if logged here.
             }
             SyncEvent::Info { text } => s.push(ActivityKind::Info, text.clone()),
             SyncEvent::Error { pair, text } => {
@@ -426,7 +417,7 @@ impl Controller {
             watch_stop: Mutex::new(None),
             stats,
         };
-        c.refresh_account();
+        c.refresh_account(false);
         c
     }
 
@@ -625,18 +616,20 @@ impl Controller {
     }
 
     /// Refresh the account panel (binary present? logged in? version) on a
-    /// background thread.
-    pub fn refresh_account(&self) {
+    /// background thread. When `signal_watch` is true and the probe confirms a
+    /// session, nudge the tray daemon's watcher to resume immediately.
+    pub fn refresh_account(&self, signal_watch: bool) {
         let cfg = self.cfg.lock().unwrap().clone();
         let state = self.state.clone();
         state.lock().unwrap().account.checking = true;
         thread::spawn(move || {
             let proton = ProtonCli::new(&cfg);
+            let signed_in = proton.list_dir(&cfg.remote_root).is_ok();
             let account = match proton.resolve_binary() {
                 Some(p) => AccountState {
                     checked: true,
                     binary_found: true,
-                    signed_in: proton.list_dir(&cfg.remote_root).is_ok(),
+                    signed_in,
                     version: format!("{} ({})", proton.version(), p.display()),
                     checking: false,
                 },
@@ -648,7 +641,18 @@ impl Controller {
                     checking: false,
                 },
             };
-            state.lock().unwrap().account = account;
+            {
+                let mut s = state.lock().unwrap();
+                s.account = account;
+                if signed_in {
+                    s.signed_out = false;
+                } else if s.account.binary_found {
+                    s.signed_out = true;
+                }
+            }
+            if signal_watch && signed_in {
+                crate::auth_signal::signal(&cfg.state_dir);
+            }
         });
     }
 }

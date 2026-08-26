@@ -1000,6 +1000,25 @@ impl<'a, R: Remote> Engine<'a, R> {
                 }
                 return;
             }
+            // Same byte size but different mtimes: usually metadata drift (a
+            // download/touch, or Proton's claimedModificationTime vs a local
+            // clock), not a real dual edit. Emitting keep-both here multiplies
+            // conflict copies forever. Prefer size equality; if both sides carry
+            // sha1 and they differ, fall through to a real conflict.
+            if let (Some(a), Some(b)) = (le, re) {
+                if a.size == b.size && a.size > 0 {
+                    let sha_clash = matches!(
+                        (&a.sha1, &b.sha1),
+                        (Some(x), Some(y)) if x != y
+                    );
+                    if !sha_clash {
+                        if let Some(e) = le {
+                            new_base.insert(path.to_string(), e.clone());
+                        }
+                        return;
+                    }
+                }
+            }
             self.emit_conflict(path, le, re, plan, new_base);
             return;
         }

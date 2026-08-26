@@ -421,14 +421,36 @@ fn self_exe() -> std::ffi::OsString {
         .unwrap_or_else(|_| "neutronsync-gui".into())
 }
 
+/// Propagate session-related env vars to a child process. Autostart and manual
+/// spawns must reach the OS keyring via D-Bus; without these the CLI reports
+/// "No session loaded" even when the user is signed in elsewhere.
+fn inherit_session_env(cmd: &mut std::process::Command) {
+    for key in [
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XDG_RUNTIME_DIR",
+        "SSH_AUTH_SOCK",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+    ] {
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
+}
+
 /// Launch a detached GUI window process (no `--tray`).
 fn spawn_window() {
-    let _ = std::process::Command::new(self_exe()).spawn();
+    let mut cmd = std::process::Command::new(self_exe());
+    inherit_session_env(&mut cmd);
+    let _ = cmd.spawn();
 }
 
 /// Launch a detached headless tray daemon (`--tray`).
 fn spawn_daemon() {
-    let _ = std::process::Command::new(self_exe()).arg("--tray").spawn();
+    let mut cmd = std::process::Command::new(self_exe());
+    cmd.arg("--tray");
+    inherit_session_env(&mut cmd);
+    let _ = cmd.spawn();
 }
 
 /// Terminate the open GUI window process, if any. Used by the tray "Quit" so a
@@ -969,7 +991,14 @@ impl eframe::App for App {
             if self.mode_daemon {
                 match Controller::read_status(&self.cfg.state_dir) {
                     Some(mut pubd) => {
-                        pubd.account = mine.account;
+                        pubd.account = mine.account.clone();
+                        // The window probes auth directly; trust it over the
+                        // daemon's possibly stale signed_out flag (up to 20s lag
+                        // without a refresh signal).
+                        if mine.account.checked {
+                            pubd.signed_out =
+                                mine.account.binary_found && !mine.account.signed_in;
+                        }
                         pubd
                     }
                     None => mine,
@@ -989,7 +1018,7 @@ impl eframe::App for App {
             if snap.account.signed_in || now > until {
                 self.login_poll_until = None;
             } else if now - self.last_account_poll > 2.5 && !snap.account.checking {
-                self.ctrl.refresh_account();
+                self.ctrl.refresh_account(true);
                 self.last_account_poll = now;
             }
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -1399,7 +1428,12 @@ impl App {
             .activity
             .iter()
             .rev()
-            .filter(|a| a.op.is_some() || a.kind == ActivityKind::Error)
+            .filter(|a| {
+                a.op.is_some()
+                    || (a.kind == ActivityKind::Error
+                        && !a.text.starts_with("Signed out of Proton")
+                        && !a.text.starts_with("Signed back in to Proton"))
+            })
             .collect();
         let has_files = rows.iter().any(|a| a.op.is_some());
         if snap.active.is_empty() && rows.is_empty() {
@@ -1439,7 +1473,7 @@ impl App {
                 for item in &rows {
                     match &item.op {
                         Some(op) => {
-                            if let Some(act) = activity_row(ui, op, item.ts) {
+                            if let Some(act) = activity_row(ui, op, item.ts, &item.text) {
                                 if let Some(root) = locals.get(&op.pair) {
                                     open_target = Some(match act {
                                         Open::File => root.join(&op.path),
@@ -1899,7 +1933,7 @@ impl App {
             .clicked()
             {
                 self.last_account_poll = ui.ctx().input(|i| i.time);
-                self.ctrl.refresh_account();
+                self.ctrl.refresh_account(false);
             }
             if checking {
                 ui.add_space(4.0);
@@ -2314,7 +2348,7 @@ impl App {
                                 .clicked()
                             {
                                 self.last_account_poll = ui.ctx().input(|i| i.time);
-                                self.ctrl.refresh_account();
+                                self.ctrl.refresh_account(false);
                             }
                         });
                     } else if button(
@@ -2328,7 +2362,7 @@ impl App {
                     .clicked()
                     {
                         self.last_account_poll = ui.ctx().input(|i| i.time);
-                        self.ctrl.refresh_account();
+                        self.ctrl.refresh_account(false);
                     }
                     if waiting {
                         ui.add_space(14.0);
@@ -2353,9 +2387,10 @@ impl App {
     fn launch_login(&self) {
         let bin = self.cfg.binary.clone();
         thread::spawn(move || {
-            let _ = std::process::Command::new(&bin)
-                .args(["auth", "login"])
-                .status();
+            let mut cmd = std::process::Command::new(&bin);
+            cmd.args(["auth", "login"]);
+            inherit_session_env(&mut cmd);
+            let _ = cmd.status();
         });
     }
 
@@ -2364,7 +2399,7 @@ impl App {
         let now = ctx.input(|i| i.time);
         self.login_poll_until = Some(now + 180.0);
         self.last_account_poll = now;
-        self.ctrl.refresh_account();
+        self.ctrl.refresh_account(false);
         self.toast(
             ctx,
             "Login opened in your browser — the app updates once you're signed in.",
@@ -2401,7 +2436,7 @@ impl App {
                         if button(ui, None, "Log out", Btn::Danger, false, true).clicked() {
                             let proton = ProtonCli::new(&self.cfg);
                             let _ = proton.logout();
-                            self.ctrl.refresh_account();
+                            self.ctrl.refresh_account(false);
                             self.confirm_logout = false;
                             self.toast(ctx, "Logged out.", false);
                         }
@@ -2805,7 +2840,25 @@ fn active_row(ui: &mut egui::Ui, op: &ActivityOp) {
     ui.add_space(4.0);
 }
 
-fn activity_row(ui: &mut egui::Ui, op: &ActivityOp, ts: i64) -> Option<Open> {
+/// Text to show for a failed operation. Older rows stored `ok=false` without an
+/// `error` column; fall back to the stored line text or a generic label.
+fn op_error_text(op: &ActivityOp, line: &str) -> Option<String> {
+    if op.ok {
+        return None;
+    }
+    if let Some(e) = op.error.as_deref().filter(|e| !e.is_empty()) {
+        return Some(e.to_string());
+    }
+    // op_text() for failures is "action path: reason" when reason was captured.
+    if let Some((_, reason)) = line.rsplit_once(": ") {
+        if !reason.is_empty() && !reason.starts_with(&op.action) {
+            return Some(reason.to_string());
+        }
+    }
+    Some("failed".into())
+}
+
+fn activity_row(ui: &mut egui::Ui, op: &ActivityOp, ts: i64, line: &str) -> Option<Open> {
     let a = op.action.to_lowercase();
     let (icon, base) = if a.contains("rename") || a.contains("move") {
         (Icon::Arrow, ACCENT)
@@ -2838,10 +2891,11 @@ fn activity_row(ui: &mut egui::Ui, op: &ActivityOp, ts: i64) -> Option<Open> {
         name_clicked = r.clicked();
         // A failed row says why on the row itself: the reason used to live only
         // in sync.log, so the feed showed a red filename and nothing else.
-        if let Some(err) = op.error.as_deref().filter(|e| !e.is_empty()) {
+        if let Some(err) = op_error_text(op, line) {
             ui.add_space(6.0);
+            let tip = err.clone();
             ui.add(egui::Label::new(RichText::new(err).size(11.5).color(DANGER)).truncate())
-                .on_hover_text(err);
+                .on_hover_text(tip);
         }
     });
     ui.add_space(4.0);
@@ -3209,8 +3263,18 @@ fn combo_compare(ui: &mut egui::Ui, v: &mut Compare) -> bool {
 fn starter_config(path: &PathBuf) -> Config {
     Config {
         binary: "proton-drive".into(),
-        upload_flags: vec!["--conflict-strategy".into(), "replace".into()],
-        download_flags: vec!["--conflict-strategy".into(), "replace".into()],
+        upload_flags: vec![
+            "--file-conflict-strategy".into(),
+            "replace".into(),
+            "--folder-conflict-strategy".into(),
+            "replace".into(),
+        ],
+        download_flags: vec![
+            "--file-conflict-strategy".into(),
+            "remove".into(),
+            "--folder-conflict-strategy".into(),
+            "remove".into(),
+        ],
         credentials_store: None,
         fresh_cache: true,
         scan_threads: 0,

@@ -25,7 +25,7 @@ The official `proton-drive` CLI can upload, download, list, and manage sharing, 
 ## Requirements
 
 - Linux with a recent Rust toolchain (edition 2021) if building from source.
-- The official `proton-drive` CLI on your `PATH` (<https://proton.me/blog/proton-drive-cli>). Verified against `cli-drive 0.6.0`.
+- The official `proton-drive` CLI on your `PATH` (<https://proton.me/blog/proton-drive-cli>). Verified against `cli-drive 0.8.0`.
 - `gio` (from glib, present on most desktops) for recoverable local deletes; a manual XDG-trash fallback is used if it is missing.
 
 ## Install
@@ -113,8 +113,8 @@ TOML at `~/.config/neutronsync/neutronsync.toml` (override with `-c PATH` or `$N
 ```toml
 [cli]
 binary = "proton-drive"
-upload_flags = ["--conflict-strategy", "replace"]
-download_flags = ["--conflict-strategy", "replace"]
+upload_flags = ["--file-conflict-strategy", "replace", "--folder-conflict-strategy", "replace"]
+download_flags = ["--file-conflict-strategy", "remove", "--folder-conflict-strategy", "remove"]
 fresh_cache = true            # throwaway metadata cache per run (avoids stale listings)
 # credentials_store = "keychain"   # keychain | pass | unsafe_file
 

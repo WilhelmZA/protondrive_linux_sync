@@ -38,6 +38,9 @@ const FULL_WALK_MAX_SECS: u64 = 6 * 3600;
 /// While signed out, re-probe the proton-drive session no more often than this,
 /// so a logged-out daemon idles cheaply instead of spawning a probe every tick.
 const AUTH_REPROBE_SECS: i64 = 20;
+/// While signed in, still probe occasionally so an expired session is caught
+/// before a full walk starts spamming per-folder errors.
+const AUTH_KEEPALIVE_SECS: i64 = 300;
 
 /// Outcome of a cheap auth probe. `Unknown` (a non-auth error, e.g. a network
 /// blip) is deliberately distinct from `SignedOut` so a transient failure never
@@ -339,6 +342,7 @@ pub fn watch_with(
     // real work — re-probing on a throttle until the session is back.
     let mut signed_out = matches!(probe_auth(&reload_cfg(cfg, log)), AuthProbe::SignedOut);
     let mut last_auth_probe = now_epoch();
+    let state_dir = cfg.state_dir.clone();
     if signed_out {
         note_auth(events, log, false);
     }
@@ -437,10 +441,13 @@ pub fn watch_with(
             }
 
             // Auth gate: while signed out, do no sync work; re-probe on a
-            // throttle and resume the moment the session is back.
+            // throttle (or immediately when the GUI signals a fresh login) and
+            // resume the moment the session is back.
             if signed_out {
                 walk_cancel.store(true, Ordering::Relaxed);
-                if now_epoch() - last_auth_probe >= AUTH_REPROBE_SECS {
+                let auth_due = crate::auth_signal::take(&state_dir)
+                    || now_epoch() - last_auth_probe >= AUTH_REPROBE_SECS;
+                if auth_due {
                     last_auth_probe = now_epoch();
                     if let AuthProbe::SignedIn = probe_auth(&reload_cfg(cfg, log)) {
                         signed_out = false;
@@ -452,6 +459,19 @@ pub fn watch_with(
                 if signed_out {
                     thread::sleep(Duration::from_millis(500));
                     continue;
+                }
+            } else {
+                let auth_due = crate::auth_signal::take(&state_dir)
+                    || now_epoch() - last_auth_probe >= AUTH_KEEPALIVE_SECS;
+                if auth_due {
+                    last_auth_probe = now_epoch();
+                    if let AuthProbe::SignedOut = probe_auth(&reload_cfg(cfg, log)) {
+                        signed_out = true;
+                        walk_cancel.store(true, Ordering::Relaxed);
+                        note_auth(events, log, false);
+                        thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
                 }
             }
 

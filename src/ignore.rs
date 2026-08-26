@@ -79,6 +79,9 @@ pub const DEFAULT_IGNORE: &[&str] = &[
     ".dropbox",
     ".dropbox.cache",
     ".dropbox.attr",
+    // NeutronSync keep-both copies — never re-sync them or they nest forever
+    // ("file (conflict …) (conflict …).pdf").
+    "*(conflict *)*",
 ];
 
 /// Whether `rel` (a POSIX path relative to a pair root) should be ignored as
@@ -169,5 +172,13 @@ mod tests {
         assert!(!is_ignored_junk("notes/synced-plan.md")); // contains "sync" but not a component
         assert!(!is_ignored_junk("music/track.tmp3")); // not a .tmp extension
         assert!(!is_ignored_junk(""));
+        // NeutronSync conflict copies must be ignored (or they re-sync and nest)
+        assert!(is_ignored_junk(
+            "_Actuarial/record (conflict 20260826-062245).pdf"
+        ));
+        assert!(is_ignored_junk(
+            "a/b (conflict 20260826-052833) (conflict 20260826-053140).pdf"
+        ));
+        assert!(!is_ignored_junk("_Actuarial/record.pdf"));
     }
 }

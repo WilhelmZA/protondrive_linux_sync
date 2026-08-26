@@ -1,18 +1,22 @@
-//! Adapter over Proton's official `proton-drive` CLI (verified: cli-drive 0.6.0).
+//! Adapter over Proton's official `proton-drive` CLI (verified: cli-drive 0.8.0).
 //!
 //! This is the ONLY module that shells out to the binary or knows its exact
 //! command spellings and JSON shape. Facts baked in here:
 //!   * `filesystem list -j PATH` (JSON), global `-j` AFTER the subcommand.
-//!   * `filesystem upload [-c STRATEGY] LOCAL... PARENT` (dest = parent).
-//!   * `filesystem download [-c STRATEGY] PATH... LOCALFOLDER` (dest = folder).
+//!   * `filesystem upload [-f STRATEGY] [-d STRATEGY] LOCAL... PARENT` (dest = parent).
+//!   * `filesystem download [-f STRATEGY] [-d STRATEGY] PATH... LOCALFOLDER` (dest = folder).
 //!     Both upload AND download prompt interactively without a strategy.
+//!     cli-drive ≥ 0.8.0 dropped the unified `--conflict-strategy` / `-c` flag;
+//!     upload overwrite is `replace`, download overwrite is `remove`.
 //!   * `filesystem create-folder PARENT NAME`; `filesystem trash PATH`
 //!     (recoverable) vs `filesystem delete` (permanent - never used).
 //!   * The CLI caches directory metadata and serves it STALE, so we point it at
 //!     a throwaway `PROTON_DRIVE_CACHE_DIR` per run (see `Config::fresh_cache`).
 //!   * `list -j` node: {uid, type:"file"|"folder", name:{ok,value},
-//!       activeRevision:{ok,value:{claimedSize, claimedModificationTime,
-//!       claimedDigests:{sha1}}}}. totalStorageSize is the ENCRYPTED size.
+//!       activeRevision: either the revision object itself (cli-drive ≥ 0.8) or
+//!       {ok,value:{claimedSize, claimedModificationTime, claimedDigests:{sha1}}}
+//!       (≤ 0.7). totalStorageSize is the ENCRYPTED size and must not be used
+//!       as content size.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -368,8 +372,7 @@ impl ProtonCli {
             let is_dir = is_folder(row);
             let (mut size, mut mtime, mut sha1) = (0u64, None, None);
             if !is_dir {
-                let rev = ok_value(row.get("activeRevision"));
-                if let Some(rev) = rev {
+                if let Some(rev) = active_revision(row) {
                     size = num_u64(rev.get("claimedSize")).unwrap_or(0);
                     mtime = parse_time(rev.get("claimedModificationTime"));
                     sha1 = rev
@@ -378,9 +381,10 @@ impl ProtonCli {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
                 }
+                // Never fall back to totalStorageSize: that is the ENCRYPTED
+                // size and would make every file look modified vs local content.
                 if size == 0 {
-                    size = num_u64(get_val(row, &["claimedSize", "size", "totalStorageSize"]))
-                        .unwrap_or(0);
+                    size = num_u64(get_val(row, &["claimedSize", "size"])).unwrap_or(0);
                 }
                 if mtime.is_none() {
                     mtime = parse_time(row.get("modificationTime"));
@@ -704,6 +708,24 @@ fn ok_value(v: Option<&Value>) -> Option<&Value> {
     }
 }
 
+/// The revision object for a file node. cli-drive ≤ 0.7 wrapped it as
+/// `{ "ok": true, "value": { claimedSize, ... } }`; ≥ 0.8 puts the fields
+/// directly on `activeRevision`. Accept both so a CLI upgrade can't make every
+/// file look modified (missing claimedSize used to fall through to the
+/// encrypted totalStorageSize).
+fn active_revision(row: &Value) -> Option<&Value> {
+    let v = row.get("activeRevision")?;
+    if let Some(inner) = ok_value(Some(v)) {
+        return Some(inner);
+    }
+    if v.as_object()
+        .is_some_and(|o| o.contains_key("claimedSize") || o.contains_key("storageSize"))
+    {
+        return Some(v);
+    }
+    None
+}
+
 fn extract_name(row: &Value) -> Option<String> {
     match row.get("name") {
         Some(Value::Object(_)) => ok_value(row.get("name"))
@@ -821,7 +843,7 @@ fn is_safe_component(name: &str) -> bool {
 /// a literal backslash is doubled inside one (`\` -> `[\\]`) so it isn't read as
 /// an escape. The result matches exactly the original path, so the CLI resolves
 /// it back to the real name (the remote node keeps the correct name). Verified
-/// against cli-drive 0.6.0 for all of `\ * ? [ {`.
+/// against cli-drive 0.8.0 for all of `\ * ? [ {`.
 ///
 /// A quoted path is a pattern, so it must EXIST — a path with no metacharacters
 /// is returned untouched and stays literal, and every caller here passes a path
@@ -891,7 +913,7 @@ fn is_executable(p: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{glob_quote_local, is_not_logged_in, is_safe_component};
+    use super::{glob_quote_local, is_not_logged_in, is_safe_component, ProtonCli};
 
     #[test]
     fn glob_quotes_local_metacharacters() {
@@ -949,5 +971,54 @@ mod tests {
         assert!(!is_safe_component("a/b")); // embedded separator
         assert!(!is_safe_component("a\\b"));
         assert!(!is_safe_component("x\0y")); // NUL
+    }
+
+    #[test]
+    fn parses_cli_08_inline_active_revision() {
+        // cli-drive 0.8 dropped the {ok,value} envelope around activeRevision.
+        // If we miss that, claimedSize is lost and totalStorageSize (encrypted)
+        // would be used instead — every file then looks modified forever.
+        let raw = r#"[
+          {
+            "uid": "u1",
+            "type": "file",
+            "name": {"ok": true, "value": "invoice.pdf"},
+            "modificationTime": "2026-08-26T06:17:58.000Z",
+            "totalStorageSize": 190037,
+            "activeRevision": {
+              "claimedSize": 189950,
+              "claimedModificationTime": "2025-04-26T13:45:48.000Z",
+              "claimedDigests": {"sha1": "abc"}
+            }
+          }
+        ]"#;
+        let entries = ProtonCli::parse_list(raw, "/my-files").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "invoice.pdf");
+        assert_eq!(entries[0].size, 189950);
+        assert_eq!(entries[0].mtime, Some(1745675148));
+        assert_eq!(entries[0].sha1.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn parses_legacy_wrapped_active_revision() {
+        let raw = r#"[
+          {
+            "uid": "u1",
+            "type": "file",
+            "name": {"ok": true, "value": "old.pdf"},
+            "totalStorageSize": 999,
+            "activeRevision": {
+              "ok": true,
+              "value": {
+                "claimedSize": 100,
+                "claimedModificationTime": "2025-04-26T13:45:48.000Z"
+              }
+            }
+          }
+        ]"#;
+        let entries = ProtonCli::parse_list(raw, "/my-files").unwrap();
+        assert_eq!(entries[0].size, 100);
+        assert_eq!(entries[0].mtime, Some(1745675148));
     }
 }

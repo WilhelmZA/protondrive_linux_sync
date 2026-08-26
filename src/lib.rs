@@ -7,6 +7,7 @@
 //! The library is deliberately separate from the CLI binary so a future GUI can
 //! depend on the same core (config, engine, adapter, state).
 
+pub mod auth_signal;
 pub mod config;
 pub mod datefmt;
 pub mod engine;
@@ -31,10 +32,11 @@ pub const EXAMPLE_CONFIG: &str = r#"# neutronsync configuration. See README.md.
 # Path to the official proton-drive binary. Leave as-is to find it on $PATH.
 binary = "proton-drive"
 # Both upload and download prompt interactively without a conflict strategy,
-# which would hang a scheduled run - so we always pass one. Values:
-# merge, keep-both, replace, skip.
-upload_flags = ["--conflict-strategy", "replace"]
-download_flags = ["--conflict-strategy", "replace"]
+# which would hang a scheduled run - so we always pass one. cli-drive ≥ 0.8.0
+# splits file and folder strategies; upload overwrites with replace, download
+# with remove (the 0.8 name for the same overwrite).
+upload_flags = ["--file-conflict-strategy", "replace", "--folder-conflict-strategy", "replace"]
+download_flags = ["--file-conflict-strategy", "remove", "--folder-conflict-strategy", "remove"]
 # The CLI caches directory metadata and serves it stale; a throwaway cache per
 # run keeps listings honest. Set false to reuse the CLI's cache (faster, risky).
 fresh_cache = true

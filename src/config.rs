@@ -371,12 +371,14 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
 
     Ok(Config {
         binary: cli.binary.unwrap_or_else(|| "proton-drive".to_string()),
-        upload_flags: cli
-            .upload_flags
-            .unwrap_or_else(|| vec!["--conflict-strategy".into(), "replace".into()]),
-        download_flags: cli
-            .download_flags
-            .unwrap_or_else(|| vec!["--conflict-strategy".into(), "replace".into()]),
+        upload_flags: migrate_transfer_flags(
+            cli.upload_flags.unwrap_or_else(default_upload_flags),
+            TransferKind::Upload,
+        ),
+        download_flags: migrate_transfer_flags(
+            cli.download_flags.unwrap_or_else(default_download_flags),
+            TransferKind::Download,
+        ),
         credentials_store,
         fresh_cache: cli.fresh_cache.unwrap_or(true),
         scan_threads: cli.scan_threads.map(|n| n as usize).unwrap_or(0),
@@ -398,6 +400,92 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         pairs,
         source_path: Some(path),
     })
+}
+
+/// Defaults for cli-drive ≥ 0.8.0: separate file/folder strategies. Upload
+/// `replace` trashes the remote and writes the local copy; download uses
+/// `remove` (the 0.8 name for the same overwrite behaviour — `replace` is gone).
+fn default_upload_flags() -> Vec<String> {
+    vec![
+        "--file-conflict-strategy".into(),
+        "replace".into(),
+        "--folder-conflict-strategy".into(),
+        "replace".into(),
+    ]
+}
+
+fn default_download_flags() -> Vec<String> {
+    vec![
+        "--file-conflict-strategy".into(),
+        "remove".into(),
+        "--folder-conflict-strategy".into(),
+        "remove".into(),
+    ]
+}
+
+enum TransferKind {
+    Upload,
+    Download,
+}
+
+/// Rewrite pre-0.8 `--conflict-strategy` / `-c` flags into the split
+/// `--file-conflict-strategy` / `--folder-conflict-strategy` form. Configs that
+/// already use the new flags (or omit the legacy ones) are left alone.
+fn migrate_transfer_flags(flags: Vec<String>, kind: TransferKind) -> Vec<String> {
+    let mut out = Vec::with_capacity(flags.len().max(4));
+    let mut legacy: Option<String> = None;
+    let mut i = 0;
+    while i < flags.len() {
+        let f = &flags[i];
+        if f == "--conflict-strategy" || f == "-c" {
+            if let Some(v) = flags.get(i + 1) {
+                legacy = Some(v.clone());
+                i += 2;
+                continue;
+            }
+        }
+        out.push(f.clone());
+        i += 1;
+    }
+    let Some(old) = legacy else {
+        return if out.is_empty() {
+            match kind {
+                TransferKind::Upload => default_upload_flags(),
+                TransferKind::Download => default_download_flags(),
+            }
+        } else {
+            out
+        };
+    };
+    // Already has explicit -f/-d: drop the obsolete -c only.
+    let has_split = out.iter().any(|f| {
+        f == "--file-conflict-strategy"
+            || f == "-f"
+            || f == "--folder-conflict-strategy"
+            || f == "-d"
+    });
+    if has_split {
+        return out;
+    }
+    let (file, folder) = match (&kind, old.as_str()) {
+        (TransferKind::Upload, "replace") => ("replace", "replace"),
+        (TransferKind::Upload, "keep-both") => ("rename", "rename"),
+        (TransferKind::Upload, "skip") => ("skip", "skip"),
+        (TransferKind::Upload, "merge") => ("create-new-revision", "merge"),
+        (TransferKind::Download, "replace") => ("remove", "remove"),
+        (TransferKind::Download, "keep-both") => ("rename", "rename"),
+        (TransferKind::Download, "skip") => ("skip", "skip"),
+        (TransferKind::Download, "merge") => ("rename", "merge"),
+        (TransferKind::Upload, _) => ("replace", "replace"),
+        (TransferKind::Download, _) => ("remove", "remove"),
+    };
+    out.extend([
+        "--file-conflict-strategy".into(),
+        file.into(),
+        "--folder-conflict-strategy".into(),
+        folder.into(),
+    ]);
+    out
 }
 
 /// Path helper used by the engine to build absolute remote paths.
@@ -548,4 +636,57 @@ pub fn save(cfg: &Config, path: &Path) -> Result<()> {
     }
     std::fs::write(path, to_toml(cfg)?).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{migrate_transfer_flags, TransferKind};
+
+    #[test]
+    fn migrates_legacy_conflict_strategy_upload() {
+        let got = migrate_transfer_flags(
+            vec!["--conflict-strategy".into(), "replace".into()],
+            TransferKind::Upload,
+        );
+        assert_eq!(
+            got,
+            vec![
+                "--file-conflict-strategy",
+                "replace",
+                "--folder-conflict-strategy",
+                "replace",
+            ]
+        );
+    }
+
+    #[test]
+    fn migrates_legacy_conflict_strategy_download() {
+        let got = migrate_transfer_flags(
+            vec!["-c".into(), "replace".into()],
+            TransferKind::Download,
+        );
+        assert_eq!(
+            got,
+            vec![
+                "--file-conflict-strategy",
+                "remove",
+                "--folder-conflict-strategy",
+                "remove",
+            ]
+        );
+    }
+
+    #[test]
+    fn leaves_split_flags_alone() {
+        let flags = vec![
+            "--file-conflict-strategy".into(),
+            "replace".into(),
+            "--folder-conflict-strategy".into(),
+            "merge".into(),
+        ];
+        assert_eq!(
+            migrate_transfer_flags(flags.clone(), TransferKind::Upload),
+            flags
+        );
+    }
 }

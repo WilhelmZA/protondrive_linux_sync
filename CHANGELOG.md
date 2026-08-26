@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Fixed
+- cli-drive 0.8.0 changed the `filesystem list -j` shape: `activeRevision` is no longer wrapped in `{ok,value}`, so NeutronSync missed `claimedSize` / `claimedModificationTime` and fell back to the encrypted `totalStorageSize`. Every file then looked modified and the watcher re-uploaded (and conflict-copied) the tree. Both JSON shapes are accepted now, and encrypted size is never used as content size.
+- After that thrash, same-size files with drifted mtimes were still treated as dual edits and keep-both multiplied conflict copies. Same size (unless both sha1s disagree) now refreshes the baseline instead of conflicting, and `*(conflict *)*` names are ignored so conflict copies cannot re-enter sync.
+
+### Changed
+- Targets Proton Drive CLI **0.8.0**. That release dropped `--conflict-strategy`; upload/download now use separate `--file-conflict-strategy` / `--folder-conflict-strategy` flags (download overwrite is `remove`, not `replace`). Defaults and the example config were updated, and configs that still have the old `-c` / `--conflict-strategy` form are rewritten on load so existing installs keep working after you upgrade the CLI.
+
 ### Added
 - `scripts/promote.sh X.Y.Z` promotes a pre-release to stable, and `--demote` puts it back. GitHub carries only two badges, "Latest" on a single release and "Pre-release" on each flagged one, so a stable release that is not the newest stable shows nothing at all. The script therefore clears the pre-release flag, moves the "Latest" badge, and marks the title `NeutronSync vX.Y.Z (stable)` so the distinction stays visible down the list.
 - `scripts/release.sh` cuts a release in one command: it bumps the version in `Cargo.toml` and `Cargo.lock`, closes the changelog's `[Unreleased]` section as `## [x.y.z] - <date>`, commits, and creates the signed tag. It refuses to run on a dirty tree, on a version that already exists, or on an empty `[Unreleased]`, and it stops before pushing, so nothing reaches GitHub without a deliberate `git push`. `--dry-run` prints the release body it would publish.
