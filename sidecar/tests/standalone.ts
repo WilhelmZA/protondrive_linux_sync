@@ -1,9 +1,10 @@
 import { mkdtemp, rename, rm, readdir } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import assert from 'node:assert/strict';
 
 const root = resolve(import.meta.dir, '..');
-const directory = await mkdtemp('/tmp/opencode/neutronsync-standalone-');
+const directory = await mkdtemp(join(tmpdir(), 'neutronsync-standalone-'));
 const modules = join(root, 'node_modules');
 const hidden = join(directory, 'dependencies-aside');
 const cwd = join(directory, 'empty');
