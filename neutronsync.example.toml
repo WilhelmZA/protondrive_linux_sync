@@ -51,13 +51,15 @@ compare = "size+mtime"
 # The GUI offers 6 h, 12 h, 1 day and 7 days. Ignored when backend = "cli".
 # full_walk_interval = 86400
 
-# Legacy CLI watch pacing (ignored on the API backend):
-#   poll_interval - floor for the adaptive full rescan
+# Watch pacing shared by both backends:
 #   scan_interval - short re-check of "hot" folders
 #   debounce - how long a burst of local file events settles before syncing
-# poll_interval = 900
 # scan_interval = 120
 # debounce = 2
+
+# Legacy CLI only (ignored on the API backend): floor for the adaptive full rescan.
+# The API backend uses full_walk_interval instead.
+# poll_interval = 900
 
 # GUI preferences (also toggled from Settings; saved back here automatically).
 #   auto_sync    - start the watch daemon on launch and keep it running.
