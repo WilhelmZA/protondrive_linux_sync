@@ -24,7 +24,7 @@ The official `proton-drive` CLI can upload, download, list, and manage sharing, 
 
 ## Remote backend
 
-The default backend is `cli`. Phase 1 adds an optional `api` backend using the `neutronsync-drive` sidecar. Build it with `sidecar/build.sh` and use its separate signed-in session. The API backend is read-only until Phase 2: even without `--dry-run`, sync warns and only builds a plan. It leaves local files, the baseline, sync timestamps, activity history and state logs unchanged.
+The default backend is `cli`. The optional `api` backend uses one shared `neutronsync-drive` sidecar for two-way sync: folder creation, uploads, verified downloads, renames, moves and recoverable trash. Build it with `sidecar/build.sh` and use its separate signed-in session. Uploads replace same-name files with new revisions and preserve whole-second modification times. Downloads appear atomically after size and SHA-1 verification. API sync writes normal activity history and `sync.log`; use `--dry-run` to preview a plan.
 
 ```toml
 [cli]
@@ -34,7 +34,7 @@ sidecar = "/path/to/neutronsync-drive" # optional
 
 Without `sidecar`, NeutronSync looks next to its executable, then on `PATH` for `neutronsync-drive`. API sync does not require the `proton-drive` binary. All sync entry points honour the configured backend; auth probes and sign-in in the watcher, service and GUI still use the CLI in this phase.
 
-Use `neutronsync sync --dry-run --backend api` to override the config for one run. `--backend cli` selects the CLI instead. API excludes hide paths and their descendants from the plan, but Phase 1 still lists those folders remotely.
+Use `neutronsync sync --dry-run --backend api` to override the config for one run. `--backend cli` selects the CLI instead. API excludes hide paths and their descendants from the plan, but the API backend still lists those folders remotely.
 
 ## Requirements
 

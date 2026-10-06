@@ -547,12 +547,8 @@ pub fn run_sync_shallow_many(
     }
 }
 
-fn sync_logger(cfg: &Config, log: &Logger) -> Logger {
-    if cfg.backend == crate::config::Backend::Api {
-        log.without_file()
-    } else {
-        log.clone()
-    }
+fn sync_logger(_cfg: &Config, log: &Logger) -> Logger {
+    log.clone()
 }
 
 fn sync_remote(

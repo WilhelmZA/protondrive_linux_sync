@@ -43,3 +43,46 @@ The equivalence check copies `~/.local/state/neutronsync` to scratch before open
 Every one of the 1,056 API-only paths falls into an evidenced category: **151 match the engine's built-in junk rules**; **904 belong to seven top-level subtrees absent wholesale from the confirmed-sync baseline**; and **one is the web-uploaded test file changed after the last sync**. The 904 untracked paths comprise Apps (444), Other (194), Travel (156), Coding Projects (101), Public (5), Scanned Documents (3), and Screenshots (1). The raw walk includes junk, whereas the sync plan filters it. A confirmed-sync baseline records only tracked state, so it cannot establish the upload dates or historical exclusion settings of those seven omitted subtrees. This comparison establishes equivalence for its recorded subset, not equality of the two full live backends.
 
 A live CLI-versus-API comparison is not possible while the CLI session is signed out. The copied `status.json` confirms `account.signed_in: false`; the CLI session remains untouched. Full outputs, checksums, command timings, per-path differences and classifications are under `Plans/neutronsync-api-backend-phase-1/evidence/`. `live_checks.py` reproduces the measurements with scratch-only configuration; `explain_equivalence.py` classifies every recorded difference. The first combined runner reaches its external 120-second timeout during comparison; resuming against the same scratch state completes the comparison, with the final detailed comparison taking 56.181 seconds.
+
+## Phase 2
+
+Measured on 2026-10-06 with a personal test account. The isolated config is a scratch config. Its only pair uses a newly created local scratch folder and `/my-files/NeutronSync-Phase2-Test`. State and logs stay under the scratch directory. Every sync uses `--config` and runs with `dry_run: false`.
+
+- Local creation uploads two files and creates one nested folder: three operations, zero errors, 8.236 seconds.
+- Local editing creates a new revision on the same node UID: one operation, zero errors, 5.757 seconds.
+- Local rename sends `node.rename` on the original UID: one operation, zero errors, 4.156 seconds. Local move sends `node.move` on that UID: one operation, zero errors, 5.247 seconds. Captured RPCs prove neither operation trashes or re-uploads the file.
+- Local deletion sends `node.trash`: one operation, zero errors, 4.427 seconds.
+- Direct sidecar upload, rename and trash propagate locally: one operation each, zero errors, respectively 4.771, 3.373 and 3.417 seconds. The desktop trash contains the deleted file and its `.trashinfo` receipt. Deliberately incorrect upload `size` and `mtime` values are overridden by file metadata.
+- A simultaneous local and remote edit keeps both contents: one conflict operation, zero errors, 7.518 seconds.
+- All nine second syncs plan zero operations and apply zero changes. Each finishes in 3.133–3.703 seconds. All 18 syncs report zero errors.
+- Cleanup sends `node.trash` for the test folder. A subsequent resolve returns `not_found`. An independent read-only query finds its exact UID in Proton trash on the fourth page, recorded in `live-run-02/trash-confirmation.json`.
+
+The complete successful wire capture contains 20 write requests. Its UID-to-path audit asserts that every write target stays inside the test folder. These are the remote paths written, including rename and move destinations:
+
+- `/my-files/NeutronSync-Phase2-Test`
+- `/my-files/NeutronSync-Phase2-Test/nested`
+- `/my-files/NeutronSync-Phase2-Test/a.txt`
+- `/my-files/NeutronSync-Phase2-Test/nested/b.txt`
+- `/my-files/NeutronSync-Phase2-Test/renamed.txt`
+- `/my-files/NeutronSync-Phase2-Test/nested/renamed.txt`
+- `/my-files/NeutronSync-Phase2-Test/remote.txt`
+- `/my-files/NeutronSync-Phase2-Test/remote-renamed.txt`
+- `/my-files/NeutronSync-Phase2-Test/nested/renamed (conflict 20261006-105043).txt`
+
+`pgrep -af neutronsync-drive` finds the existing read-only stability monitor before and after verification: monitor PID 2778566, sidecar PID 2778568. The monitor continues under the explicit exception in the Phase 2 spec. Neither the live wire capture nor the monitor log contains `auth.signed_out` during these checks. The latest observed monitor authentication check reports `signed_in: true` at 12:46:23 local time.
+
+The recoverable-delete check returns no matches. No DELETE endpoint exception is added; the HTTP allowlist also refuses destructive POST endpoints. Exact command output:
+
+```text
+$ grep -rnE 'deleteNodes|emptyTrash|deleteRevision' sidecar/src
+
+exit: 1
+$ grep -rnE 'deleteNodes|emptyTrash|deleteRevision' src || echo "no destructive SDK calls"
+no destructive SDK calls
+
+exit: 0
+```
+
+Evidence lives in `Plans/neutronsync-api-backend-phase-2/evidence/`. `live-run-02/` holds all successful sync outputs, RPCs, write-target assertions, revision identity assertions and trash confirmation. The first attempt successfully uploads and trashes its isolated folder, then stops because the evidence runner expects JSON-only stdout. Its original outputs remain in `evidence/live-*`. The corrected runner parses the JSON after console messages and completes the full sequence.
+
+Automated checks pass: `cargo fmt --check`, `cargo clippy --all-targets --features gui`, `cargo build --release --features gui`, `cargo test`, and `bun test`. Rust reports 83 passing tests and one pre-existing ignored live helper. Bun reports 29 passing tests. The sidecar typecheck passes. Clippy reports existing warnings, with none in new code. The worker records a separate full-tree local-scanner scope question in `STATE.md`; these results do not assert that existing engine behavior has changed.

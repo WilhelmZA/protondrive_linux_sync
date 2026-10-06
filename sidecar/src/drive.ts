@@ -2,12 +2,14 @@ import { CryptoProxy } from '@protontech/crypto';
 import { getSrp, computeKeyPassword, generateKeySalt } from '@protontech/crypto/srp';
 import {
   ProtonDriveClient, MemoryCache, OpenPGPCryptoWithCryptoProxy,
-  type NodeEntity, type DriveEvent, type ProtonDriveHTTPClientJsonRequest,
+  type NodeEntity, type DriveEvent,
 } from '@protontech/drive-sdk';
 import { Account } from './account';
 import type { Auth } from './auth';
 import { Fault, classify } from './errors';
 import type { Notify, SafeLog } from './log';
+import { httpClient } from './http';
+import { Writes, type WriteClient } from './writes';
 
 export interface ReadClient {
   getMyFilesRootFolder(): Promise<NodeEntity>;
@@ -16,21 +18,10 @@ export interface ReadClient {
   iterateEvents(scope: string, since?: string): AsyncIterable<DriveEvent>;
 }
 
-export function sdkClient(auth: Auth, account: Account, log: SafeLog): ReadClient {
-  const fetchJson = async (request: ProtonDriveHTTPClientJsonRequest) => {
-    const method = request.method.toUpperCase();
-    // The SDK batches metadata reads through this POST endpoint.
-    const metadataRead = method === 'POST' && /^\/drive\/v2\/volumes\/[^/]+\/links$/.test(new URL(request.url).pathname);
-    if (method !== 'GET' && !metadataRead) throw new Fault('fatal');
-    const timeout = AbortSignal.timeout(request.timeoutMs || 30_000);
-    return auth.request(request.url, {
-      method, headers: request.headers, body: metadataRead ? JSON.stringify(request.json) : undefined,
-      signal: request.signal ? AbortSignal.any([request.signal, timeout]) : timeout,
-    }, true);
-  };
+export function sdkClient(auth: Auth, account: Account, log: SafeLog): ReadClient & WriteClient {
   const diagnostic = (level: string) => (message: unknown) => log.sdk(level, message);
   const sdk = new ProtonDriveClient({
-    httpClient: { fetchJson, fetchBlob: async () => { throw new Fault('fatal'); } },
+    httpClient: httpClient(auth),
     account, entitiesCache: new MemoryCache(), cryptoCache: new MemoryCache(),
     openPGPCryptoModule: new OpenPGPCryptoWithCryptoProxy(CryptoProxy),
     srpModule: {
@@ -41,6 +32,13 @@ export function sdkClient(auth: Auth, account: Account, log: SafeLog): ReadClien
     telemetry: { getLogger: () => ({ debug: diagnostic('debug'), info: diagnostic('debug'), warn: diagnostic('warn'), error: diagnostic('error') }), recordMetric: () => {} },
   });
   return {
+    createFolder: (...args) => sdk.createFolder(...args),
+    renameNode: (...args) => sdk.renameNode(...args),
+    moveNodes: (...args) => sdk.moveNodes(...args),
+    trashNodes: (...args) => sdk.trashNodes(...args),
+    getFileUploader: (...args) => sdk.getFileUploader(...args),
+    getFileRevisionUploader: (...args) => sdk.getFileRevisionUploader(...args),
+    getFileDownloader: (...args) => sdk.getFileDownloader(...args),
     getMyFilesRootFolder: () => sdk.getMyFilesRootFolder(),
     async getNode(uid) {
       for await (const node of sdk.iterateNodes([uid])) {
@@ -89,11 +87,12 @@ export function entry(node: NodeEntity): Entry {
   return {
     name, type: node.type as Entry['type'], size: revision?.claimedSize ?? 0,
     mtime: mtime ? Math.floor(mtime.getTime() / 1000) : null,
-    sha1: revision?.claimedDigests?.sha1 || null, uid: node.uid, parent_uid: node.parentUid ?? null,
+    sha1: revision?.claimedDigests?.sha1?.toLowerCase() || null, uid: node.uid, parent_uid: node.parentUid ?? null,
   };
 }
 
 export class Drive {
+  writes() { return new Writes(this.client as ReadClient & WriteClient, this.notify, this.log); }
   private scopes = new Map<string, { cursor?: string; timer?: ReturnType<typeof setTimeout>; active: boolean; polling?: Promise<void> }>();
   constructor(private client: ReadClient, private notify: Notify, private log: SafeLog, private pollMs = 5000, private walkConcurrency = Number(process.env.NEUTRONSYNC_DRIVE_WALK_CONCURRENCY) || 16) {}
   async resolve(path: string) {

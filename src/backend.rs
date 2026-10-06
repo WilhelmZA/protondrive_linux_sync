@@ -27,9 +27,7 @@ pub fn select(cfg: &Config) -> Result<Box<dyn Remote + Send + Sync>> {
 
 pub fn effective_dry_run(remote: &dyn Remote, requested: bool, log: &Logger) -> bool {
     if remote.read_only() && !requested {
-        log.warn(
-            "read-only backend: forcing a dry run, nothing will change (writes require Phase 2)",
-        );
+        log.warn("read-only backend: forcing a dry run, nothing will change");
     }
     requested || remote.read_only()
 }

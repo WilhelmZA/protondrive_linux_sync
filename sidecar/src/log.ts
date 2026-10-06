@@ -6,6 +6,7 @@ const safeMessages = new Set([
   'Sidecar ready', 'SDK diagnostic suppressed', 'Diagnostic suppressed',
   'Session storage unavailable', 'Event polling failed', 'Folder listing failed',
   'My-files event scope follows in events.batch',
+  'Download signature issue accepted after digest verification',
 ]);
 
 // NEUTRONSYNC_DRIVE_DEBUG=1 (local, opt-in): show the first 200 characters of string messages.

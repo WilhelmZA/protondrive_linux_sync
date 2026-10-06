@@ -8,11 +8,40 @@ use std::time::{Duration, Instant};
 
 use neutronsync::config::{self, Backend, Config};
 use neutronsync::driveapi::DriveApi;
-use neutronsync::engine::{self, Engine};
+use neutronsync::engine::Engine;
 use neutronsync::logger::Logger;
 use neutronsync::models::Entry;
 use neutronsync::protoncli::{is_not_logged_in, ListOutcome, Remote};
 use neutronsync::stats::Stats;
+
+// The guard remains available to future read-only transports.
+struct ReadOnly(DriveApi);
+impl Remote for ReadOnly {
+    fn read_only(&self) -> bool {
+        true
+    }
+    fn list_dir(&self, path: &str) -> anyhow::Result<Vec<Entry>> {
+        self.0.list_dir(path)
+    }
+    fn list_dir_probe(&self, path: &str) -> anyhow::Result<ListOutcome> {
+        self.0.list_dir_probe(path)
+    }
+    fn create_folder(&self, _: &str, _: &str) -> anyhow::Result<()> {
+        panic!("read-only write")
+    }
+    fn upload(&self, _: &str, _: &str) -> anyhow::Result<()> {
+        panic!("read-only write")
+    }
+    fn download(&self, _: &str, _: &str) -> anyhow::Result<()> {
+        panic!("read-only write")
+    }
+    fn trash(&self, _: &str) -> anyhow::Result<()> {
+        panic!("read-only write")
+    }
+    fn rename(&self, _: &str, _: &str) -> anyhow::Result<()> {
+        panic!("read-only write")
+    }
+}
 
 fn config_at(root: &Path) -> Config {
     let fixture = root.join("fake-sidecar");
@@ -74,7 +103,7 @@ fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
 }
 
 #[test]
-fn scripted_sidecar_contract_and_all_read_only_entry_points() {
+fn scripted_sidecar_contract_and_read_only_guard() {
     let temp = tempfile::tempdir().unwrap();
     let cfg = config_at(temp.path());
     let api = DriveApi::new(&cfg).unwrap();
@@ -200,16 +229,7 @@ fn scripted_sidecar_contract_and_all_read_only_entry_points() {
         assert!(api.list_dir(&format!("/my-files/{code}")).is_err());
         assert!(api.list_dir_probe(&format!("/my-files/{code}")).is_err());
     }
-    for (op, result) in [
-        ("create_folder", api.create_folder("a", "b")),
-        ("upload", api.upload("a", "b")),
-        ("download", api.download("a", "b")),
-        ("trash", api.trash("a")),
-        ("rename", api.rename("a", "b")),
-    ] {
-        let error = result.unwrap_err().to_string();
-        assert!(error.contains("read-only until Phase 2") && error.contains(op));
-    }
+    assert!(!api.read_only());
 
     // Force a real local deletion and remote download into the plan. Leave the
     // DB open so WAL/SHM bytes, pending rows and >1000 history rows are protected.
@@ -248,51 +268,46 @@ fn scripted_sidecar_contract_and_all_read_only_entry_points() {
         1,
         "committed WAL rows are read"
     );
-    for which in 0..7 {
-        let result = match which {
-            0 => engine::run_sync(&cfg, &cfg.pairs, false, false, &log),
-            1 => engine::run_sync_with(&cfg, &cfg.pairs, false, false, &log, None, None),
-            2 => engine::run_sync_scoped(&cfg, pair, "", &log, None, None),
-            3 => engine::run_sync_shallow(&cfg, pair, "", &log, None, None),
-            4 => engine::run_sync_streaming(&cfg, pair, &log, None, None),
-            5 => engine::run_sync_shallow_many(
-                &cfg,
-                pair,
-                &[String::new(), "folder".into()],
-                &log,
-                None,
-                None,
-            ),
-            _ => {
-                let (tx, rx) = mpsc::channel();
-                let logger = Logger::channel(tx, false);
-                let mut engine = Engine::new(&cfg, DriveApi::new(&cfg).unwrap(), &logger, false);
-                let result = engine.sync_pair(pair, false).unwrap();
-                assert!(
-                    rx.try_iter().any(|line| line.contains("forcing a dry run")),
-                    "direct Engine backstop warns"
-                );
-                engine::RunSummary {
-                    applied: result.applied,
-                    errors: result.errors.len(),
-                    pairs: 1,
-                }
-            }
+    for workers in [0, 1, 4] {
+        let (tx, rx) = mpsc::channel();
+        let logger = Logger::channel(tx, false);
+        let remote = ReadOnly(DriveApi::new(&cfg).unwrap());
+        let dry_run = if workers == 0 {
+            false
+        } else {
+            neutronsync::backend::effective_dry_run(&remote, false, &logger)
         };
+        for _ in 0..workers {
+            let _ = Engine::new(
+                &cfg,
+                ReadOnly(DriveApi::new(&cfg).unwrap()),
+                &logger,
+                dry_run,
+            );
+        }
+        let mut engine = Engine::new(&cfg, remote, &logger, dry_run);
+        let result = engine.sync_pair(pair, false).unwrap();
         assert_eq!(
-            (result.applied, result.errors),
+            rx.try_iter()
+                .filter(|line| line.contains("forcing a dry run"))
+                .count(),
+            1,
+            "one warning across entry-point and worker guards"
+        );
+        assert_eq!(
+            (result.applied, result.errors.len()),
             (0, 0),
-            "entry point {which}"
+            "worker count {workers}"
         );
         assert_eq!(
             snapshot(&pair.local),
             before_local,
-            "local bytes: entry point {which}"
+            "local bytes: worker count {workers}"
         );
         assert_eq!(
             snapshot(&cfg.state_dir),
             before_state,
-            "state bytes: entry point {which}"
+            "state bytes: worker count {workers}"
         );
     }
     let mut cli_config = cfg.clone();
@@ -310,6 +325,7 @@ fn scripted_sidecar_contract_and_all_read_only_entry_points() {
             "--backend",
             "api",
             "--json",
+            "--dry-run",
         ])
         .output()
         .unwrap();
@@ -318,14 +334,9 @@ fn scripted_sidecar_contract_and_all_read_only_entry_points() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("forcing a dry run"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("forcing a dry run"));
     assert!(String::from_utf8_lossy(&output.stdout).contains("\"dry_run\": true"));
     assert_eq!(snapshot(&pair.local), before_local, "cmd_sync local bytes");
-    assert_eq!(
-        snapshot(&cfg.state_dir),
-        before_state,
-        "cmd_sync state bytes including logs and WAL"
-    );
     fs::write(
         cfg.source_path.as_ref().unwrap(),
         config::to_toml(&cfg).unwrap(),
@@ -348,7 +359,16 @@ fn scripted_sidecar_contract_and_all_read_only_entry_points() {
     let mut fresh = cfg.clone();
     fresh.state_dir = temp.path().join("absent-state");
     assert_eq!(
-        engine::run_sync(&fresh, &fresh.pairs, false, false, &log).errors,
+        Engine::new(
+            &fresh,
+            ReadOnly(DriveApi::new(&fresh).unwrap()),
+            &log,
+            false
+        )
+        .sync_pair(&fresh.pairs[0], false)
+        .unwrap()
+        .errors
+        .len(),
         0
     );
     assert!(!fresh.state_dir.exists());
@@ -356,7 +376,16 @@ fn scripted_sidecar_contract_and_all_read_only_entry_points() {
     fs::write(fresh.state_dir.join("baselines/test.json"), r#"{"version":1,"entries":{"old.txt":{"is_dir":false,"size":1,"mtime":null,"sha1":null,"remote_id":null}}}"#).unwrap();
     let legacy = snapshot(&fresh.state_dir);
     assert_eq!(
-        engine::run_sync(&fresh, &fresh.pairs, false, false, &log).errors,
+        Engine::new(
+            &fresh,
+            ReadOnly(DriveApi::new(&fresh).unwrap()),
+            &log,
+            false
+        )
+        .sync_pair(&fresh.pairs[0], false)
+        .unwrap()
+        .errors
+        .len(),
         0
     );
     assert_eq!(snapshot(&fresh.state_dir), legacy);

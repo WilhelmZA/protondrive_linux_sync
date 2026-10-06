@@ -1,6 +1,6 @@
-//! Phase 1 read-only JSON-RPC backend. All instances share one lazy sidecar.
+//! JSON-RPC backend. All instances share one lazy sidecar.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 
 use crate::config::{remote_join, Config};
-use crate::models::{Entry, TreeScan};
+use crate::models::{DownloadJob, Entry, TreeScan};
 use crate::protoncli::{is_safe_component, ListOutcome, Remote};
 
 pub const SIDECAR_NAME: &str = "neutronsync-drive";
@@ -284,6 +284,7 @@ fn to_entry(raw: &Value) -> Option<Entry> {
 
 pub struct DriveApi {
     binary: PathBuf,
+    download_threads: usize,
 }
 
 impl DriveApi {
@@ -293,7 +294,10 @@ impl DriveApi {
                 "{SIDECAR_NAME} not found or not executable. Build sidecar/ or set cli.sidecar."
             )
         })?;
-        Ok(Self { binary }) // No session or process until the first read.
+        Ok(Self {
+            binary,
+            download_threads: cfg.download_threads,
+        }) // Lazy session and process.
     }
 
     pub fn status(&self) -> Result<Value> {
@@ -306,6 +310,15 @@ impl DriveApi {
         if result.get("type").and_then(Value::as_str) != Some("folder") {
             bail!(RpcError::new("conflict"));
         }
+        result
+            .get("uid")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or_else(|| anyhow!("api backend: resolve returned no uid"))
+    }
+
+    fn node(client: &Client, path: &str) -> Result<String> {
+        let result = client.call("node.resolve", json!({"path":path}))?;
         result
             .get("uid")
             .and_then(Value::as_str)
@@ -333,13 +346,20 @@ impl DriveApi {
     }
 }
 
-fn phase2(op: &str) -> anyhow::Error {
-    anyhow!("api backend is read-only until Phase 2: {op} is not supported")
+fn split_remote(path: &str) -> Result<(&str, &str)> {
+    let (parent, name) = path
+        .trim_end_matches('/')
+        .rsplit_once('/')
+        .unwrap_or(("", path));
+    if !is_safe_component(name) {
+        bail!("api backend: unsafe name");
+    }
+    Ok((parent, name))
 }
 
 impl Remote for DriveApi {
     fn read_only(&self) -> bool {
-        true
+        false
     }
     fn list_dir(&self, path: &str) -> Result<Vec<Entry>> {
         match self.probe(path)? {
@@ -350,20 +370,98 @@ impl Remote for DriveApi {
     fn list_dir_probe(&self, path: &str) -> Result<ListOutcome> {
         self.probe(path)
     }
-    fn create_folder(&self, _: &str, _: &str) -> Result<()> {
-        Err(phase2("create_folder"))
+    fn create_folder(&self, parent: &str, name: &str) -> Result<()> {
+        if !is_safe_component(name) {
+            bail!("api backend: unsafe name");
+        }
+        let client = shared(&self.binary)?;
+        let uid = Self::resolve(&client, parent)?;
+        client.call("node.create_folder", json!({"parent_uid":uid,"name":name}))?;
+        Ok(())
     }
-    fn upload(&self, _: &str, _: &str) -> Result<()> {
-        Err(phase2("upload"))
+    fn upload(&self, local: &str, parent: &str) -> Result<()> {
+        let name = Path::new(local)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow!("api backend: unsafe name"))?;
+        if !is_safe_component(name) {
+            bail!("api backend: unsafe name");
+        }
+        let client = shared(&self.binary)?;
+        let uid = Self::resolve(&client, parent)?;
+        client.call(
+            "file.upload",
+            json!({"parent_uid":uid,"name":name,"local_path":local}),
+        )?;
+        Ok(())
     }
-    fn download(&self, _: &str, _: &str) -> Result<()> {
-        Err(phase2("download"))
+    fn download(&self, remote: &str, dest: &str) -> Result<()> {
+        let (_, name) = split_remote(remote)?;
+        let client = shared(&self.binary)?;
+        let uid = Self::node(&client, remote)?;
+        client.call(
+            "file.download",
+            json!({"uid":uid,"local_path":Path::new(dest).join(name)}),
+        )?;
+        Ok(())
     }
-    fn trash(&self, _: &str) -> Result<()> {
-        Err(phase2("trash"))
+    fn trash(&self, remote: &str) -> Result<()> {
+        let client = shared(&self.binary)?;
+        let uid = Self::node(&client, remote)?;
+        client.call("node.trash", json!({"uids":[uid]}))?;
+        Ok(())
     }
-    fn rename(&self, _: &str, _: &str) -> Result<()> {
-        Err(phase2("rename"))
+    fn rename(&self, from: &str, to: &str) -> Result<()> {
+        let (fp, fname) = split_remote(from)?;
+        let (tp, tname) = split_remote(to)?;
+        let client = shared(&self.binary)?;
+        let uid = Self::node(&client, from)?;
+        if fp != tp {
+            let parent = Self::resolve(&client, tp)?;
+            client.call("node.move", json!({"uid":uid,"new_parent_uid":parent}))?;
+        }
+        if fp == tp || fname != tname {
+            client.call("node.rename", json!({"uid":uid,"new_name":tname}))?;
+        }
+        Ok(())
+    }
+
+    fn download_many(
+        &self,
+        jobs: &[DownloadJob],
+        threads: usize,
+        cancel: &AtomicBool,
+        on_start: &(dyn Fn(&DownloadJob) + Sync),
+        on_done: &(dyn Fn(&DownloadJob, std::result::Result<(), String>) + Sync),
+    ) {
+        let workers = if threads > 0 {
+            threads
+        } else if self.download_threads > 0 {
+            self.download_threads
+        } else {
+            4
+        }
+        .clamp(1, 8);
+        let queue: Mutex<VecDeque<_>> = Mutex::new(jobs.iter().collect());
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| loop {
+                    let job = {
+                        let mut queue = queue.lock().unwrap();
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        queue.pop_front()
+                    };
+                    let Some(job) = job else { break };
+                    on_start(job);
+                    let result = self
+                        .download(&job.remote_path, &job.dest_dir)
+                        .map_err(|e| e.to_string());
+                    on_done(job, result);
+                });
+            }
+        });
     }
 
     fn list_tree(

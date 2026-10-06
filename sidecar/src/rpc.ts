@@ -39,6 +39,15 @@ export async function serve(auth: Auth, getDrive: () => Promise<Drive>, close: (
         case 'auth.logout': return auth.logout();
         case 'node.resolve': return (await getDrive()).resolve(text(p, 'path'));
         case 'node.list': return (await getDrive()).list(text(p, 'uid'));
+        case 'node.create_folder': return (await getDrive()).writes().createFolder(text(p, 'parent_uid'), text(p, 'name'));
+        case 'file.upload': return (await getDrive()).writes().upload(text(p, 'parent_uid'), text(p, 'name'), text(p, 'local_path'), request.id, p.replace_uid === undefined ? undefined : text(p, 'replace_uid'));
+        case 'file.download': return (await getDrive()).writes().download(text(p, 'uid'), text(p, 'local_path'), request.id);
+        case 'node.rename': return (await getDrive()).writes().rename(text(p, 'uid'), text(p, 'new_name'));
+        case 'node.move': return (await getDrive()).writes().move(text(p, 'uid'), text(p, 'new_parent_uid'));
+        case 'node.trash': {
+          if (!Array.isArray(p.uids) || !p.uids.length || !p.uids.every((uid: unknown) => typeof uid === 'string' && uid.length)) throw new Fault('fatal');
+          return (await getDrive()).writes().trash(p.uids);
+        }
         case 'node.walk': {
           if (!Array.isArray(p.exclude_globs) || !p.exclude_globs.every((g: unknown) => typeof g === 'string')) throw new Fault('fatal');
           return (await getDrive()).walk(text(p, 'uid'), p.exclude_globs);

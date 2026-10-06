@@ -58,7 +58,7 @@ export class Auth {
     const headers = new Headers(init.headers);
     headers.set('x-pm-appversion', appVersion);
     headers.set('Accept', 'application/vnd.protonmail.v1+json');
-    if (init.body) headers.set('Content-Type', 'application/json');
+    if (init.body && !(init.body instanceof FormData)) headers.set('Content-Type', 'application/json');
     if (session) {
       headers.set('x-pm-uid', session.uid);
       headers.set('Authorization', `Bearer ${session.accessToken}`);
@@ -89,6 +89,21 @@ export class Auth {
 
   async json(path: string, init: RequestInit = {}, authenticated = true): Promise<any> {
     return this.decode(authenticated ? await this.request(path, init) : await this.raw(path, init));
+  }
+
+  // Storage hosts use SDK storage tokens, never our account session.
+  async blob(url: string, init: RequestInit): Promise<Response> {
+    const headers = new Headers(init.headers);
+    headers.delete('Authorization');
+    headers.delete('x-pm-uid');
+    headers.set('x-pm-appversion', appVersion);
+    if (new URL(url).origin === new URL(this.base).origin) {
+      const session = this.requireSession();
+      headers.set('Authorization', `Bearer ${session.accessToken}`);
+      headers.set('x-pm-uid', session.uid);
+    }
+    try { return await this.fetcher(url, { ...init, headers, redirect: 'error' }); }
+    catch { throw new Fault('transient'); }
   }
 
   /**
