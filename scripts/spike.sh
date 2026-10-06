@@ -14,13 +14,17 @@ import time
 parser = argparse.ArgumentParser(description="Read-only Phase 0 measurements. Credentials use the terminal and anonymous pipes only.")
 parser.add_argument("binary")
 parser.add_argument("--path", default="/my-files/Documents")
+parser.add_argument("--username", help="Proton username (prompted when omitted)")
+parser.add_argument("--password-cmd", help="command whose stdout is the Proton password, e.g. pass-cli item view ... --field password")
+parser.add_argument("--totp-cmd", help="command whose stdout is the current 6-digit TOTP code")
 parser.add_argument("--duration", type=float, default=86400, help="session observation seconds (default: 24 hours)")
 args = parser.parse_args()
-terminal = open('/dev/tty', 'r+')
+tty_in = open('/dev/tty', 'r')
+terminal = open('/dev/tty', 'w')
 def prompt(message):
     terminal.write(message)
     terminal.flush()
-    return terminal.readline().rstrip('\n')
+    return tty_in.readline().rstrip('\n')
 
 process = subprocess.Popen([args.binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None, text=True, bufsize=1)
 messages = queue.Queue()
@@ -28,6 +32,7 @@ notifications = []
 signouts = 0
 scope = None
 sequence = 0
+walk_progress = {'entries': 0, 'folders': 0, 'shown': 0.0, 'start': 0.0}
 def reader():
     try:
         for line in process.stdout:
@@ -60,16 +65,45 @@ def rpc(method, params=None, timeout=3600):
             if 'error' in value:
                 raise RuntimeError('RPC failed: ' + value['error'].get('data', {}).get('code', 'fatal'))
             return value['result']
-        # Walk entries are counted by the sidecar and do not need storage here.
+        if value.get('method') == 'walk.entry':
+            walk_progress['entries'] += 1
+            if value['params']['entry']['type'] == 'folder':
+                walk_progress['folders'] += 1
+            if received - walk_progress['shown'] >= 5:
+                walk_progress['shown'] = received
+                terminal.write(f"  walking: {walk_progress['folders']} folders, {walk_progress['entries']} entries, {received - walk_progress['start']:.0f} s\n")
+                terminal.flush()
         if value.get('method') == 'events.batch':
             notifications.append((received, value))
 
 try:
     if not rpc('auth.status')['signed_in']:
-        username = prompt('Proton username: ')
-        result = rpc('auth.login', {'username': username, 'password': getpass.getpass('Proton password: ', stream=terminal)})
+        username = args.username or prompt('Proton username: ')
+        if args.password_cmd:
+            fetched = subprocess.run(args.password_cmd, shell=True, stdout=subprocess.PIPE, stderr=None, text=True)
+            if fetched.returncode != 0:
+                raise RuntimeError('--password-cmd failed')
+            password = fetched.stdout.rstrip('\n')
+            if not password:
+                raise RuntimeError('--password-cmd returned nothing')
+        else:
+            password = getpass.getpass('Proton password: ', stream=terminal)
+        result = rpc('auth.login', {'username': username, 'password': password})
+        if result.get('need_human_verification'):
+            terminal.write('Proton wants human verification. Open this link in a browser and complete it:\n  ' + result['url'] + '\n')
+            pasted = prompt('Press Enter when done (or paste a token if the page shows one): ').strip()
+            result = rpc('auth.login', {'username': username, 'password': password, 'hv_token': pasted or result['token'], 'hv_type': 'captcha'})
+            if result.get('need_human_verification'):
+                raise RuntimeError('Human verification was not accepted')
         if result.get('need_2fa'):
-            result = rpc('auth.submit_2fa', {'code': getpass.getpass('TOTP code: ', stream=terminal)})
+            if args.totp_cmd:
+                fetched = subprocess.run(args.totp_cmd, shell=True, stdout=subprocess.PIPE, stderr=None, text=True)
+                code = fetched.stdout.strip() if fetched.returncode == 0 else ''
+                if not code:
+                    raise RuntimeError('--totp-cmd failed')
+            else:
+                code = getpass.getpass('TOTP code: ', stream=terminal)
+            result = rpc('auth.submit_2fa', {'code': code})
         if result.get('need_mailbox_password'):
             result = rpc('auth.submit_mailbox_password', {'password': getpass.getpass('Mailbox password: ', stream=terminal)})
         if not result.get('ok'):
@@ -79,10 +113,13 @@ try:
     print('| --- | --- | --- | --- |', flush=True)
     for label, target in [('Cold walk', 'under 120 s'), ('Warm walk', 'under 30 s')]:
         start = time.monotonic()
+        walk_progress.update(entries=0, folders=0, shown=start, start=start)
         result = rpc('node.walk', {'uid': uid, 'exclude_globs': []})
         elapsed = time.monotonic() - start
         print(f"| {label} | {target} | {elapsed:.3f} s | folders={result['folders']}; failed={len(result['failed'])} |", flush=True)
         if result['failed']:
+            for path, code in zip(result['failed'], result.get('failed_codes', [])):
+                terminal.write(f'  failed folder: {path or "(root)"} [{code}]\n')
             raise RuntimeError('Walk is partial; do not use its timing as a successful reading')
     rpc('events.subscribe', {'scope_id': '/my-files'})
     print('My-files SDK tree-event scope ID: ' + str(scope), flush=True)

@@ -47,7 +47,7 @@ test('compiled binary implements the complete RPC contract against fake HTTP', a
     const list = await call('node.list', { uid: 'documents' });
     expect(list.result.entries).toHaveLength(2);
     expect(list.result.entries[1]).toMatchObject({ mtime: null, sha1: null });
-    expect((await call('node.walk', { uid: 'root', exclude_globs: ['**/unknown.txt'] })).result).toEqual({ folders: 2, failed: [] });
+    expect((await call('node.walk', { uid: 'root', exclude_globs: ['**/unknown.txt'] })).result).toEqual({ folders: 2, failed: [], failed_codes: [] });
     expect(notifications.filter(n => n.method === 'walk.entry').map(n => n.params.uid)).toEqual(['documents', 'file']);
     expect((await call('events.subscribe', { scope_id: '/my-files' })).result).toEqual({ ok: true, last_event_id: 'event-0' });
     expect(notifications.some(n => n.method === 'events.batch' && n.params.scope_id === 'sdk-scope-id')).toBe(true);

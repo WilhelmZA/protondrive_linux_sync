@@ -1,5 +1,5 @@
 import { createInterface } from 'node:readline';
-import type { Auth } from './auth';
+import { hvTypes, type Auth, type HvType } from './auth';
 import type { Drive } from './drive';
 import { Fault, classify } from './errors';
 import type { Notify } from './log';
@@ -27,7 +27,12 @@ export async function serve(auth: Auth, getDrive: () => Promise<Drive>, close: (
       const p = request.params ?? {};
       if (!p || typeof p !== 'object' || Array.isArray(p)) throw new Fault('fatal');
       switch (request.method) {
-        case 'auth.login': return auth.login(text(p, 'username'), text(p, 'password'));
+        case 'auth.login': {
+          if (p.hv_token === undefined) return auth.login(text(p, 'username'), text(p, 'password'));
+          const type = p.hv_type ?? 'captcha';
+          if (typeof type !== 'string' || !hvTypes.includes(type)) throw new Fault('fatal');
+          return auth.login(text(p, 'username'), text(p, 'password'), { token: text(p, 'hv_token'), type: type as HvType });
+        }
         case 'auth.submit_2fa': return auth.submit2fa(text(p, 'code'));
         case 'auth.submit_mailbox_password': return auth.submitMailbox(text(p, 'password'));
         case 'auth.status': return auth.status();
@@ -54,6 +59,12 @@ export async function serve(auth: Auth, getDrive: () => Promise<Drive>, close: (
       } else { await authQueue; result = await run(); }
       respond({ result });
     } catch (error) {
+      // Opt-in diagnostics for unexpected (non-Fault) errors: name and stack frames only, no message text.
+      if (process.env.NEUTRONSYNC_DRIVE_DEBUG === '1' && !(error instanceof Fault)) {
+        const e = error as { name?: string; stack?: string } | null;
+        const frames = (e?.stack ?? '').split('\n').filter(l => l.trim().startsWith('at ')).slice(0, 4).map(l => l.trim());
+        process.stderr.write(JSON.stringify({ debug: 'error', method: request.method, name: e?.name ?? typeof error, frames }) + '\n');
+      }
       const fault = classify(error);
       respond({ error: { code: codes[fault.code], message: fault.message, data: { code: fault.code, ...(fault.retry_after === undefined ? {} : { retry_after: fault.retry_after }) } } });
     }

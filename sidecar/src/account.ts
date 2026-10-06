@@ -1,4 +1,4 @@
-import { CryptoProxy, VERIFICATION_STATUS, type PrivateKeyReference } from '@protontech/crypto';
+import { CryptoProxy, VERIFICATION_STATUS, type PrivateKeyReference, type PublicKeyReference } from '@protontech/crypto';
 import { Api } from '@protontech/crypto/proxy/endpoint/api.ts';
 import type { ProtonDriveAccount, ProtonDriveAccountAddress } from '@protontech/drive-sdk';
 import type { Auth } from './auth';
@@ -53,9 +53,29 @@ export class Account implements ProtonDriveAccount {
     if (!address) throw new Fault('auth');
     return address;
   }
-  async getPublicKeys(email: string) {
-    const data = await this.auth.json(`/core/v4/keys?Email=${encodeURIComponent(email)}`);
-    return Promise.all((data.Keys ?? []).map((key: { PublicKey: string }) => CryptoProxy.importPublicKey({ armoredKey: key.PublicKey })));
+  // The SDK asks for the signer's keys once per node it verifies; without this cache a walk
+  // sends one keys request per file, almost all for the same few addresses, and gets rate limited.
+  private publicKeys = new Map<string, Promise<PublicKeyReference[]>>();
+  getPublicKeys(email: string) {
+    const key = email.toLowerCase();
+    let keys = this.publicKeys.get(key);
+    if (!keys) {
+      keys = this.fetchPublicKeys(email);
+      keys.catch(() => this.publicKeys.delete(key));
+      this.publicKeys.set(key, keys);
+    }
+    return keys;
+  }
+  private async fetchPublicKeys(email: string): Promise<PublicKeyReference[]> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const data = await this.auth.json(`/core/v4/keys?Email=${encodeURIComponent(email)}`);
+        return Promise.all((data.Keys ?? []).map((key: { PublicKey: string }) => CryptoProxy.importPublicKey({ armoredKey: key.PublicKey })));
+      } catch (error) {
+        if (!(error instanceof Fault) || error.code !== 'rate_limited' || attempt >= 4) throw error;
+        await Bun.sleep(Math.max(1, error.retry_after ?? 10) * 1000);
+      }
+    }
   }
   async hasProtonAccount(email: string) { return (await this.getPublicKeys(email)).length > 0; }
 }

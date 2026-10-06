@@ -20,6 +20,10 @@ export function fixture() {
     const body: any = request.method === 'POST' ? await request.json() : {};
     if (path === '/auth/v4/info') { account = body.Username; return reply({ Code: 1000, SRPSession: 'fake-session' }); }
     if (path === '/auth/v4') {
+      if (account === 'needs-hv' && request.headers.get('x-pm-human-verification-token') !== 'hv-token') {
+        return reply({ Code: 9001, Error: 'password-secret', Details: { HumanVerificationToken: 'hv-token', HumanVerificationMethods: ['captcha', 'bogus'] } }, 422);
+      }
+      if (account === 'needs-hv' && request.headers.get('x-pm-human-verification-token-type') !== 'captcha') return reply({}, 422);
       if (body.ClientProof === 'bad-proof') return reply({ Error: 'bad-password' }, 401);
       return reply({ Code: 1000, UID: 'session-uid', AccessToken: 'access-secret', RefreshToken: 'refresh-secret', ServerProof: btoa(account === 'bad-server' ? 'wrong-proof' : 'fake-server-proof'), ExpiresIn: 3600, PasswordMode: account.includes('two-password') ? 2 : 1, '2FA': { Enabled: account.includes('totp') ? 1 : 0 } });
     }

@@ -47,6 +47,23 @@ describe('authentication over fake HTTP', () => {
       expect(h.store.value?.keyPassphrase).toBe('salted-mailbox-secret');
     }
   });
+  test('human verification returns the verify URL, then login succeeds with the token', async () => {
+    const h = harness();
+    const first = await h.auth.login('needs-hv', 'password-secret');
+    expect(first).toEqual({ need_human_verification: true, token: 'hv-token', methods: ['captcha'], url: 'https://verify.proton.me/?methods=captcha&token=hv-token' });
+    expect(h.auth.status().signed_in).toBe(false);
+    expect(h.store.value).toBeNull();
+    expect(JSON.stringify(first)).not.toContain('password-secret');
+    expect(await h.auth.login('needs-hv', 'password-secret', { token: 'hv-token', type: 'captcha' })).toEqual({ ok: true });
+    expect(h.auth.status().signed_in).toBe(true);
+  });
+  test('passthrough hands 429 and 5xx responses to the SDK instead of throwing', async () => {
+    const h = harness();
+    await h.auth.login('normal', 'password-secret');
+    expect((await h.auth.request('/fixture/node/limited', {}, true)).status).toBe(429);
+    expect((await h.auth.request('/fixture/node/transient', {}, true)).status).toBe(503);
+    await expect(h.auth.request('/fixture/node/limited')).rejects.toMatchObject({ code: 'rate_limited' });
+  });
   test('bad password and bad server proof never create a session', async () => {
     const h = harness();
     await expect(h.auth.login('normal', 'bad-password')).rejects.toMatchObject({ code: 'auth' });

@@ -26,9 +26,9 @@ export function sdkClient(auth: Auth, account: Account, log: SafeLog): ReadClien
     return auth.request(request.url, {
       method, headers: request.headers, body: metadataRead ? JSON.stringify(request.json) : undefined,
       signal: request.signal ? AbortSignal.any([request.signal, timeout]) : timeout,
-    });
+    }, true);
   };
-  const diagnostic = () => log.write('debug', 'SDK diagnostic suppressed');
+  const diagnostic = (level: string) => (message: unknown) => log.sdk(level, message);
   const sdk = new ProtonDriveClient({
     httpClient: { fetchJson, fetchBlob: async () => { throw new Fault('fatal'); } },
     account, entitiesCache: new MemoryCache(), cryptoCache: new MemoryCache(),
@@ -38,7 +38,7 @@ export function sdkClient(auth: Auth, account: Account, log: SafeLog): ReadClien
       computeKeyPassword, generateKeySalt,
       getSrpVerifier: async () => { throw new Fault('fatal'); },
     },
-    telemetry: { getLogger: () => ({ debug: diagnostic, info: diagnostic, warn: diagnostic, error: diagnostic }), recordMetric: () => {} },
+    telemetry: { getLogger: () => ({ debug: diagnostic('debug'), info: diagnostic('debug'), warn: diagnostic('warn'), error: diagnostic('error') }), recordMetric: () => {} },
   });
   return {
     getMyFilesRootFolder: () => sdk.getMyFilesRootFolder(),
@@ -95,7 +95,7 @@ export function entry(node: NodeEntity): Entry {
 
 export class Drive {
   private scopes = new Map<string, { cursor?: string; timer?: ReturnType<typeof setTimeout>; active: boolean; polling?: Promise<void> }>();
-  constructor(private client: ReadClient, private notify: Notify, private log: SafeLog, private pollMs = 5000) {}
+  constructor(private client: ReadClient, private notify: Notify, private log: SafeLog, private pollMs = 5000, private walkConcurrency = Number(process.env.NEUTRONSYNC_DRIVE_WALK_CONCURRENCY) || 16) {}
   async resolve(path: string) {
     const parts = path.split('/').filter(Boolean);
     if (parts.shift() !== 'my-files' || parts.some(p => p === '.' || p === '..')) throw new Fault('not_found');
@@ -122,32 +122,43 @@ export class Drive {
     const queue = [{ uid, path: '' }];
     const seen = new Set<string>();
     const failed: string[] = [];
+    const failed_codes: string[] = [];
     let folders = 0;
-    while (queue.length) {
-      const chunk = queue.splice(0, 8);
-      const results = await Promise.allSettled(chunk.map(async folder => {
-        if (seen.has(folder.uid)) { failed.push(folder.path); return; }
-        seen.add(folder.uid);
-        try {
-          const { entries } = await this.list(folder.uid);
-          folders++;
-          for (const child of entries) {
-            const path = folder.path ? `${folder.path}/${child.name}` : child.name;
-            if (globs.some(g => g.match(path) || (child.type === 'folder' && g.match(`${path}/`)))) continue;
-            this.notify('walk.entry', { uid: child.uid, parent_uid: folder.uid, entry: child });
-            if (child.type === 'folder') queue.push({ uid: child.uid, path });
-          }
-        } catch (error) {
-          const fault = classify(error);
-          if (fault.code === 'auth' || folder.uid === uid) throw fault;
-          failed.push(folder.path);
-          this.log.write('warn', 'Folder listing failed');
+    let fatal: unknown;
+    // A pool, not fixed chunks: a slow folder never holds the other workers idle.
+    const visit = async (folder: { uid: string; path: string }) => {
+      if (seen.has(folder.uid)) { failed.push(folder.path); failed_codes.push('cycle'); return; }
+      seen.add(folder.uid);
+      try {
+        const { entries } = await this.list(folder.uid);
+        folders++;
+        for (const child of entries) {
+          const path = folder.path ? `${folder.path}/${child.name}` : child.name;
+          if (globs.some(g => g.match(path) || (child.type === 'folder' && g.match(`${path}/`)))) continue;
+          this.notify('walk.entry', { uid: child.uid, parent_uid: folder.uid, entry: child });
+          if (child.type === 'folder') queue.push({ uid: child.uid, path });
         }
-      }));
-      const rejected = results.find(result => result.status === 'rejected');
-      if (rejected?.status === 'rejected') throw rejected.reason;
-    }
-    return { folders, failed };
+      } catch (error) {
+        const fault = classify(error);
+        if (fault.code === 'auth' || folder.uid === uid) { fatal ??= fault; return; }
+        failed.push(folder.path);
+        failed_codes.push(fault.code);
+        this.log.write('warn', 'Folder listing failed');
+      }
+    };
+    await new Promise<void>(resolve => {
+      let active = 0;
+      const pump = () => {
+        while (fatal === undefined && active < this.walkConcurrency && queue.length) {
+          active++;
+          void visit(queue.shift()!).finally(() => { active--; pump(); });
+        }
+        if (active === 0 && (fatal !== undefined || !queue.length)) resolve();
+      };
+      pump();
+    });
+    if (fatal !== undefined) throw fatal;
+    return { folders, failed, failed_codes };
   }
   async subscribe(scope: string, since?: string) {
     // The path alias allows the spike to discover the SDK scope without adding an RPC method.

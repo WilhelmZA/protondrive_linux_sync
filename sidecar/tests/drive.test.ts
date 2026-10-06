@@ -50,6 +50,6 @@ test('walk excludes globs, streams entries and records failed subfolders', async
     async *iterateEvents() {},
   };
   const drive = new Drive(client, (_method, params) => notifications.push(params), new SafeLog(() => {}));
-  expect(await drive.walk('root', ['**/*.txt'])).toEqual({ folders: 2, failed: ['broken'] });
+  expect(await drive.walk('root', ['**/*.txt'])).toEqual({ folders: 2, failed: ['broken'], failed_codes: ['fatal'] });
   expect(notifications.map(n => n.entry.name)).toEqual(['Documents', 'broken']);
 });

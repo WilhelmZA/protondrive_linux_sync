@@ -5,6 +5,15 @@ import { Fault, httpFault } from './errors';
 import type { Notify, SafeLog } from './log';
 import type { Session, SessionStore } from './store';
 
+// Opt-in diagnostics: path, HTTP status and numeric API code only. Never message text or bodies.
+const apiDebug = process.env.NEUTRONSYNC_DRIVE_DEBUG === '1';
+function debugApi(response: Response, code: unknown) {
+  if (!apiDebug) return;
+  let path = '?';
+  try { path = new URL(response.url).pathname; } catch {}
+  process.stderr.write(JSON.stringify({ debug: 'api', path, status: response.status, code: typeof code === 'number' ? code : null }) + '\n');
+}
+
 export const appVersion = `external-drive-neutronsync@${version}-dev`;
 export type Fetch = (url: string, init: RequestInit) => Promise<Response>;
 export interface AuthCrypto {
@@ -13,7 +22,10 @@ export interface AuthCrypto {
   unlock: (auth: Auth, passphrase: string) => Promise<void>;
 }
 type Pending = { session: Session; password: string; twoPassword: boolean; totp: boolean };
-type LoginResult = { ok: true } | { need_2fa: true } | { need_mailbox_password: true };
+type HumanVerification = { need_human_verification: true; url: string; token: string; methods: string[] };
+type LoginResult = { ok: true } | { need_2fa: true } | { need_mailbox_password: true } | HumanVerification;
+export type HvType = 'captcha' | 'email' | 'sms';
+export const hvTypes: readonly string[] = ['captcha', 'email', 'sms'];
 
 export class Auth {
   session: Session | null = null;
@@ -57,11 +69,18 @@ export class Auth {
   }
 
   private async decode(response: Response): Promise<any> {
-    if (!response.ok) throw httpFault(response.status, response.headers.get('retry-after'));
+    if (!response.ok) {
+      if (apiDebug) {
+        const body = await response.clone().json().catch(() => ({})) as { Code?: unknown };
+        debugApi(response, body.Code);
+      }
+      throw httpFault(response.status, response.headers.get('retry-after'));
+    }
     let data: any;
     try { data = await response.json(); } catch { throw new Fault('fatal'); }
     // Do not expose server-provided Error/Details, which can echo credentials.
     if (data.Code !== undefined && data.Code !== 1000 && data.Code !== 1001) {
+      debugApi(response, data.Code);
       if (data.Code === 9001) throw new Fault('auth');
       throw new Fault('fatal');
     }
@@ -72,7 +91,13 @@ export class Auth {
     return this.decode(authenticated ? await this.request(path, init) : await this.raw(path, init));
   }
 
-  async request(path: string, init: RequestInit = {}): Promise<Response> {
+  /**
+   * Authenticated request with single-flight 401 refresh.
+   * `passthrough` returns non-OK responses (429, 5xx, API errors) unchanged, for the SDK:
+   * its apiService does its own retry-after, 5xx retry and error-code parsing, and cannot
+   * do any of that if this layer throws first.
+   */
+  async request(path: string, init: RequestInit = {}, passthrough = false): Promise<Response> {
     if (this.retryAt > Date.now()) await Bun.sleep(this.retryAt - Date.now());
     if (!this.session) throw new Fault('auth');
     const session = this.session;
@@ -87,7 +112,7 @@ export class Auth {
       response = await this.raw(path, init, this.session);
       if (response.status === 401) { await this.signOut(); throw new Fault('auth'); }
     }
-    if (!response.ok) {
+    if (!response.ok && !passthrough) {
       const fault = httpFault(response.status, response.headers.get('retry-after'));
       if (fault.code === 'rate_limited') this.retryAt = Date.now() + (fault.retry_after ?? 60) * 1000;
       throw fault;
@@ -130,15 +155,27 @@ export class Auth {
     return this.refreshFlight;
   }
 
-  async login(username: string, password: string): Promise<LoginResult> {
+  async login(username: string, password: string, hv?: { token: string; type: HvType }): Promise<LoginResult> {
     await this.logout();
     const info = await this.json('/auth/v4/info', { method: 'POST', body: JSON.stringify({ Username: username, Intent: 'Proton' }) }, false);
     let proof: Awaited<ReturnType<typeof getSrp>>;
     try { proof = await this.crypto.proof(info, { username, password }); }
     catch { throw new Fault('auth'); }
-    const data = await this.json('/auth/v4', {
-      method: 'POST', body: JSON.stringify({ Username: username, ClientEphemeral: proof.clientEphemeral, ClientProof: proof.clientProof, SRPSession: info.SRPSession }),
-    }, false);
+    const headers: Record<string, string> = hv ? { 'x-pm-human-verification-token': hv.token, 'x-pm-human-verification-token-type': hv.type } : {};
+    const response = await this.raw('/auth/v4', {
+      method: 'POST', headers, body: JSON.stringify({ Username: username, ClientEphemeral: proof.clientEphemeral, ClientProof: proof.clientProof, SRPSession: info.SRPSession }),
+    });
+    // 9001: Proton wants human verification. Surface only the token and methods, never other Details.
+    if (response.status === 422) {
+      const body = await response.clone().json().catch(() => ({})) as { Code?: number; Details?: { HumanVerificationToken?: unknown; HumanVerificationMethods?: unknown } };
+      const token = body.Details?.HumanVerificationToken;
+      if (body.Code === 9001 && typeof token === 'string' && token) {
+        const offered = Array.isArray(body.Details?.HumanVerificationMethods) ? body.Details.HumanVerificationMethods.filter((m): m is string => typeof m === 'string' && hvTypes.includes(m)) : [];
+        const methods = offered.length ? offered : ['captcha'];
+        return { need_human_verification: true, token, methods, url: `https://verify.proton.me/?methods=${methods.join(',')}&token=${encodeURIComponent(token)}` };
+      }
+    }
+    const data = await this.decode(response);
     const expected = Buffer.from(proof.expectedServerProof, 'base64');
     const actual = Buffer.from(data.ServerProof ?? '', 'base64');
     if (!expected.length || expected.length !== actual.length || !timingSafeEqual(expected, actual) || !data.UID || !data.AccessToken || !data.RefreshToken) throw new Fault('auth');
