@@ -149,6 +149,7 @@ pub(super) fn watch(
     let mut probe_at = 0;
     let mut next_full = now_epoch() + cfg.full_walk_interval as i64;
     let mut batches = VecDeque::<EventBatch>::new();
+    let mut acked: Option<String> = None;
     let mut pending = BTreeSet::new();
     let mut retry = (String::new(), 0usize);
     let mut refresh_failed = false;
@@ -215,17 +216,37 @@ pub(super) fn watch(
                     }
                 }
             };
-            match pairs
-                .iter()
-                .map(|p| feed.resolve_root(&p.remote))
-                .collect::<Result<Vec<_>>>()
-            {
-                Ok(r) => roots = r,
-                Err(e) => {
-                    log.warn(&format!("watch: root resolution failed: {e}"));
-                    continue;
+            // A pair whose remote folder does not exist yet (never synced) must
+            // not block the other pairs. Its empty root never matches a uid, so
+            // its events map through node_path, and a walk creates the folder.
+            let mut missing_roots = BTreeSet::new();
+            let mut resolved = Vec::new();
+            let mut root_error = None;
+            for (i, p) in pairs.iter().enumerate() {
+                match feed.resolve_root(&p.remote) {
+                    Ok(uid) => resolved.push(uid),
+                    Err(e)
+                        if e.downcast_ref::<crate::driveapi::RpcError>()
+                            .is_some_and(|e| e.code == "not_found") =>
+                    {
+                        log.info(&format!(
+                            "watch: remote folder for {:?} does not exist yet; a walk will create it",
+                            p.name
+                        ));
+                        missing_roots.insert(i);
+                        resolved.push(String::new());
+                    }
+                    Err(e) => {
+                        root_error = Some(e);
+                        break;
+                    }
                 }
             }
+            if let Some(e) = root_error {
+                log.warn(&format!("watch: root resolution failed: {e}"));
+                continue;
+            }
+            roots = resolved;
             scope = subscription.scope_id;
             refresh_failed = false;
             if let Some(cause) = cause {
@@ -238,6 +259,20 @@ pub(super) fn watch(
                     log.warn(&format!("watch: cursor acknowledgement failed: {e}"));
                     continue;
                 }
+            }
+            if cause.is_none()
+                && !missing_roots.is_empty()
+                && !full_walk(
+                    cfg,
+                    pairs,
+                    &missing_roots,
+                    "missing_root",
+                    log,
+                    stop,
+                    events,
+                )
+            {
+                continue;
             }
             if signed_out {
                 note_auth(events, log, true);
@@ -270,7 +305,14 @@ pub(super) fn watch(
                     }
                 }
                 Ok(Some(FeedMessage::Batch(batch))) => {
-                    if batch.scope_id == scope {
+                    // The sidecar re-sends an unacknowledged batch on every poll, so
+                    // a long walk queues many copies. Keep one, and skip any batch
+                    // already acknowledged.
+                    let duplicate = batches
+                        .iter()
+                        .any(|b| b.last_event_id == batch.last_event_id)
+                        || (batch.last_event_id.is_some() && batch.last_event_id == acked);
+                    if batch.scope_id == scope && !duplicate {
                         batches.push_back(batch);
                     }
                 }
@@ -389,7 +431,12 @@ pub(super) fn watch(
             }
             if success {
                 match save_ack(&stats, feed, &scope, batch.last_event_id.as_deref()) {
-                    Ok(()) => retry = (String::new(), 0),
+                    Ok(()) => {
+                        retry = (String::new(), 0);
+                        acked = batch.last_event_id.clone();
+                        // Drop queued copies of the batch that was just acknowledged.
+                        batches.retain(|b| b.last_event_id != acked);
+                    }
                     Err(e) => {
                         log.warn(&format!("watch: cursor acknowledgement failed: {e}"));
                         success = false;

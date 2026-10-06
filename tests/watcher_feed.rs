@@ -471,3 +471,32 @@ fn refused_resume_cursor_runs_one_resume_gap_walk() {
     assert_eq!(h.local("a/file"), "cursor-gap");
     assert_eq!(h.log().matches("cause=resume_gap").count(), 1);
 }
+#[test]
+fn missing_pair_root_does_not_block_the_feed() {
+    let mut h = Harness::new();
+    let mut tree = h.tree();
+    for uid in ["test", "a", "b"] {
+        tree.as_object_mut().unwrap().remove(uid);
+    }
+    h.write("tree.json", tree);
+    h.ready();
+    assert!(h.log().contains("does not exist yet"), "{}", h.log());
+    assert!(!h.log().contains("root resolution failed"), "{}", h.log());
+}
+#[test]
+fn duplicate_deliveries_of_one_batch_apply_once() {
+    let mut h = Harness::new();
+    h.ready();
+    h.file("a", "x.txt", "hello");
+    let batch = json!({"last_event_id":"1","events":[{"type":"node_created","node_uid":"file","parent_uid":"a"}]});
+    h.write("feed.json", json!([batch.clone(), batch.clone(), batch]));
+    h.applied();
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        h.log().matches("watch: batch id=1 ").count(),
+        1,
+        "{}",
+        h.log()
+    );
+    assert_eq!(h.local("a/x.txt"), "hello");
+}
