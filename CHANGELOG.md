@@ -5,29 +5,26 @@ All notable changes to this project are documented here. The format follows [Kee
 ## [Unreleased]
 
 ### Added
+- **NeutronSync now talks to Proton Drive directly** through `neutronsync-drive`, a sidecar built on Proton's Drive SDK, instead of running the `proton-drive` CLI once per operation. One long-lived session per login removes the frequent sign-outs, a full walk of a 750-folder tree drops from about 13 minutes to under 30 seconds, and remote changes arrive through Proton's change feed in seconds instead of on the next full walk.
+- Two-way sync through the API backend and its shared `neutronsync-drive` sidecar. Choose the backend with `[cli] backend` and an optional `sidecar` path, or per run with `sync --backend`. It supports folder creation, revision uploads, verified atomic downloads, rename, move and recoverable trash. Transfer concurrency and cancellation match the CLI backend. API sync now records activity history and logs; `--dry-run` previews changes.
 - One session-wide API sidecar serves concurrent GUI, tray, CLI and watch processes, with private socket routing and independent event cursors.
+- API watcher: remote change batches share the local-change reconcile queue, with UID-to-folder mapping, durable acknowledged cursors, restart replay and sidecar-driven sign-out recovery. API full walks become a daily safety net configured by `options.full_walk_interval`; CLI watcher pacing stays adaptive.
 - GUI and CLI sign-in support passwords, TOTP, mailbox passwords and Proton human verification through the sidecar.
 - Packages and binary tarballs include `neutronsync-drive`. Packages now depend on `secret-tool` through `libsecret-tools` (deb) or `libsecret` (rpm).
-- Phase 3 API watcher: remote change batches share the local-change reconcile queue, with UID-to-folder mapping, durable acknowledged cursors, restart replay and sidecar-driven sign-out recovery. API full walks become a daily safety net configured by `options.full_walk_interval`; CLI watcher pacing stays adaptive.
-- Optional two-way API backend through one shared `neutronsync-drive` sidecar. Configure `[cli] backend = "api"` and optional `sidecar`, or use `sync --backend api`. Phase 2 adds folder creation, revision uploads, verified atomic downloads, rename, move and recoverable trash. Transfer concurrency and cancellation match the CLI backend. API sync now records activity history and logs; `--dry-run` previews changes.
-
-### Fixed
-- cli-drive 0.8.0 changed the `filesystem list -j` shape: `activeRevision` is no longer wrapped in `{ok,value}`, so NeutronSync missed `claimedSize` / `claimedModificationTime` and fell back to the encrypted `totalStorageSize`. Every file then looked modified and the watcher re-uploaded (and conflict-copied) the tree. Both JSON shapes are accepted now, and encrypted size is never used as content size.
-- After that thrash, same-size files with drifted mtimes were still treated as dual edits and keep-both multiplied conflict copies. Same size (unless both sha1s disagree) now refreshes the baseline instead of conflicting, and `*(conflict *)*` names are ignored so conflict copies cannot re-enter sync.
+- `scripts/promote.sh X.Y.Z` promotes a pre-release to stable, and `--demote` puts it back. GitHub carries only two badges, "Latest" on a single release and "Pre-release" on each flagged one, so a stable release that is not the newest stable shows nothing at all. The script therefore clears the pre-release flag, moves the "Latest" badge, and marks the title `NeutronSync vX.Y.Z (stable)` so the distinction stays visible down the list.
+- `scripts/release.sh` cuts a release in one command: it bumps the version in `Cargo.toml` and `Cargo.lock`, closes the changelog's `[Unreleased]` section as `## [x.y.z] - <date>`, commits, and creates the signed tag. It refuses to run on a dirty tree, on a version that already exists, or on an empty `[Unreleased]`, and it stops before pushing, so nothing reaches GitHub without a deliberate `git push`. `--dry-run` prints the release body it would publish.
 
 ### Changed
 - **Default backend changes to `api`.** An absent backend key now selects the API sidecar. Explicit `backend = "cli"` remains supported for one release and survives GUI settings writes.
 - The keyring item becomes `NeutronSync Drive session`, with `purpose=session-v1`. Existing phase-labelled sessions migrate automatically after verified readback.
 - Targets Proton Drive CLI **0.8.0**. That release dropped `--conflict-strategy`; upload/download now use separate `--file-conflict-strategy` / `--folder-conflict-strategy` flags (download overwrite is `remove`, not `replace`). Defaults and the example config were updated, and configs that still have the old `-c` / `--conflict-strategy` form are rewritten on load so existing installs keep working after you upgrade the CLI.
-
-### Added
-- `scripts/promote.sh X.Y.Z` promotes a pre-release to stable, and `--demote` puts it back. GitHub carries only two badges, "Latest" on a single release and "Pre-release" on each flagged one, so a stable release that is not the newest stable shows nothing at all. The script therefore clears the pre-release flag, moves the "Latest" badge, and marks the title `NeutronSync vX.Y.Z (stable)` so the distinction stays visible down the list.
-- `scripts/release.sh` cuts a release in one command: it bumps the version in `Cargo.toml` and `Cargo.lock`, closes the changelog's `[Unreleased]` section as `## [x.y.z] - <date>`, commits, and creates the signed tag. It refuses to run on a dirty tree, on a version that already exists, or on an empty `[Unreleased]`, and it stops before pushing, so nothing reaches GitHub without a deliberate `git push`. `--dry-run` prints the release body it would publish.
-
-### Changed
 - A release fails fast rather than shipping notes nobody can read. The workflow now checks, before the eight-minute build, that the tag matches the version in `Cargo.toml` and that `CHANGELOG.md` has a non-empty section for it. Previously a missing section only warned, and the release shipped with a bare "see CHANGELOG" link as its body.
 - Every tag ships as a pre-release, and promotion to stable is a separate decision. 0.3.3 made a plain tag a stable release, which meant a build was declared stable at the moment it was cut, before it had run anywhere. The release workflow now always publishes as a pre-release and never moves the "Latest" badge; a build is promoted once it has proven itself, with `gh release edit vX.Y.Z --prerelease=false --latest`. The updater's `prerelease` channel still sees every tag as it lands, and its `stable` channel only ever offers a promoted one.
 - Release notes on GitHub now carry the changelog section for each version. Earlier releases had GitHub's generated body, a bare compare link, so the release page said nothing about what changed. The 0.1.1 through 0.3.2 notes were rewritten from this file, and titles read `NeutronSync vX.Y.Z`.
+
+### Fixed
+- cli-drive 0.8.0 changed the `filesystem list -j` shape: `activeRevision` is no longer wrapped in `{ok,value}`, so NeutronSync missed `claimedSize` / `claimedModificationTime` and fell back to the encrypted `totalStorageSize`. Every file then looked modified and the watcher re-uploaded (and conflict-copied) the tree. Both JSON shapes are accepted now, and encrypted size is never used as content size.
+- After that thrash, same-size files with drifted mtimes were still treated as dual edits and keep-both multiplied conflict copies. Same size (unless both sha1s disagree) now refreshes the baseline instead of conflicting, and `*(conflict *)*` names are ignored so conflict copies cannot re-enter sync.
 
 ## [0.3.3] - 2026-07-28
 
