@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-06
+
 ### Added
 - **NeutronSync now talks to Proton Drive directly** through `neutronsync-drive`, a sidecar built on Proton's Drive SDK, instead of running the `proton-drive` CLI once per operation. One long-lived session per login removes the frequent sign-outs, a full walk of a 750-folder tree drops from about 13 minutes to under 30 seconds, and remote changes arrive through Proton's change feed in seconds instead of on the next full walk.
 - Two-way sync through the API backend and its shared `neutronsync-drive` sidecar. Choose the backend with `[cli] backend` and an optional `sidecar` path, or per run with `sync --backend`. It supports folder creation, revision uploads, verified atomic downloads, rename, move and recoverable trash. Transfer concurrency and cancellation match the CLI backend. API sync now records activity history and logs; `--dry-run` previews changes.
