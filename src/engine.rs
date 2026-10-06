@@ -934,6 +934,12 @@ impl<'a, R: Remote> Engine<'a, R> {
                 &mut plan,
                 &mut new_base,
             );
+            if let (Some(saved), Some(uid)) = (
+                new_base.get_mut(path),
+                remote.get(path).and_then(|e| e.remote_id.as_ref()),
+            ) {
+                saved.remote_id = Some(uid.clone());
+            }
         }
 
         // Baseline rows now under an excluded sub-path are forgotten. This is a
@@ -971,7 +977,13 @@ impl<'a, R: Remote> Engine<'a, R> {
 
         // Both unchanged -> keep as-is.
         if lc == Change::Unchanged && rc == Change::Unchanged {
-            if let Some(e) = le.or(re) {
+            // Retain API identity and claimed metadata when replaying a feed batch.
+            let entry = if re.is_some_and(|e| e.remote_id.is_some()) {
+                re.or(le)
+            } else {
+                le.or(re)
+            };
+            if let Some(e) = entry {
                 new_base.insert(path.to_string(), e.clone());
             }
             return;
@@ -1451,6 +1463,9 @@ impl<'a, R: Remote> Engine<'a, R> {
                     "could not commit baseline for {:?}: {e}",
                     pair.name
                 ));
+                if self.remote.change_feed().is_some() {
+                    result.errors.push(format!("baseline commit failed: {e}"));
+                }
             }
             let retrying = pending.iter().filter(|r| !done.contains(*r)).count();
             if retrying > 0 {
@@ -1992,38 +2007,39 @@ impl<'a, R: Remote> Engine<'a, R> {
         // error means we can't see the folder — suppress deletes this run rather
         // than act on a blind listing. (A genuinely absent folder lists empty.)
         let remote_path = remote_join(&pair.remote, folder);
-        let (remote_direct, remote_failed) = match self.remote.list_dir_probe(&remote_path) {
-            Ok(ListOutcome::Listed(entries)) => {
-                let mut m = BTreeMap::new();
-                for mut e in entries {
-                    let rel = format!("{prefix}{}", e.path);
-                    if pair.is_excluded(&rel) {
-                        continue;
+        let (remote_direct, remote_failed, remote_missing) =
+            match self.remote.list_dir_probe(&remote_path) {
+                Ok(ListOutcome::Listed(entries)) => {
+                    let mut m = BTreeMap::new();
+                    for mut e in entries {
+                        let rel = format!("{prefix}{}", e.path);
+                        if pair.is_excluded(&rel) {
+                            continue;
+                        }
+                        e.path = rel.clone();
+                        m.insert(rel, e);
                     }
-                    e.path = rel.clone();
-                    m.insert(rel, e);
+                    (m, false, false)
                 }
-                (m, false)
-            }
-            // Not found: a folder the parent just listed as present now reports
-            // missing — a race (trashed elsewhere) or a transient error misread
-            // as not-found. Either way, don't propagate deletes on that basis;
-            // treat it as a failed listing (empty, deletes suppressed).
-            Ok(ListOutcome::NotFound) => {
-                self.log.warn(&format!(
-                    "shallow: remote folder {remote_path:?} not found; \
+                // Not found: a folder the parent just listed as present now reports
+                // missing — a race (trashed elsewhere) or a transient error misread
+                // as not-found. Either way, don't propagate deletes on that basis;
+                // treat it as a failed listing (empty, deletes suppressed).
+                Ok(ListOutcome::NotFound) => {
+                    self.log.warn(&format!(
+                        "shallow: remote folder {remote_path:?} not found; \
                      syncing without deletions"
-                ));
-                (BTreeMap::new(), true)
-            }
-            Err(err) => {
-                self.log.warn(&format!(
-                    "shallow: remote listing failed for {remote_path:?}: {err}; \
+                    ));
+                    (BTreeMap::new(), true, true)
+                }
+                Err(err) => {
+                    self.log.warn(&format!(
+                        "shallow: remote listing failed for {remote_path:?}: {err}; \
                      syncing without deletions"
-                ));
-                (BTreeMap::new(), true)
-            }
-        };
+                    ));
+                    (BTreeMap::new(), true, false)
+                }
+            };
 
         let cmp = self.cfg.compare;
         let ls = classify(&local_direct, &base_direct, cmp);
@@ -2050,6 +2066,12 @@ impl<'a, R: Remote> Engine<'a, R> {
                 &mut plan,
                 &mut new_base,
             );
+            if let (Some(saved), Some(uid)) = (
+                new_base.get_mut(path),
+                remote_direct.get(path).and_then(|e| e.remote_id.as_ref()),
+            ) {
+                saved.remote_id = Some(uid.clone());
+            }
         }
         // Never delete or move on a blind view of either side: if the local
         // read_dir OR the remote listing failed, strip all destructive ops.
@@ -2091,7 +2113,15 @@ impl<'a, R: Remote> Engine<'a, R> {
             .collect();
 
         let tracked = new_base.len();
-        let (result, deleted_ok) = self.apply(pair, plan, new_base, prune_excluded);
+        let (mut result, deleted_ok) = self.apply(pair, plan, new_base, prune_excluded);
+        // A stale hint for an untracked folder absent on both sides is already settled.
+        let absent_both =
+            remote_missing && local_failed && base_direct.is_empty() && !dir_path.exists();
+        if self.remote.change_feed().is_some() && (remote_failed || local_failed) && !absent_both {
+            result
+                .errors
+                .push("incomplete shallow listing; feed batch must retry".into());
+        }
 
         // Purge descendant baseline rows ONLY for sub-folders whose delete
         // actually COMPLETED (in `deleted_ok`). A delete that was cancelled or

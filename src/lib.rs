@@ -9,6 +9,7 @@
 
 pub mod auth_signal;
 pub mod backend;
+pub mod changefeed;
 pub mod config;
 pub mod datefmt;
 pub mod driveapi;

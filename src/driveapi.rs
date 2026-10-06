@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 
+use crate::changefeed::{FeedMessage, RemoteChangeFeed, Subscription};
 use crate::config::{remote_join, Config};
 use crate::models::{DownloadJob, Entry, TreeScan};
 use crate::protoncli::{is_safe_component, ListOutcome, Remote};
@@ -70,6 +71,7 @@ struct Client {
     next: AtomicU64,
     pending: Mutex<HashMap<u64, mpsc::Sender<Reply>>>,
     walk_sink: Mutex<Option<mpsc::Sender<Value>>>,
+    feed: Mutex<VecDeque<FeedMessage>>,
     // Notifications have no request id, so only one walk can be in flight.
     walk_lock: Mutex<()>,
     retry_at: Mutex<Option<Instant>>,
@@ -99,6 +101,7 @@ impl Client {
             next: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             walk_sink: Mutex::new(None),
+            feed: Mutex::new(VecDeque::new()),
             walk_lock: Mutex::new(()),
             retry_at: Mutex::new(None),
             dead: AtomicBool::new(false),
@@ -144,6 +147,9 @@ impl Client {
         if let Some(id) = msg.get("id").and_then(Value::as_u64) {
             let reply = if let Some(error) = msg.get("error") {
                 let error = RpcError::from_value(error);
+                if error.code == "auth" {
+                    self.feed.lock().unwrap().push_back(FeedMessage::SignedOut);
+                }
                 if error.code == "rate_limited" {
                     *self.retry_at.lock().unwrap() = Instant::now()
                         .checked_add(Duration::from_secs(error.retry_after.unwrap_or(1)));
@@ -162,7 +168,24 @@ impl Client {
                 let _ = tx.send(msg.get("params").cloned().unwrap_or(Value::Null));
             }
         } else if msg.get("method").and_then(Value::as_str) == Some("auth.signed_out") {
-            eprintln!("api backend: auth.signed_out (not logged in)");
+            self.feed.lock().unwrap().push_back(FeedMessage::SignedOut);
+        } else if msg.get("method").and_then(Value::as_str) == Some("events.batch") {
+            if let Ok(batch) = serde_json::from_value(msg["params"].clone()) {
+                self.feed
+                    .lock()
+                    .unwrap()
+                    .push_back(FeedMessage::Batch(batch));
+            }
+        } else if msg.get("method").and_then(Value::as_str) == Some("events.refresh_required") {
+            if let (Some(scope), Some(reason)) = (
+                msg["params"]["scope_id"].as_str(),
+                msg["params"]["reason"].as_str(),
+            ) {
+                self.feed.lock().unwrap().push_back(FeedMessage::Refresh {
+                    scope_id: scope.into(),
+                    reason: reason.into(),
+                });
+            }
         }
     }
 
@@ -285,6 +308,7 @@ fn to_entry(raw: &Value) -> Option<Entry> {
 pub struct DriveApi {
     binary: PathBuf,
     download_threads: usize,
+    feed_client: Mutex<Option<Arc<Client>>>,
 }
 
 impl DriveApi {
@@ -297,6 +321,7 @@ impl DriveApi {
         Ok(Self {
             binary,
             download_threads: cfg.download_threads,
+            feed_client: Mutex::new(None),
         }) // Lazy session and process.
     }
 
@@ -358,6 +383,9 @@ fn split_remote(path: &str) -> Result<(&str, &str)> {
 }
 
 impl Remote for DriveApi {
+    fn change_feed(&self) -> Option<&dyn RemoteChangeFeed> {
+        Some(self)
+    }
     fn read_only(&self) -> bool {
         false
     }
@@ -547,6 +575,58 @@ impl Remote for DriveApi {
                 })
             }
         }
+    }
+}
+
+impl RemoteChangeFeed for DriveApi {
+    fn subscribe(&self, scope: &str, since: Option<&str>) -> Result<Subscription> {
+        let client = shared(&self.binary)?;
+        client.feed.lock().unwrap().clear();
+        *self.feed_client.lock().unwrap() = Some(Arc::clone(&client));
+        let mut params = json!({"scope_id":scope,"ack_required":true});
+        if let Some(id) = since {
+            params["since_event_id"] = json!(id);
+        }
+        let result = client.call("events.subscribe", params)?;
+        Ok(Subscription {
+            scope_id: result["scope_id"]
+                .as_str()
+                .ok_or_else(|| anyhow!("missing event scope"))?
+                .into(),
+            last_event_id: result["last_event_id"].as_str().map(String::from),
+        })
+    }
+    fn next_batch(&self) -> Result<Option<FeedMessage>> {
+        let slot = self.feed_client.lock().unwrap();
+        let client = slot
+            .as_ref()
+            .ok_or_else(|| anyhow!("feed is not subscribed"))?;
+        if client.dead.load(Ordering::SeqCst) {
+            bail!(RpcError::new("transient"));
+        }
+        let message = client.feed.lock().unwrap().pop_front();
+        Ok(message)
+    }
+    fn ack(&self, scope: &str, event_id: &str) -> Result<()> {
+        shared(&self.binary)?.call("events.ack", json!({"scope_id":scope,"event_id":event_id}))?;
+        Ok(())
+    }
+    fn resolve_root(&self, path: &str) -> Result<String> {
+        Self::resolve(shared(&self.binary)?.as_ref(), path)
+    }
+    fn node_path(&self, uid: &str) -> Result<String> {
+        let result = shared(&self.binary)?.call("node.path", json!({"uid":uid}))?;
+        let path = result["path"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing node path"))?
+            .to_string();
+        if !path.starts_with("/my-files") || !path.split('/').skip(1).all(is_safe_component) {
+            bail!(RpcError::new("fatal"));
+        }
+        Ok(path)
+    }
+    fn signed_in(&self) -> Result<bool> {
+        Ok(self.status()?["signed_in"].as_bool().unwrap_or(false))
     }
 }
 

@@ -84,6 +84,7 @@ pub struct Config {
     pub compare: Compare,
     /// watch mode: seconds between periodic full rescans (the safety net).
     pub poll_interval_secs: u64,
+    pub full_walk_interval: u64,
     /// watch mode: seconds between short scans of "hot" (recently active) pairs.
     pub scan_interval_secs: u64,
     /// watch mode: seconds to let a burst of FS events settle before syncing.
@@ -162,6 +163,7 @@ struct RawOptions {
     compare: Option<String>,
     state_dir: Option<String>,
     poll_interval: Option<u64>,
+    full_walk_interval: Option<u64>,
     scan_interval: Option<u64>,
     debounce: Option<u64>,
     auto_sync: Option<bool>,
@@ -411,6 +413,7 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         conflict,
         compare,
         poll_interval_secs: opts.poll_interval.unwrap_or(900),
+        full_walk_interval: opts.full_walk_interval.unwrap_or(86400),
         scan_interval_secs: opts.scan_interval.unwrap_or(120),
         debounce_secs: opts.debounce.unwrap_or(2),
         update_channel,
@@ -551,6 +554,7 @@ struct OutOptions {
     conflict: String,
     compare: String,
     poll_interval: u64,
+    full_walk_interval: u64,
     scan_interval: u64,
     debounce: u64,
     update_channel: String,
@@ -629,6 +633,7 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
             conflict: conflict_str(cfg.conflict).to_string(),
             compare: compare_str(cfg.compare).to_string(),
             poll_interval: cfg.poll_interval_secs,
+            full_walk_interval: cfg.full_walk_interval,
             scan_interval: cfg.scan_interval_secs,
             debounce: cfg.debounce_secs,
             update_channel: update_channel_str(cfg.update_channel).to_string(),

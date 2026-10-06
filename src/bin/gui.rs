@@ -3289,6 +3289,7 @@ fn starter_config(path: &PathBuf) -> Config {
         conflict: ConflictPolicy::KeepBoth,
         compare: Compare::SizeMtime,
         poll_interval_secs: 900,
+        full_walk_interval: 86400,
         scan_interval_secs: 120,
         debounce_secs: 2,
         update_channel: UpdateChannel::Stable,

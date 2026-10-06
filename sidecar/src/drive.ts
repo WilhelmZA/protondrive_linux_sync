@@ -93,7 +93,7 @@ export function entry(node: NodeEntity): Entry {
 
 export class Drive {
   writes() { return new Writes(this.client as ReadClient & WriteClient, this.notify, this.log); }
-  private scopes = new Map<string, { cursor?: string; timer?: ReturnType<typeof setTimeout>; active: boolean; polling?: Promise<void> }>();
+  private scopes = new Map<string, { cursor?: string; delivered: Set<string>; ackRequired: boolean; pending?: { scope_id: string; events: { type: string; node_uid: string; parent_uid: string | null }[]; last_event_id: string | null }; timer?: ReturnType<typeof setTimeout>; active: boolean; polling?: Promise<void> }>();
   constructor(private client: ReadClient, private notify: Notify, private log: SafeLog, private pollMs = 5000, private walkConcurrency = Number(process.env.NEUTRONSYNC_DRIVE_WALK_CONCURRENCY) || 16) {}
   async resolve(path: string) {
     const parts = path.split('/').filter(Boolean);
@@ -159,14 +159,55 @@ export class Drive {
     if (fatal !== undefined) throw fatal;
     return { folders, failed, failed_codes };
   }
-  async subscribe(scope: string, since?: string) {
+  async path(uid: string) {
+    const root = await this.client.getMyFilesRootFolder();
+    const parts: string[] = [];
+    const seen = new Set<string>();
+    for (let depth = 0; depth < 256; depth++) {
+      if (seen.has(uid)) throw new Fault('not_found');
+      seen.add(uid);
+      const node = await this.client.getNode(uid);
+      if (node.trashTime) throw new Fault('not_found');
+      if (uid === root.uid) return { path: ['/my-files', ...parts.reverse()].join('/') };
+      parts.push(entry(node).name);
+      if (!node.parentUid) throw new Fault('not_found');
+      uid = node.parentUid;
+    }
+    throw new Fault('not_found');
+  }
+  ack(scope: string, id: string) {
+    const state = this.scopes.get(scope);
+    if (!state || !state.delivered.has(id)) throw new Fault('fatal');
+    state.cursor = id;
+    if (state.pending?.last_event_id === id) state.pending = undefined;
+    state.delivered.clear();
+    state.delivered.add(id);
+    // The startup walk may finish after the next batch was already delivered.
+    if (state.pending?.last_event_id) state.delivered.add(state.pending.last_event_id);
+    return { ok: true };
+  }
+  async subscribe(scope: string, since?: string, ackRequired = false) {
     // The path alias allows the spike to discover the SDK scope without adding an RPC method.
     if (scope === '/my-files') scope = (await this.client.getMyFilesRootFolder()).treeEventScopeId;
     const existing = this.scopes.get(scope);
-    if (existing) return { ok: true, last_event_id: existing.cursor ?? null };
-    const state = { cursor: since, active: true } as { cursor?: string; active: boolean; timer?: ReturnType<typeof setTimeout>; polling?: Promise<void> };
+    if (existing?.active && !ackRequired && !existing.ackRequired) return { ok: true, last_event_id: existing.cursor ?? null };
+    if (existing) {
+      existing.active = false;
+      clearTimeout(existing.timer);
+      await existing.polling?.catch(() => {});
+    }
+    const state = { cursor: since, active: true, delivered: new Set<string>(), ackRequired } as NonNullable<ReturnType<typeof this.scopes.get>>;
     this.scopes.set(scope, state);
+    // Drain history without emitting it when no resume cursor was supplied.
+    if (since === undefined && ackRequired) {
+      try {
+        for await (const event of this.client.iterateEvents(scope)) state.cursor = event.eventId;
+      } catch (error) { this.scopes.delete(scope); throw error; }
+    }
+    const startingCursor = state.cursor;
+    if (startingCursor) state.delivered.add(startingCursor);
     const poll = async () => {
+      if (state.pending) { this.notify('events.batch', state.pending); return; }
       const events: { type: string; node_uid: string; parent_uid: string | null }[] = [];
       let cursor = state.cursor;
       for await (const event of this.client.iterateEvents(scope, state.cursor)) {
@@ -179,8 +220,11 @@ export class Drive {
         }
       }
       if (!state.active) return;
-      state.cursor = cursor;
-      this.notify('events.batch', { scope_id: scope, events, last_event_id: cursor ?? null });
+      if (cursor) state.delivered.add(cursor);
+      if (!state.ackRequired) state.cursor = cursor;
+      const batch = { scope_id: scope, events, last_event_id: cursor ?? null };
+      if (state.ackRequired && cursor !== state.cursor) state.pending = batch;
+      this.notify('events.batch', batch);
     };
     const tick = async () => {
       if (!state.active) return;
@@ -196,10 +240,10 @@ export class Drive {
       }
       if (state.active) state.timer = setTimeout(tick, this.pollMs);
     };
-    try { state.polling = poll(); await state.polling; }
+    try { if (since !== undefined || !ackRequired) { state.polling = poll(); await state.polling; } }
     catch (error) { state.active = false; this.scopes.delete(scope); throw error; }
     if (state.active) state.timer = setTimeout(tick, this.pollMs);
-    return { ok: true, last_event_id: state.cursor ?? null };
+    return { ok: true, ...(ackRequired ? { scope_id: scope } : {}), last_event_id: (ackRequired ? startingCursor : state.cursor) ?? null };
   }
   close() {
     for (const state of this.scopes.values()) { state.active = false; clearTimeout(state.timer); }

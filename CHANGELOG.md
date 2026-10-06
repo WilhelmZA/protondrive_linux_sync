@@ -5,6 +5,7 @@ All notable changes to this project are documented here. The format follows [Kee
 ## [Unreleased]
 
 ### Added
+- Phase 3 API watcher: remote change batches share the local-change reconcile queue, with UID-to-folder mapping, durable acknowledged cursors, restart replay and sidecar-driven sign-out recovery. API full walks become a daily safety net configured by `options.full_walk_interval`; CLI watcher pacing stays adaptive.
 - Optional two-way API backend through one shared `neutronsync-drive` sidecar. Configure `[cli] backend = "api"` and optional `sidecar`, or use `sync --backend api`. Phase 2 adds folder creation, revision uploads, verified atomic downloads, rename, move and recoverable trash. Transfer concurrency and cancellation match the CLI backend. API sync now records activity history and logs; `--dry-run` previews changes.
 
 ### Fixed

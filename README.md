@@ -32,7 +32,7 @@ backend = "api"                       # default: "cli"
 sidecar = "/path/to/neutronsync-drive" # optional
 ```
 
-Without `sidecar`, NeutronSync looks next to its executable, then on `PATH` for `neutronsync-drive`. API sync does not require the `proton-drive` binary. All sync entry points honour the configured backend; auth probes and sign-in in the watcher, service and GUI still use the CLI in this phase.
+Without `sidecar`, NeutronSync looks next to its executable, then on `PATH` for `neutronsync-drive`. API sync and the API watcher do not require the `proton-drive` binary. The API watcher receives sign-out notifications and probes `auth.status` through the sidecar. GUI sign-in still uses the CLI in this phase.
 
 Use `neutronsync sync --dry-run --backend api` to override the config for one run. `--backend cli` selects the CLI instead. API excludes hide paths and their descendants from the plan, but the API backend still lists those folders remotely.
 
@@ -100,11 +100,12 @@ neutronsync watch                       # live sync: FS events + periodic rescan
 
 For each folder pair, NeutronSync keeps a baseline snapshot of the last state the two sides agreed on. On every run it scans the current local and remote trees and classifies each path against the baseline (created, modified, or deleted) independently per side. Combining the two verdicts decides the action and which side wins.
 
-**Detecting changes.** Proton's CLI has no "recently changed" feed, and rebuilding its SDK to add one isn't worthwhile. So NeutronSync watches your local folders live and aims the work at where the activity actually is:
+**Detecting changes.** Both backends watch local folders through inotify. The API backend also receives remote changes from the sidecar's five-second event poll:
 
 - A local change reconciles only the folder whose direct contents changed (one shallow folder listing), not the whole tree. Because the watch is recursive, a change deeper down arrives as its own event and reconciles its own folder, so editing one file never re-walks a subtree.
-- On startup it syncs folders with fresh local changes first, then recently active ("hot") folders, then everything else.
-- A full walk of both trees is the safety net that catches remote-side changes (edits made on your other devices, which the CLI only reveals by re-walking). It **streams**: it reconciles and transfers folder-by-folder as it walks, so a large tree starts syncing right away instead of after a full scan. It is paced to how long a walk actually takes, roughly six times its own duration, so a large tree is not re-walked constantly. Remote-only changes therefore appear on the next hot or full pass, not instantly.
+- With `backend = "api"`, remote events enter the same folder queue as local changes. The watcher maps node UIDs through the baseline or sidecar and reconciles both parents for moves and trash. Events are hints; the three-way merge still decides every change. The watcher saves and acknowledges each cursor after successful reconcile, so restart replays changes made while stopped without a full walk.
+- The API watcher subscribes before its first full walk. Later full walks handle refresh notices, unresolved events and the daily safety net. Set `[options] full_walk_interval = 86400` to change that interval in seconds. Sign-out pauses sync; sidecar authentication recovery resumes from the saved cursor.
+- With `backend = "cli"`, startup syncs fresh local changes, recently active ("hot") folders, then everything else. Remote changes arrive on the next hot pass or full walk. Full walks stream folder-by-folder and keep their adaptive pacing: six times the walk duration, floored at `poll_interval` and capped at six hours. `full_walk_interval` does not affect this backend.
 
 When the background tray daemon is doing the work, an open window mirrors its live state, so scanning and per-file transfers show up in Activity in real time. The sync model and its reasoning are written up in [docs/SYNC_MODEL.md](docs/SYNC_MODEL.md).
 

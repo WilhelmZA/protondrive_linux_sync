@@ -51,6 +51,26 @@ impl Stats {
         stats.load_baseline(pair)
     }
 
+    /// Load the last successfully applied event cursor for a scope.
+    pub fn feed_cursor(&self, scope: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT event_id FROM feed_cursor WHERE scope=?1",
+                [scope],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn save_feed_cursor(&self, scope: &str, id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute("INSERT INTO feed_cursor(scope,event_id) VALUES (?1,?2) ON CONFLICT(scope) DO UPDATE SET event_id=excluded.event_id", [scope,id])?;
+        Ok(())
+    }
+
     /// Open (creating if needed) the stats DB under `state_dir`.
     pub fn open(state_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(state_dir).ok();
@@ -85,6 +105,10 @@ impl Stats {
                  remote_id TEXT,
                  state     TEXT    NOT NULL DEFAULT 'synced',
                  PRIMARY KEY (pair, rel)
+             );
+             CREATE TABLE IF NOT EXISTS feed_cursor (
+                 scope TEXT PRIMARY KEY,
+                 event_id TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS pair_state (
                  pair        TEXT PRIMARY KEY,

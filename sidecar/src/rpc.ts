@@ -38,6 +38,8 @@ export async function serve(auth: Auth, getDrive: () => Promise<Drive>, close: (
         case 'auth.status': return auth.status();
         case 'auth.logout': return auth.logout();
         case 'node.resolve': return (await getDrive()).resolve(text(p, 'path'));
+        case 'node.path': return (await getDrive()).path(text(p, 'uid'));
+        case 'events.ack': return (await getDrive()).ack(text(p, 'scope_id'), text(p, 'event_id'));
         case 'node.list': return (await getDrive()).list(text(p, 'uid'));
         case 'node.create_folder': return (await getDrive()).writes().createFolder(text(p, 'parent_uid'), text(p, 'name'));
         case 'file.upload': return (await getDrive()).writes().upload(text(p, 'parent_uid'), text(p, 'name'), text(p, 'local_path'), request.id, p.replace_uid === undefined ? undefined : text(p, 'replace_uid'));
@@ -54,7 +56,8 @@ export async function serve(auth: Auth, getDrive: () => Promise<Drive>, close: (
         }
         case 'events.subscribe': {
           if (p.since_event_id !== undefined && typeof p.since_event_id !== 'string') throw new Fault('fatal');
-          return (await getDrive()).subscribe(text(p, 'scope_id'), p.since_event_id);
+          if (p.ack_required !== undefined && typeof p.ack_required !== 'boolean') throw new Fault('fatal');
+          return (await getDrive()).subscribe(text(p, 'scope_id'), p.since_event_id, p.ack_required);
         }
         default: throw new Fault('fatal');
       }

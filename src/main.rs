@@ -364,7 +364,7 @@ fn cmd_watch(cli: &Cli, pairs: &[String]) -> anyhow::Result<ExitCode> {
         out
     };
 
-    if ProtonCli::new(&cfg).resolve_binary().is_none() {
+    if cfg.backend == Backend::Cli && ProtonCli::new(&cfg).resolve_binary().is_none() {
         log.error(&format!(
             "proton-drive not found (configured: {:?}). Install it or set cli.binary.",
             cfg.binary

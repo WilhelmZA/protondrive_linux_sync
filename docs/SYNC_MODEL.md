@@ -25,14 +25,24 @@ Why shallow is correct and not lossy:
 
 - The watch is recursive, so a change deeper in the tree arrives as its **own** event and reconciles its **own** folder. Walking the subtree on every change would redo work that the deeper events already cover.
 - A directory event reconciles that directory; a file event (or a delete, where the path can no longer be stat-ed) reconciles the file's parent. Both converge on "the folder whose direct listing changed."
-- Remote-only changes are **not** the watch's job. They are caught by the hot pass and the full walk (below).
+- With the CLI backend, the hot pass and full walk catch remote-only changes. With the API backend, the remote feed queues them directly.
 
 Consequences that are intentional:
 
 - Deleting a whole sub-folder locally trashes the remote folder (recoverably) and cleans that sub-folder's descendant rows out of the baseline (the shallow commit only removed the folder's own row, so descendants are pruned explicitly).
-- A brand-new remote sub-folder's contents are created locally as an empty folder at the direct level and filled in by the full walk, since there is no local event to trigger their download.
+- A brand-new remote sub-folder initially appears as an empty local folder. The CLI full walk fills it; API events for its children queue their parent for shallow reconcile.
 
-## Startup order: quick wins first, full walk last
+## API backend: remote change feed
+
+With `[cli] backend = "api"`, the sidecar polls remote events every five seconds. Its acknowledged delivery mode repeats each batch until the watcher acknowledges it. The watcher maps parent UIDs to pair-relative folders using cached root UIDs, baseline `remote_id` values, then depth-bounded `node.path` resolution. Moves and trash also queue the node's old baseline parent. A changed baseline folder queues its own contents. An unresolved event schedules a full walk; a resolved path outside every pair is logged as `out_of_scope`.
+
+Remote events and local inotify changes share the shallow-folder queue. Every event records one disposition (`mapped`, `out_of_scope`, `walk` or `deferred`), and each batch records counts. Events never issue filesystem operations directly. Both listings and the existing three-way merge decide every operation.
+
+First start subscribes before walking and stores the starting cursor only after that walk succeeds. Subsequent batches persist their cursor in `stats.db` before acknowledgement, after all their reconciles succeed. Failed batches remain unacknowledged for replay. Three consecutive failed deliveries trigger one `apply_failed` recovery walk and acknowledgement. Restart and authentication recovery subscribe with the stored cursor. A refused cursor requires one `resume_gap` walk.
+
+`[options] full_walk_interval` sets the API safety-net interval in seconds, default `86400`. Refresh notices schedule a `refresh_required` walk. The watcher logs every API full-walk cause. The CLI backend ignores this option and keeps the adaptive pacing below. API sign-out comes from sidecar notifications or authentication errors; recovery probes `auth.status` without running the CLI.
+
+## CLI startup order: quick wins first, full walk last
 
 When the watcher starts it does not lead with the expensive full walk. It attaches the file watch **first** (so changes made during startup are captured, not lost in a blind window), then:
 
@@ -42,7 +52,7 @@ When the watcher starts it does not lead with the expensive full walk. It attach
 
 So syncing starts almost immediately and the full walk stops being a gate.
 
-## The full walk: an adaptively paced safety net
+## CLI full walk: an adaptively paced safety net
 
 The full walk scans both trees end to end. It is the only thing that catches remote-only changes across the whole tree, so it must run, but on a large tree it is expensive and pointless to run constantly. So it is **paced to its own cost**: after each full walk NeutronSync measures how long it took and schedules the next one at roughly `duration * 6` (`FULL_WALK_MULTIPLIER`), floored at the configured `poll_interval` and capped so it always eventually runs. A 15-minute walk reruns about every 90 minutes; small, active folders stay fresh in between through the shallow and hot syncs.
 

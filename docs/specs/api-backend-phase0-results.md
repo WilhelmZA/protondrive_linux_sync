@@ -86,3 +86,19 @@ exit: 0
 Evidence lives in `Plans/neutronsync-api-backend-phase-2/evidence/`. `live-run-02/` holds all successful sync outputs, RPCs, write-target assertions, revision identity assertions and trash confirmation. The first attempt successfully uploads and trashes its isolated folder, then stops because the evidence runner expects JSON-only stdout. Its original outputs remain in `evidence/live-*`. The corrected runner parses the JSON after console messages and completes the full sequence.
 
 Automated checks pass: `cargo fmt --check`, `cargo clippy --all-targets --features gui`, `cargo build --release --features gui`, `cargo test`, and `bun test`. Rust reports 83 passing tests and one pre-existing ignored live helper. Bun reports 29 passing tests. The sidecar typecheck passes. Clippy reports existing warnings, with none in new code. The worker records a separate full-tree local-scanner scope question in `STATE.md`; these results do not assert that existing engine behavior has changed.
+
+## Phase 3
+
+Measured on 2026-10-06 with a personal test account. The final isolated config is a scratch config. Its single pair uses a new local scratch folder and `/my-files/NeutronSync-Phase3-Test`. State and logs stay under that scratch directory. The configured CLI binary deliberately does not exist.
+
+- Startup subscribes before one `first_start` full walk. The initial cursor is stored after 3.011 seconds.
+- Remote create reaches the local folder in 12.064 seconds; edit in 9.888 seconds; rename in 7.453 seconds; move in 6.388 seconds; trash in 2.117 seconds. Each operation uses a separate sidecar call. Every measurement includes the write call and local observation. None triggers a full walk.
+- A local file uploads through inotify in 5.557 seconds, with no full walk.
+- After stopping the daemon, a remote upload arrives 4.804 seconds after restart. The second subscribe carries the stored `since_event_id`, `<event-id>`. Restart performs no full walk.
+- The entire run records exactly one full walk, with cause `first_start`.
+- Cleanup moves the test folder to Proton trash. An independent read-only query confirms its exact UID in trash on page four. The UID-to-path write audit proves every write target stays within the test folder.
+- The Phase 0 read-only monitor remains running: monitor PID 2778566 and sidecar PID 2778568. The Phase 3 capture and monitor show no `auth.signed_out`. The monitor reports `signed_in: true` at 14:11:23 local time.
+
+Evidence is under `Plans/neutronsync-api-backend-phase-3/evidence/`. The final live evidence is in `live-run-02/`: config, watcher logs, RPC capture, results, latency CSV, full-walk cause tally, 16-write UID-to-path audit and independent trash confirmation. The earlier successful run remains at the evidence root. Automated outputs and monitor observations are at the evidence root. The 16 fake-sidecar watcher tests cover the thirteen required cases, delayed apply, bounded failed-delivery recovery and refused resume cursors. Sidecar tests cover acknowledged replay, history-free acknowledged subscribe, default cursor advancement, resumed delivery and bounded path resolution.
+
+Automated checks pass: formatting, clippy, release build with GUI, 99 Rust tests, 32 Bun tests and the sidecar typecheck. One existing Rust live helper remains ignored. Clippy reports the same existing warning sites as the pre-change baseline. Both required source scans return no matches.

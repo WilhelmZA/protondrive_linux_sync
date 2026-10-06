@@ -34,6 +34,9 @@ use crate::models::{DownloadJob, Entry, TreeScan};
 
 /// The remote operations the engine needs. A fake implements this in tests.
 pub trait Remote {
+    fn change_feed(&self) -> Option<&dyn crate::changefeed::RemoteChangeFeed> {
+        None
+    }
     /// Forces planning only, including local operations and state persistence.
     fn read_only(&self) -> bool {
         false

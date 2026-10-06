@@ -10,6 +10,9 @@ import time
 import uuid
 
 home = Path(__file__).parent
+output_lock = threading.Lock()
+subscription = None
+feed_lock = threading.Lock()
 with (home / "starts").open("a") as out:
     out.write(f"{os.getpid()}\n")
 
@@ -31,7 +34,43 @@ def children(uid):
 
 
 def send(value):
-    print(json.dumps(dict(jsonrpc="2.0", **value)), flush=True)
+    with output_lock:
+        print(json.dumps(dict(jsonrpc="2.0", **value)), flush=True)
+
+
+def read_json(name, default):
+    try:
+        return json.loads((home / name).read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def poll_feed():
+    global subscription
+    while True:
+        time.sleep(0.7)
+        with feed_lock:
+            if subscription is None:
+                continue
+            script = read_json('feed.json', [])
+            cursor = subscription['cursor']
+            ids = [item.get('last_event_id') for item in script]
+            start = ids.index(cursor) + 1 if cursor in ids else 0
+            for item in script[start:start + 1]:
+                if item.get('signed_out'):
+                    send(dict(method='auth.signed_out', params={}))
+                    subscription = None
+                    break
+                if item.get('refresh') and item['last_event_id'] not in subscription['notices']:
+                    subscription['notices'].add(item['last_event_id'])
+                    send(dict(method='events.refresh_required', params=dict(scope_id='scope', reason=item['refresh'])))
+                send(dict(method='events.batch', params=dict(scope_id='scope', events=item.get('events', []), last_event_id=item['last_event_id'])))
+                subscription['delivered'].add(item['last_event_id'])
+                if not subscription['ack_required']:
+                    subscription['cursor'] = item['last_event_id']
+
+
+threading.Thread(target=poll_feed, daemon=True).start()
 
 
 class Failure(Exception):
@@ -76,6 +115,18 @@ def mutable(request):
             result = dict(uid=uid, type=node(uid)['type'])
         elif method == 'node.list':
             result = dict(entries=listing(p['uid']))
+        elif method == 'node.path':
+            uid = p['uid']
+            parts = []
+            for _ in range(256):
+                n = node(uid)
+                if uid == 'root':
+                    break
+                parts.append(n['name'])
+                uid = n['parent_uid']
+            else:
+                raise Failure('not_found')
+            result = dict(path='/'.join(['/my-files', *reversed(parts)]))
         elif method == 'node.walk':
             queue = [(p['uid'], '')]
             failed = []
@@ -168,13 +219,34 @@ for line in sys.stdin:
     method, params, rid = request["method"], request["params"], request["id"]
     with (home / "calls").open("a") as out:
         out.write(json.dumps(request) + "\n")
+    if method == 'events.subscribe':
+        controls = read_json('controls.json', {})
+        if controls.get('refuse_cursor') and params.get('since_event_id'):
+            send(dict(id=rid, error=dict(code=-32000, data=dict(code='not_found'))))
+            continue
+        script = read_json('feed.json', [])
+        cursor = params.get('since_event_id', script[-1]['last_event_id'] if script else '0')
+        with feed_lock:
+            subscription = dict(cursor=cursor, ack_required=params.get('ack_required', False), delivered={cursor}, notices=set())
+        send(dict(id=rid, result=dict(scope_id='scope', last_event_id=cursor)))
+        continue
+    if method == 'events.ack':
+        with feed_lock:
+            if subscription is None or params['scope_id'] != 'scope' or params['event_id'] not in subscription['delivered']:
+                send(dict(id=rid, error=dict(code=-32000, data=dict(code='fatal'))))
+            else:
+                subscription['cursor'] = params['event_id']
+                with (home / 'acks').open('a') as out:
+                    out.write(json.dumps(params) + '\n')
+                send(dict(id=rid, result=dict(ok=True)))
+        continue
     if (home / 'tree.json').exists() and method != 'auth.status':
         mutable(request)
         continue
     result = None
     code = None
     if method == "auth.status":
-        result = dict(signed_in=True, account=str(os.getpid()))
+        result = dict(signed_in=read_json('controls.json', {}).get('signed_in', True), account=str(os.getpid()))
     elif method == "node.resolve":
         path = params["path"]
         leaf = path.rsplit("/", 1)[-1]

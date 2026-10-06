@@ -25,6 +25,9 @@ use crate::logger::Logger;
 use crate::protoncli::{is_not_logged_in, ProtonCli, Remote};
 use crate::stats::Stats;
 
+#[path = "watcher_feed.rs"]
+mod feed;
+
 /// A sub-folder counts as "hot" if it saw >= this many changes in the window.
 const HOT_WINDOW_SECS: i64 = 1800;
 const HOT_THRESHOLD: i64 = 1;
@@ -317,6 +320,10 @@ pub fn watch_with(
                 r.display()
             ));
         }
+    }
+    let backend = crate::backend::select(cfg)?;
+    if let Some(change_feed) = backend.change_feed() {
+        return feed::watch(cfg, &pairs, log, stop, events, change_feed, &rx);
     }
     log.info(&format!(
         "watch: watching {} folder(s); hot re-check every {}s; full walk adaptive (>= {}s)",

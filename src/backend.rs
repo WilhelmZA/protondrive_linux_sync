@@ -34,6 +34,9 @@ pub fn effective_dry_run(remote: &dyn Remote, requested: bool, log: &Logger) -> 
 
 // Forward every method, including the CLI's optimised tree scan and transfers.
 impl<R: Remote + ?Sized> Remote for Box<R> {
+    fn change_feed(&self) -> Option<&dyn crate::changefeed::RemoteChangeFeed> {
+        (**self).change_feed()
+    }
     fn read_only(&self) -> bool {
         (**self).read_only()
     }
