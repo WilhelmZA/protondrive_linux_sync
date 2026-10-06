@@ -256,6 +256,7 @@ export class Auth {
     try { await this.store.clear(); } catch { this.log.write('warn', 'Session storage unavailable'); }
   }
   async logout(): Promise<{ ok: true }> {
+    const hadSession = !!this.session || !!this.pending;
     this.generation++;
     this.session = null;
     this.pending = null;
@@ -263,6 +264,7 @@ export class Auth {
     // Wait for an existing refresh to finish before clearing its persisted result.
     if (this.refreshFlight) await this.refreshFlight.catch(() => {});
     await this.store.clear();
+    if (hadSession) this.notify('auth.signed_out', {});
     return { ok: true };
   }
 }

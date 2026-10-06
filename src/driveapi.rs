@@ -2,9 +2,10 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -66,8 +67,9 @@ type Reply = std::result::Result<Value, RpcError>;
 
 struct Client {
     binary: PathBuf,
-    stdin: Mutex<ChildStdin>,
-    child: Mutex<Child>,
+    stdin: Mutex<Box<dyn Write + Send>>,
+    child: Mutex<Option<Child>>,
+    socket: Option<UnixStream>,
     next: AtomicU64,
     pending: Mutex<HashMap<u64, mpsc::Sender<Reply>>>,
     walk_sink: Mutex<Option<mpsc::Sender<Value>>>,
@@ -80,6 +82,19 @@ struct Client {
 
 impl Client {
     fn spawn(binary: &Path) -> Result<Arc<Self>> {
+        if std::env::var_os("NEUTRONSYNC_DRIVE_STDIO").is_none() {
+            let socket = connect_session(binary)?;
+            let read = socket.try_clone()?;
+            let write = socket.try_clone()?;
+            return Ok(Self::start(
+                binary,
+                Box::new(write),
+                None,
+                Some(socket),
+                read,
+            ));
+        }
+        // Explicit fixture/spike compatibility. Production clients use the socket.
         let mut child = Command::new(binary)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -94,10 +109,27 @@ impl Client {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("sidecar stdout unavailable"))?;
+        Ok(Self::start(
+            binary,
+            Box::new(stdin),
+            Some(child),
+            None,
+            stdout,
+        ))
+    }
+
+    fn start(
+        binary: &Path,
+        stdin: Box<dyn Write + Send>,
+        child: Option<Child>,
+        socket: Option<UnixStream>,
+        stdout: impl std::io::Read + Send + 'static,
+    ) -> Arc<Self> {
         let client = Arc::new(Self {
             binary: binary.into(),
             stdin: Mutex::new(stdin),
             child: Mutex::new(child),
+            socket,
             next: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             walk_sink: Mutex::new(None),
@@ -120,7 +152,7 @@ impl Client {
                 reader.fail();
             }
         });
-        Ok(client)
+        client
     }
 
     fn fail(&self) {
@@ -139,8 +171,13 @@ impl Client {
 
     fn stop(&self) {
         let mut child = self.child.lock().unwrap();
-        let _ = child.kill();
-        let _ = child.wait();
+        if let Some(child) = child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(socket) = &self.socket {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
     }
 
     fn dispatch(&self, msg: Value) {
@@ -232,7 +269,15 @@ fn shared(binary: &Path) -> Result<Arc<Client>> {
     static SHARED: OnceLock<Mutex<Option<Arc<Client>>>> = OnceLock::new();
     let mut slot = SHARED.get_or_init(|| Mutex::new(None)).lock().unwrap();
     if let Some(client) = &*slot {
-        let exited = client.child.lock().unwrap().try_wait()?.is_some();
+        let exited = client
+            .child
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map(|c| c.try_wait())
+            .transpose()?
+            .flatten()
+            .is_some();
         if !client.dead.load(Ordering::SeqCst) && !exited {
             if client.binary != binary {
                 bail!("cli.sidecar differs from the sidecar already running in this process");
@@ -245,6 +290,105 @@ fn shared(binary: &Path) -> Result<Arc<Client>> {
     let client = Client::spawn(binary)?;
     *slot = Some(Arc::clone(&client));
     Ok(client)
+}
+
+fn session_socket() -> Result<PathBuf> {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .ok_or_else(|| anyhow!("XDG_RUNTIME_DIR and HOME are both unset"))?;
+    let dir = base.join("neutronsync-drive");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
+    let metadata = std::fs::symlink_metadata(&dir)?;
+    // The server repeats this check and verifies SO_PEERCRED before reading RPC.
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        bail!("unsafe sidecar socket directory: {}", dir.display());
+    }
+    Ok(dir.join("session.sock"))
+}
+
+fn connect_session(binary: &Path) -> Result<UnixStream> {
+    let path = session_socket()?;
+    let canonical = std::fs::canonicalize(binary)?;
+    let started = Instant::now();
+    let mut launched: Option<Child> = None;
+    loop {
+        match UnixStream::connect(&path) {
+            Ok(mut socket) => {
+                socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+                // Read only the greeting, without buffering the next RPC frame.
+                let mut line = Vec::new();
+                use std::io::Read;
+                for _ in 0..16384 {
+                    let mut buffer = [0u8; 1];
+                    socket.read_exact(&mut buffer)?;
+                    let byte = buffer[0];
+                    if byte == b'\n' {
+                        break;
+                    }
+                    line.push(byte);
+                }
+                let hello: Value = serde_json::from_slice(&line)?;
+                if hello["method"] != "sidecar.hello"
+                    || hello["params"]["binary"].as_str() != canonical.to_str()
+                {
+                    bail!(
+                        "cli.sidecar differs from the sidecar already running in this user session"
+                    );
+                }
+                socket.set_read_timeout(None)?;
+                if let Some(mut child) = launched.take() {
+                    // The session owner outlives its initiating GUI/CLI.
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                }
+                return Ok(socket);
+            }
+            Err(error)
+                if !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                return Err(error.into())
+            }
+            Err(_) => {}
+        }
+        if started.elapsed() > Duration::from_secs(20) {
+            bail!("cannot connect to {SIDECAR_NAME}; check secret-tool and the Secret Service session");
+        }
+        let exited = launched
+            .as_mut()
+            .map(|c| c.try_wait())
+            .transpose()?
+            .flatten()
+            .is_some();
+        if launched.is_none() || exited {
+            launched = Some(
+                Command::new(binary)
+                    .arg("--socket")
+                    .arg(&path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(
+                        if std::env::var("NEUTRONSYNC_DRIVE_TRACE").as_deref() == Ok("1") {
+                            Stdio::inherit()
+                        } else {
+                            Stdio::null()
+                        },
+                    )
+                    .spawn()?,
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn executable(path: &Path) -> bool {
@@ -315,7 +459,7 @@ impl DriveApi {
     pub fn new(cfg: &Config) -> Result<Self> {
         let binary = resolve_sidecar(cfg).ok_or_else(|| {
             anyhow!(
-                "{SIDECAR_NAME} not found or not executable. Build sidecar/ or set cli.sidecar."
+                "{SIDECAR_NAME} not found or not executable. Install the NeutronSync package, build sidecar/, or set cli.sidecar. For the legacy fallback set [cli] backend = \"cli\"."
             )
         })?;
         Ok(Self {
@@ -327,6 +471,16 @@ impl DriveApi {
 
     pub fn status(&self) -> Result<Value> {
         shared(&self.binary)?.call("auth.status", json!({}))
+    }
+
+    pub fn auth(&self, method: &str, params: Value) -> Result<Value> {
+        if !matches!(
+            method,
+            "auth.login" | "auth.submit_2fa" | "auth.submit_mailbox_password" | "auth.logout"
+        ) {
+            bail!("unsupported authentication method");
+        }
+        shared(&self.binary)?.call(method, params)
     }
 
     fn resolve(client: &Client, path: &str) -> Result<String> {

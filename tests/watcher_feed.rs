@@ -16,6 +16,7 @@ struct Harness {
 }
 impl Harness {
     fn new() -> Self {
+        std::env::set_var("NEUTRONSYNC_DRIVE_STDIO", "1");
         // Keep the suite within the shared user's inotify instance limit.
         let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();

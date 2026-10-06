@@ -55,6 +55,19 @@ jobs:
       - name: Install packagers
         run: cargo install cargo-deb cargo-generate-rpm
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - name: Install and test sidecar
+        working-directory: sidecar
+        run: |
+          bun install --frozen-lockfile
+          bun test
+
+      - name: Build sidecar
+        run: sidecar/build.sh
+
       - name: Build release binaries (CLI + GUI)
         run: cargo build --release --features gui --bins
 
@@ -82,6 +95,7 @@ jobs:
           stage="stage/neutronsync-${ref}"
           mkdir -p "$stage"
           cp target/release/neutronsync target/release/neutronsync-gui \
+             sidecar/dist/neutronsync-drive \
              README.md LICENSE "$stage/"
           tar -C stage -czf "dist/neutronsync-${ref}-x86_64-linux.tar.gz" "neutronsync-${ref}"
 

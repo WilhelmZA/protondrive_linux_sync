@@ -22,6 +22,17 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - name: Sidecar tests and typecheck
+        working-directory: sidecar
+        run: |
+          bun install --frozen-lockfile
+          bun test
+          bun tests/typecheck.ts
+
       # System libraries needed to build the egui/eframe GUI (glow/winit) and
       # the rfd native file dialog.
       - name: Install GUI build dependencies

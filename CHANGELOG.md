@@ -5,6 +5,9 @@ All notable changes to this project are documented here. The format follows [Kee
 ## [Unreleased]
 
 ### Added
+- One session-wide API sidecar serves concurrent GUI, tray, CLI and watch processes, with private socket routing and independent event cursors.
+- GUI and CLI sign-in support passwords, TOTP, mailbox passwords and Proton human verification through the sidecar.
+- Packages and binary tarballs include `neutronsync-drive`. Packages now depend on `secret-tool` through `libsecret-tools` (deb) or `libsecret` (rpm).
 - Phase 3 API watcher: remote change batches share the local-change reconcile queue, with UID-to-folder mapping, durable acknowledged cursors, restart replay and sidecar-driven sign-out recovery. API full walks become a daily safety net configured by `options.full_walk_interval`; CLI watcher pacing stays adaptive.
 - Optional two-way API backend through one shared `neutronsync-drive` sidecar. Configure `[cli] backend = "api"` and optional `sidecar`, or use `sync --backend api`. Phase 2 adds folder creation, revision uploads, verified atomic downloads, rename, move and recoverable trash. Transfer concurrency and cancellation match the CLI backend. API sync now records activity history and logs; `--dry-run` previews changes.
 
@@ -13,6 +16,8 @@ All notable changes to this project are documented here. The format follows [Kee
 - After that thrash, same-size files with drifted mtimes were still treated as dual edits and keep-both multiplied conflict copies. Same size (unless both sha1s disagree) now refreshes the baseline instead of conflicting, and `*(conflict *)*` names are ignored so conflict copies cannot re-enter sync.
 
 ### Changed
+- **Default backend changes to `api`.** An absent backend key now selects the API sidecar. Explicit `backend = "cli"` remains supported for one release and survives GUI settings writes.
+- The keyring item becomes `NeutronSync Drive session`, with `purpose=session-v1`. Existing phase-labelled sessions migrate automatically after verified readback.
 - Targets Proton Drive CLI **0.8.0**. That release dropped `--conflict-strategy`; upload/download now use separate `--file-conflict-strategy` / `--folder-conflict-strategy` flags (download overwrite is `remove`, not `replace`). Defaults and the example config were updated, and configs that still have the old `-c` / `--conflict-strategy` form are rewritten on load so existing installs keep working after you upgrade the CLI.
 
 ### Added

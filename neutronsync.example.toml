@@ -2,11 +2,12 @@
 # (or run `neutronsync init`), then edit. See README.md.
 
 [cli]
-# Backend defaults to "cli"; "api" is read-only until Phase 2.
-# backend = "cli"
+# Backend defaults to "api", using the packaged sidecar for two-way sync.
+# Select "cli" only as a legacy fallback if the API backend fails.
+# backend = "api"
 # Optional sidecar path; default: next to neutronsync, then on PATH.
 # sidecar = "/path/to/neutronsync-drive"
-# Path to the official proton-drive binary. Leave as-is to find it on $PATH.
+# Legacy CLI backend only: path to proton-drive (resolved on $PATH).
 binary = "proton-drive"
 # Flags appended to `filesystem upload` so an existing remote file is overwritten
 # when the local copy changed. cli-drive ≥ 0.8.0 uses separate file/folder

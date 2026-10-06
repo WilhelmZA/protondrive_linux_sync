@@ -16,8 +16,8 @@ pub const DEFAULT_REMOTE_ROOT: &str = "/my-files";
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
-    #[default]
     Cli,
+    #[default]
     Api,
 }
 
@@ -308,7 +308,7 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
 
     let cli = raw.cli.unwrap_or_default();
     let opts = raw.options.unwrap_or_default();
-    let backend = match cli.backend.as_deref().unwrap_or("cli") {
+    let backend = match cli.backend.as_deref().unwrap_or("api") {
         "cli" => Backend::Cli,
         "api" => Backend::Api,
         other => bail!("cli.backend must be cli|api, got {other:?}"),

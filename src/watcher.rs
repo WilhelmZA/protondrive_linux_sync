@@ -57,6 +57,13 @@ enum AuthProbe {
 /// Probe whether the proton-drive session is authenticated by listing the remote
 /// root — the same check the GUI's Account panel uses. Cheap (one CLI call).
 fn probe_auth(cfg: &Config) -> AuthProbe {
+    if cfg.backend == crate::config::Backend::Api {
+        return match crate::driveapi::DriveApi::new(cfg).and_then(|api| api.status()) {
+            Ok(status) if status["signed_in"] == true => AuthProbe::SignedIn,
+            Ok(_) => AuthProbe::SignedOut,
+            Err(_) => AuthProbe::Unknown,
+        };
+    }
     match ProtonCli::new(cfg).list_dir(&cfg.remote_root) {
         Ok(_) => AuthProbe::SignedIn,
         Err(e) if is_not_logged_in(&e.to_string()) => AuthProbe::SignedOut,

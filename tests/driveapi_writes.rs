@@ -22,6 +22,7 @@ struct Harness {
 }
 impl Harness {
     fn new() -> Self {
+        std::env::set_var("NEUTRONSYNC_DRIVE_STDIO", "1");
         let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -132,6 +133,25 @@ impl Drop for Harness {
     fn drop(&mut self) {
         let _ = self.api.list_dir("/my-files/die");
     }
+}
+
+#[test]
+fn cli_or_null_remote_ids_plan_zero_operations_against_unchanged_api_tree() {
+    let h = Harness::new();
+    h.local("one.txt", "unchanged one");
+    h.local("two.txt", "unchanged two");
+    let initial = h.run();
+    assert!(initial.errors.is_empty());
+    let mut baseline = h.baseline();
+    baseline.get_mut("one.txt").unwrap().remote_id = Some("cli-era-id".into());
+    baseline.get_mut("two.txt").unwrap().remote_id = None;
+    neutronsync::stats::Stats::open(&h.cfg.state_dir)
+        .unwrap()
+        .save_baseline("test", &baseline)
+        .unwrap();
+    let before = h.writes().len();
+    h.settled();
+    assert_eq!(h.writes().len(), before);
 }
 
 #[test]

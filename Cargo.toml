@@ -2,7 +2,7 @@
 name = "neutronsync"
 version = "0.3.3"
 edition = "2021"
-description = "Bidirectional Proton Drive folder sync built on the official proton-drive CLI"
+description = "Bidirectional Proton Drive folder sync with a built-in API sidecar"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/WilhelmZA/protondrive_linux_sync"
@@ -25,6 +25,8 @@ clap = { version = "4", features = ["derive"] }
 sha1_smol = "1"
 walkdir = "2"
 anyhow = "1"
+libc = "0.2"
+rpassword = "7"
 tempfile = "3"
 eframe = { version = "0.35", optional = true }
 egui-phosphor = { version = "0.13", optional = true, default-features = false, features = ["regular"] }
@@ -72,20 +74,21 @@ required-features = ["gui"]
 # CLI, the GUI, the .desktop entry, and the systemd --user units. The GUI
 # binary is one of the assets, so packaging requires the `gui` feature:
 #   cargo deb --features gui         &&   cargo generate-rpm
-# proton-drive is a runtime prerequisite (not in distro repos) - see README.
+# proton-drive is optional, for the legacy CLI backend.
 [package.metadata.deb]
 maintainer = "Wilhelm Schonfeldt"
 copyright = "2026 Wilhelm Schonfeldt"
 section = "utils"
 priority = "optional"
-depends = "$auto, libgl1, libxkbcommon0"
+depends = "$auto, libgl1, libxkbcommon0, libsecret-tools"
 extended-description = """\
-Bidirectional Proton Drive folder sync built on the official proton-drive CLI. \
-Ships a CLI (neutronsync) and a native GUI (neutronsync-gui). Requires the \
-proton-drive CLI to be installed separately."""
+Bidirectional Proton Drive folder sync with a built-in API sidecar. \
+Ships a CLI (neutronsync), native GUI (neutronsync-gui) and neutronsync-drive. \
+The optional proton-drive CLI is needed only for the legacy backend = "cli" path."""
 assets = [
     ["target/release/neutronsync", "usr/bin/", "755"],
     ["target/release/neutronsync-gui", "usr/bin/", "755"],
+    ["sidecar/dist/neutronsync-drive", "usr/bin/", "755"],
     ["packaging/neutronsync-gui.desktop", "usr/share/applications/", "644"],
     ["assets/logo.png", "usr/share/icons/hicolor/256x256/apps/neutronsync.png", "644"],
     ["assets/neutron-logo.svg", "usr/share/icons/hicolor/scalable/apps/neutronsync.svg", "644"],
@@ -100,6 +103,7 @@ assets = [
 assets = [
     { source = "target/release/neutronsync", dest = "/usr/bin/neutronsync", mode = "755" },
     { source = "target/release/neutronsync-gui", dest = "/usr/bin/neutronsync-gui", mode = "755" },
+    { source = "sidecar/dist/neutronsync-drive", dest = "/usr/bin/neutronsync-drive", mode = "755" },
     { source = "packaging/neutronsync-gui.desktop", dest = "/usr/share/applications/neutronsync-gui.desktop", mode = "644" },
     { source = "assets/logo.png", dest = "/usr/share/icons/hicolor/256x256/apps/neutronsync.png", mode = "644" },
     { source = "assets/neutron-logo.svg", dest = "/usr/share/icons/hicolor/scalable/apps/neutronsync.svg", mode = "644" },
@@ -109,3 +113,6 @@ assets = [
     { source = "README.md", dest = "/usr/share/doc/neutronsync/README.md", mode = "644" },
     { source = "LICENSE", dest = "/usr/share/doc/neutronsync/LICENSE", mode = "644" },
 ]
+
+[package.metadata.generate-rpm.requires]
+libsecret = "*"

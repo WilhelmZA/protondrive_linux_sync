@@ -1,13 +1,13 @@
 import { expect, test } from 'bun:test';
 import { createInterface } from 'node:readline';
 import { spawn } from 'node:child_process';
-import { resolve } from 'node:path';
+import { binary } from './compiled';
 import { fixture } from './fixture';
 
 test('compiled binary implements the complete RPC contract against fake HTTP', async () => {
   const backend = fixture();
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: backend.handle });
-  const child = spawn(resolve(import.meta.dir, '../dist/neutronsync-drive'), ['--test-backend', server.url.origin], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(binary, ['--test-backend', server.url.origin], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, NEUTRONSYNC_DRIVE_TRACE: '1' } });
   const notifications: any[] = [];
   const protocol: any[] = [];
   let stderr = '';

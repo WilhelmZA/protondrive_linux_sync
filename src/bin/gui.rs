@@ -496,6 +496,16 @@ enum UpdateState {
     Failed(String),
 }
 
+#[derive(Default)]
+struct ApiSignIn {
+    username: String,
+    password: String,
+    factor: String,
+    step: serde_json::Value,
+    error: Option<String>,
+    pending: Option<std::sync::mpsc::Receiver<Result<serde_json::Value, String>>>,
+}
+
 struct App {
     ctrl: Controller,
     cfg: Config,
@@ -512,6 +522,7 @@ struct App {
     // after launching browser login, poll the account until signed in (or deadline)
     login_poll_until: Option<f64>,
     last_account_poll: f64,
+    api_signin: ApiSignIn,
 
     // remote browser
     browser_open: bool,
@@ -575,6 +586,7 @@ impl App {
             confirm_reset: false,
             login_poll_until: None,
             last_account_poll: 0.0,
+            api_signin: ApiSignIn::default(),
             browser_open: false,
             browser_path: String::new(),
             browser_entries: Vec::new(),
@@ -1879,6 +1891,21 @@ impl App {
 
     fn page_account(&mut self, ui: &mut egui::Ui, snap: &AppState) {
         self.page_header(ui, "Account", |_ui, _app| {});
+        if self.cfg.backend == neutronsync::config::Backend::Api {
+            ui.label(&snap.account.version);
+            if snap.account.signed_in {
+                ui.label("Signed in");
+                if ui.button("Sign out").clicked() {
+                    self.confirm_logout = true;
+                }
+            } else {
+                self.api_signin_form(ui);
+            }
+            if ui.button("Refresh").clicked() {
+                self.ctrl.refresh_account(false);
+            }
+            return;
+        }
         let acc = &snap.account;
         let (col, label) = if !acc.checked {
             (DIM, "Checking…")
@@ -1958,10 +1985,8 @@ impl App {
         );
         ui.add_space(6.0);
         ui.label(
-            RichText::new(
-                "Bidirectional Proton Drive folder sync, built on the official proton-drive CLI.",
-            )
-            .color(DIM),
+            RichText::new("Bidirectional Proton Drive folder sync with a built-in API sidecar.")
+                .color(DIM),
         );
         ui.add_space(12.0);
         ui.label(
@@ -2222,6 +2247,17 @@ impl App {
     }
 
     fn page_signin(&mut self, ui: &mut egui::Ui, snap: &AppState) {
+        if self.cfg.backend == neutronsync::config::Backend::Api {
+            self.page_header(ui, "Sign in to Proton Drive", |_ui, _app| {});
+            ui.label(&snap.account.version);
+            if snap.account.binary_found {
+                self.api_signin_form(ui);
+            }
+            if ui.button("Check again").clicked() {
+                self.ctrl.refresh_account(false);
+            }
+            return;
+        }
         let found = snap.account.binary_found;
         let logo = self.logo_tex.clone();
         let col_w: f32 = 470.0;
@@ -2383,6 +2419,109 @@ impl App {
         });
     }
 
+    fn api_signin_form(&mut self, ui: &mut egui::Ui) {
+        if let Some(result) = self
+            .api_signin
+            .pending
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        {
+            self.api_signin.pending = None;
+            self.api_signin.factor.clear();
+            match result {
+                Ok(step) => {
+                    if step["ok"] == true {
+                        self.api_signin = ApiSignIn::default();
+                        self.ctrl.refresh_account(true);
+                    } else {
+                        if step["need_human_verification"] != true {
+                            self.api_signin.password.clear();
+                        }
+                        self.api_signin.step = step;
+                    }
+                }
+                Err(error) => {
+                    self.api_signin.password.clear();
+                    self.api_signin.error = Some(error);
+                }
+            }
+        }
+        let busy = self.api_signin.pending.is_some();
+        ui.add_enabled_ui(!busy, |ui| {
+            let form = &mut self.api_signin;
+            let two_factor = form.step["need_2fa"] == true;
+            let mailbox = form.step["need_mailbox_password"] == true;
+            if two_factor || mailbox {
+                ui.label(if two_factor {
+                    "TOTP code"
+                } else {
+                    "Mailbox password"
+                });
+                ui.add(egui::TextEdit::singleline(&mut form.factor).password(true));
+            } else {
+                ui.label("Username");
+                ui.text_edit_singleline(&mut form.username);
+                ui.label("Password");
+                ui.add(egui::TextEdit::singleline(&mut form.password).password(true));
+            }
+            let hv = form.step["need_human_verification"] == true;
+            if hv {
+                ui.label("Complete human verification, then retry sign-in.");
+                if let Some(url) = form.step["url"]
+                    .as_str()
+                    .filter(|url| url.starts_with("https://verify.proton.me/"))
+                {
+                    ui.hyperlink_to("verify.proton.me", url);
+                    if ui.button("Open browser").clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                    }
+                }
+            }
+            if let Some(error) = &form.error {
+                ui.colored_label(DANGER, error);
+            }
+            if ui
+                .button(if hv { "Retry sign-in" } else { "Sign in" })
+                .clicked()
+            {
+                let (method, params) = if two_factor {
+                    (
+                        "auth.submit_2fa",
+                        serde_json::json!({"code":std::mem::take(&mut form.factor)}),
+                    )
+                } else if mailbox {
+                    (
+                        "auth.submit_mailbox_password",
+                        serde_json::json!({"password":std::mem::take(&mut form.factor)}),
+                    )
+                } else {
+                    let mut params =
+                        serde_json::json!({"username":form.username,"password":form.password});
+                    if hv {
+                        params["hv_token"] = form.step["token"].clone();
+                        params["hv_type"] = form.step["methods"][0].clone();
+                    }
+                    ("auth.login", params)
+                };
+                let (tx, rx) = std::sync::mpsc::channel();
+                form.pending = Some(rx);
+                form.error = None;
+                let cfg = self.cfg.clone();
+                let ctx = ui.ctx().clone();
+                thread::spawn(move || {
+                    let result = neutronsync::driveapi::DriveApi::new(&cfg)
+                        .and_then(|api| api.auth(method, params))
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(result);
+                    ctx.request_repaint();
+                });
+            }
+        });
+        if busy {
+            ui.spinner();
+        }
+    }
+
     fn launch_login(&self) {
         let bin = self.cfg.binary.clone();
         thread::spawn(move || {
@@ -2433,11 +2572,19 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if button(ui, None, "Log out", Btn::Danger, false, true).clicked() {
-                            let proton = ProtonCli::new(&self.cfg);
-                            let _ = proton.logout();
+                            let result = if self.cfg.backend == neutronsync::config::Backend::Api {
+                                neutronsync::driveapi::DriveApi::new(&self.cfg)
+                                    .and_then(|api| api.auth("auth.logout", serde_json::json!({})))
+                                    .map(|_| ())
+                            } else {
+                                ProtonCli::new(&self.cfg).logout()
+                            };
                             self.ctrl.refresh_account(false);
                             self.confirm_logout = false;
-                            self.toast(ctx, "Logged out.", false);
+                            match result {
+                                Ok(()) => self.toast(ctx, "Logged out.", false),
+                                Err(error) => self.toast(ctx, error.to_string(), true),
+                            }
                         }
                         if button(ui, None, "Cancel", Btn::Secondary, false, true).clicked() {
                             self.confirm_logout = false;
@@ -3261,7 +3408,7 @@ fn combo_compare(ui: &mut egui::Ui, v: &mut Compare) -> bool {
 // -- starter config ----------------------------------------------------------
 fn starter_config(path: &PathBuf) -> Config {
     Config {
-        backend: neutronsync::config::Backend::Cli,
+        backend: neutronsync::config::Backend::Api,
         sidecar: None,
         binary: "proton-drive".into(),
         upload_flags: vec![

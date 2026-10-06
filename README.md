@@ -5,12 +5,12 @@
 <h1 align="center">NeutronSync</h1>
 
 <p align="center">
-  Bidirectional folder sync for Proton Drive on Linux, built on Proton's official <code>proton-drive</code> CLI.
+  Bidirectional folder sync for Proton Drive on Linux, with a built-in API sidecar.
 </p>
 
-> NeutronSync is an independent, unofficial project. It is not affiliated with, endorsed by, or sponsored by Proton AG. "Proton" and "Proton Drive" are trademarks of Proton AG. NeutronSync never sees your Proton credentials; it only drives Proton's own CLI, which you log in yourself.
+> NeutronSync is an independent, unofficial project. It is not affiliated with, endorsed by, or sponsored by Proton AG. "Proton" and "Proton Drive" are trademarks of Proton AG.
 
-The official `proton-drive` CLI can upload, download, list, and manage sharing, but it has no sync engine. NeutronSync adds one: a three-way-merge engine that keeps one or more local folders and their Proton Drive counterparts in sync in both directions, driven entirely by the CLI's one-shot commands. It ships as a dependency-light CLI plus an optional native GUI, both on one core library.
+NeutronSync keeps local folders and their Proton Drive counterparts in sync through a three-way-merge engine. Its CLI and native GUI share one core library. The bundled `neutronsync-drive` sidecar uses Proton's SDK and owns the API session.
 
 ## Features
 
@@ -24,22 +24,25 @@ The official `proton-drive` CLI can upload, download, list, and manage sharing, 
 
 ## Remote backend
 
-The default backend is `cli`. The optional `api` backend uses one shared `neutronsync-drive` sidecar for two-way sync: folder creation, uploads, verified downloads, renames, moves and recoverable trash. Build it with `sidecar/build.sh` and use its separate signed-in session. Uploads replace same-name files with new revisions and preserve whole-second modification times. Downloads appear atomically after size and SHA-1 verification. API sync writes normal activity history and `sync.log`; use `--dry-run` to preview a plan.
+The default backend is `api`. One `neutronsync-drive` sidecar serves the GUI, tray daemon, CLI and watch processes in your user session. Uploads replace same-name files with new revisions and preserve whole-second modification times. Downloads appear atomically after size and SHA-1 verification. Deletes go to Proton trash. Use `--dry-run` to preview a plan. Existing baselines remain valid even when remote node identifiers differ.
 
 ```toml
 [cli]
-backend = "api"                       # default: "cli"
+backend = "api"                       # default; this line may be omitted
 sidecar = "/path/to/neutronsync-drive" # optional
 ```
 
-Without `sidecar`, NeutronSync looks next to its executable, then on `PATH` for `neutronsync-drive`. API sync and the API watcher do not require the `proton-drive` binary. The API watcher receives sign-out notifications and probes `auth.status` through the sidecar. GUI sign-in still uses the CLI in this phase.
+Without `sidecar`, NeutronSync looks next to its executable, then on `PATH` for `neutronsync-drive`. The package includes it. Set `[cli] backend = "cli"` if the API backend fails and you need the legacy backend. That fallback remains available for one release and requires a separate `proton-drive` installation and sign-in. NeutronSync never silently switches backends. Saving GUI settings preserves an explicit `cli` selection.
+
+The first client starts the session owner. Other clients connect to `$XDG_RUNTIME_DIR/neutronsync-drive/session.sock`. If `XDG_RUNTIME_DIR` is unset, the path is `$HOME/.cache/neutronsync-drive/session.sock`. The socket directory is private, mode `0700`; the owner checks peer UIDs. A lock beside the socket prevents competing owners. The sidecar survives its initiating client; after a sidecar crash, clients reconnect and watchers resume persisted event cursors.
 
 Use `neutronsync sync --dry-run --backend api` to override the config for one run. `--backend cli` selects the CLI instead. API excludes hide paths and their descendants from the plan, but the API backend still lists those folders remotely.
 
 ## Requirements
 
 - Linux with a recent Rust toolchain (edition 2021) if building from source.
-- The official `proton-drive` CLI on your `PATH` (<https://proton.me/blog/proton-drive-cli>). Verified against `cli-drive 0.8.0`.
+- An unlocked Secret Service keyring in your desktop session and `secret-tool` (`libsecret-tools` on Debian/Ubuntu; `libsecret` on Fedora/RHEL).
+- The official `proton-drive` CLI only for `backend = "cli"` (<https://proton.me/blog/proton-drive-cli>).
 - `gio` (from glib, present on most desktops) for recoverable local deletes; a manual XDG-trash fallback is used if it is missing.
 
 ## Install
@@ -57,7 +60,7 @@ sudo apt install ./neutronsync_<version>_amd64.deb
 sudo dnf install ./neutronsync-<version>.x86_64.rpm
 ```
 
-Both packages install the `neutronsync` CLI and `neutronsync-gui` GUI to `/usr/bin`, a desktop launcher, and systemd user units. A portable `neutronsync-<version>-x86_64-linux.tar.gz` (both binaries) is also attached to each release if you'd rather not use a package manager.
+Both packages install `neutronsync`, `neutronsync-gui` and `neutronsync-drive` to `/usr/bin`, plus a desktop launcher and systemd user units. They depend on the package providing `secret-tool`. The binary tarball contains all three binaries; keep them together and provide `secret-tool` and a Secret Service session yourself.
 
 ### From source
 
@@ -65,6 +68,11 @@ Both packages install the `neutronsync` CLI and `neutronsync-gui` GUI to `/usr/b
 # CLI
 cargo install --path .                      # -> ~/.cargo/bin/neutronsync
 cargo test                                  # engine + unit tests
+
+# Sidecar (Bun 1.4.0)
+(cd sidecar && bun install --frozen-lockfile && bun test)
+sidecar/build.sh
+install -m 755 sidecar/dist/neutronsync-drive ~/.cargo/bin/neutronsync-drive
 
 # GUI (opt-in feature, keeps the CLI dependency-light)
 cargo build --release --features gui --bin neutronsync-gui
@@ -81,20 +89,20 @@ sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
 
 ### GUI
 
-Launch **NeutronSync** from your app menu (or `neutronsync-gui`). Sign in to Proton (this opens Proton's own login in your browser and signs in the CLI), add folder pairs on the Folders page, and use "Choose folders to sync" to exclude any sub-folders you don't want. Settings covers the tray, auto-sync, conflict handling, and your update channel.
+Launch **NeutronSync** from your app menu. Enter your username and password in the sign-in form. If prompted, enter your TOTP code or mailbox password. For human verification, open the shown `verify.proton.me` link, complete verification, then select **Retry sign-in**. Password fields stay masked. Add folder pairs on the Folders page and select **Choose folders to sync** to set exclusions. The Account page also provides sign-in and sign-out.
 
 ### CLI
 
 ```sh
-neutronsync login                       # proton-drive auth login (browser)
 neutronsync init                        # write ~/.config/neutronsync/neutronsync.toml
+neutronsync login                       # sidecar sign-in; passwords are not echoed
 $EDITOR ~/.config/neutronsync/neutronsync.toml
 neutronsync sync --dry-run              # preview
 neutronsync sync                        # apply
 neutronsync watch                       # live sync: FS events + periodic rescan
 ```
 
-`init` writes an empty config; add your own `[[pair]]` entries. Other commands: `status`, `doctor [REMOTE_PATH]` (probe the CLI and show list parsing), `logout`. `sync` takes `--dry-run`, `--resync` (rebuild the baseline from the union of both sides), and `--json`; passing pair names syncs only those.
+`login` prompts for username, password and any required TOTP or mailbox password. Human verification offers a browser link and waits for confirmation before retrying. `init` writes an empty config; add your own `[[pair]]` entries. `status` reports the account through `auth.status`. `doctor [REMOTE_PATH]` probes the selected backend. `logout` signs out through that backend. `sync` takes `--dry-run`, `--resync` and `--json`; passing pair names syncs only those.
 
 ## How it works
 
@@ -172,11 +180,20 @@ Releases come from GitHub. Every tag ships as a pre-release; a stable release is
 
 ## Privacy and trust
 
-NeutronSync has no access to your Proton account. Logging in runs Proton's own `proton-drive auth login` in your browser; the CLI stores the session in your OS keyring, and all encryption and decryption is done by Proton's software. NeutronSync never sees, stores, or transmits your password or Proton credentials. Sync logs (which record file paths, not secrets) are written private to your user.
+The API sign-in form passes credentials over the private local socket to the sidecar. The sidecar stores session tokens and the derived key passphrase in your Secret Service keyring. Passwords, TOTP codes and tokens never enter logs, configuration, activity history or process arguments. One process owns and refreshes the session. Existing phase-labelled sessions migrate automatically to `NeutronSync Drive session`. See [SECURITY.md](SECURITY.md) for the threat model.
+
+## Troubleshooting
+
+- **Sidecar missing:** reinstall the package or build `sidecar/` and place `neutronsync-drive` beside the Rust binaries or on `PATH`. You can also set `cli.sidecar`. The legacy fallback is `[cli] backend = "cli"`.
+- **`secret-tool` missing:** install `libsecret-tools` on Debian/Ubuntu or `libsecret` on Fedora/RHEL.
+- **No Secret Service session:** start and unlock your desktop keyring. Run NeutronSync in the same user D-Bus session. A headless service needs that session too.
+- **Human verification:** complete the shown Proton verification link, then retry sign-in. The CLI waits for Enter before retrying.
+- **Signed out:** sign in from Account or run `neutronsync login`. Refresh the Account page if needed. The watcher resumes from its saved event cursor.
+- **Sidecar path differs:** all clients in one user session must select the same executable. Align `cli.sidecar` before reconnecting.
 
 ## Known limitations
 
-- Remote-side changes (edits on another device) are only noticed on a hot or full pass, not instantly, because the CLI has no event feed and must re-walk. Actively-changed local folders sync immediately; see [docs/SYNC_MODEL.md](docs/SYNC_MODEL.md).
+- The legacy CLI backend notices remote changes on a hot or full pass. The default API backend polls remote events every five seconds.
 - Default `compare = "size+mtime"` can miss an in-place edit that keeps the same size and mtime; use `compare = "sha1"` to compare content exactly.
 - Renames look like a delete + create.
 

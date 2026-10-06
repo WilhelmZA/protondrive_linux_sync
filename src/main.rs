@@ -7,12 +7,14 @@ use clap::{Parser, Subcommand};
 
 use neutronsync::backend::{effective_dry_run, select};
 use neutronsync::config::{self, Backend, Config};
+use neutronsync::driveapi::DriveApi;
 use neutronsync::engine::Engine;
 use neutronsync::events::{EventSink, SyncEvent};
 use neutronsync::logger::Logger;
 use neutronsync::protoncli::ProtonCli;
 use neutronsync::stats::Stats;
 use neutronsync::EXAMPLE_CONFIG;
+use serde_json::json;
 
 /// Records each finished op into `stats.db` so a CLI sync shows up in the same
 /// activity feed the GUI reads (the GUI restores the feed from this table).
@@ -49,7 +51,7 @@ impl EventSink for DbSink {
 #[command(
     name = "neutronsync",
     version,
-    about = "Bidirectional Proton Drive folder sync built on the official proton-drive CLI"
+    about = "Bidirectional Proton Drive folder sync with a built-in API sidecar"
 )]
 struct Cli {
     /// Path to the config file.
@@ -72,13 +74,13 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Browser login (proton-drive auth login).
+    /// Sign in through the selected backend.
     Login,
-    /// proton-drive auth logout.
+    /// Sign out through the selected backend.
     Logout,
-    /// Show config, resolved pairs and CLI availability.
+    /// Show config, resolved pairs and account status.
     Status,
-    /// Probe the CLI and show how a listing is parsed.
+    /// Probe the selected backend and its remote listing.
     Doctor { path: Option<String> },
     /// Run the bidirectional sync.
     Sync {
@@ -157,15 +159,72 @@ fn cmd_init(cli: &Cli, force: bool) -> anyhow::Result<ExitCode> {
 
 fn cmd_login(cli: &Cli) -> anyhow::Result<ExitCode> {
     let cfg = load_cfg(cli)?;
+    if cfg.backend == Backend::Api {
+        let api = DriveApi::new(&cfg)?;
+        let username = prompt("Username: ")?;
+        let password = rpassword::prompt_password("Password: ")?;
+        let mut result = api.auth(
+            "auth.login",
+            json!({"username":username,"password":password}),
+        )?;
+        loop {
+            if result["ok"] == true {
+                break;
+            }
+            result = if result["need_2fa"] == true {
+                api.auth(
+                    "auth.submit_2fa",
+                    json!({"code":rpassword::prompt_password("TOTP code: ")?}),
+                )?
+            } else if result["need_mailbox_password"] == true {
+                api.auth(
+                    "auth.submit_mailbox_password",
+                    json!({"password":rpassword::prompt_password("Mailbox password: ")?}),
+                )?
+            } else if result["need_human_verification"] == true {
+                let url = result["url"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("api backend: fatal"))?;
+                if !url.starts_with("https://verify.proton.me/") {
+                    anyhow::bail!("api backend: fatal");
+                }
+                println!("Complete human verification: {url}");
+                if prompt("Open in your browser? [y/N] ")?.eq_ignore_ascii_case("y") {
+                    let _ = std::process::Command::new("xdg-open").arg(url).status();
+                }
+                prompt("Press Enter after verification completes: ")?;
+                api.auth("auth.login", json!({"username":username,"password":password,"hv_token":result["token"],"hv_type":result["methods"][0]}))?
+            } else {
+                anyhow::bail!("api backend: fatal");
+            };
+        }
+        println!("Logged in.");
+        return Ok(ExitCode::SUCCESS);
+    }
     let proton = ProtonCli::new(&cfg);
     proton.login()?;
     println!("Logged in.");
     Ok(ExitCode::SUCCESS)
 }
 
+fn prompt(label: &str) -> anyhow::Result<String> {
+    use std::io::Write;
+    print!("{label}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line)? == 0 {
+        anyhow::bail!("sign-in cancelled");
+    }
+    Ok(line.trim().to_string())
+}
+
 fn cmd_logout(cli: &Cli) -> anyhow::Result<ExitCode> {
     let cfg = load_cfg(cli)?;
-    ProtonCli::new(&cfg).logout()?;
+    if cfg.backend == Backend::Api {
+        DriveApi::new(&cfg)?.auth("auth.logout", json!({}))?;
+    } else {
+        ProtonCli::new(&cfg).logout()?;
+    }
     println!("Logged out.");
     Ok(ExitCode::SUCCESS)
 }
@@ -181,7 +240,19 @@ fn cmd_status(cli: &Cli) -> anyhow::Result<ExitCode> {
     if let Some(p) = &cfg.source_path {
         println!("config          {}", p.display());
     }
-    println!("proton-drive    {resolved} (configured: {})", cfg.binary);
+    println!("backend         {:?}", cfg.backend);
+    if cfg.backend == Backend::Api {
+        match DriveApi::new(&cfg).and_then(|api| api.status()) {
+            Ok(status) => println!(
+                "signed in       {} (sidecar auth.status; account: {})",
+                status["signed_in"],
+                status["account"].as_str().unwrap_or("none")
+            ),
+            Err(error) => println!("signed in       unavailable: {error}"),
+        }
+    } else {
+        println!("proton-drive    {resolved} (configured: {})", cfg.binary);
+    }
     println!("remote root     {}", cfg.remote_root);
     println!(
         "propagate del.  {} (local -> {:?})",
@@ -205,6 +276,19 @@ fn cmd_status(cli: &Cli) -> anyhow::Result<ExitCode> {
 
 fn cmd_doctor(cli: &Cli, path: Option<&str>) -> anyhow::Result<ExitCode> {
     let cfg = load_cfg(cli)?;
+    if cfg.backend == Backend::Api {
+        let api = DriveApi::new(&cfg)?;
+        let status = api.status()?;
+        println!(
+            "backend: api\nsidecar auth.status: signed_in={}, account={}",
+            status["signed_in"],
+            status["account"].as_str().unwrap_or("none")
+        );
+        use neutronsync::protoncli::Remote;
+        let entries = api.list_dir(path.unwrap_or(&cfg.remote_root))?;
+        println!("sidecar node.list: {} entries", entries.len());
+        return Ok(ExitCode::SUCCESS);
+    }
     let proton = ProtonCli::new(&cfg);
     println!(
         "binary: {}",

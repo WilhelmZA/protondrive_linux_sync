@@ -623,6 +623,36 @@ impl Controller {
         let state = self.state.clone();
         state.lock().unwrap().account.checking = true;
         thread::spawn(move || {
+            if cfg.backend == crate::config::Backend::Api {
+                let result = crate::driveapi::DriveApi::new(&cfg).and_then(|api| api.status());
+                let (usable, signed_in, version) = match result {
+                    Ok(status) => (
+                        true,
+                        status["signed_in"] == true,
+                        format!(
+                            "neutronsync-drive — {}",
+                            status["account"].as_str().unwrap_or("not signed in")
+                        ),
+                    ),
+                    Err(error) => (false, false, error.to_string()),
+                };
+                let mut s = state.lock().unwrap();
+                s.account = AccountState {
+                    checked: true,
+                    binary_found: usable,
+                    signed_in,
+                    version,
+                    checking: false,
+                };
+                if usable {
+                    s.signed_out = !signed_in;
+                }
+                drop(s);
+                if signal_watch && signed_in {
+                    crate::auth_signal::signal(&cfg.state_dir);
+                }
+                return;
+            }
             let proton = ProtonCli::new(&cfg);
             let signed_in = proton.list_dir(&cfg.remote_root).is_ok();
             let account = match proton.resolve_binary() {

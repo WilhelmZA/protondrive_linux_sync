@@ -44,6 +44,7 @@ impl Remote for ReadOnly {
 }
 
 fn config_at(root: &Path) -> Config {
+    std::env::set_var("NEUTRONSYNC_DRIVE_STDIO", "1");
     let fixture = root.join("fake-sidecar");
     fs::write(&fixture, include_str!("fixtures/drive_sidecar.py")).unwrap();
     fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
@@ -426,6 +427,42 @@ fn scripted_sidecar_contract_and_read_only_guard() {
 }
 
 #[test]
+fn status_reports_missing_sidecar_repairs_and_remaining_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    fs::write(&path, "[cli]\nsidecar = '/no-such-neutronsync-drive'\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_neutronsync"))
+        .args(["status", "--config", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "neutronsync-drive",
+        "Install the NeutronSync package",
+        "build sidecar/",
+        "backend = \"cli\"",
+        "state dir",
+        "pairs:",
+    ] {
+        assert!(text.contains(expected), "{text}");
+    }
+}
+
+#[test]
+fn default_config_selects_api_and_explicit_cli_survives_settings_write() {
+    assert_eq!(Backend::default(), Backend::Api);
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    fs::write(&path, "").unwrap();
+    assert_eq!(config::load(path.to_str()).unwrap().backend, Backend::Api);
+    fs::write(&path, "[cli]\nbackend = 'cli'\n").unwrap();
+    let cfg = config::load(path.to_str()).unwrap();
+    fs::write(&path, config::to_toml(&cfg).unwrap()).unwrap();
+    assert_eq!(config::load(path.to_str()).unwrap().backend, Backend::Cli);
+}
+
+#[test]
 fn backend_config_roundtrip_and_argument_validation() {
     let temp = tempfile::tempdir().unwrap();
     let mut cfg = config_at(temp.path());
@@ -443,7 +480,7 @@ fn backend_config_roundtrip_and_argument_validation() {
         .to_string()
         .contains("cli.backend"));
     fs::write(&path, "").unwrap();
-    assert_eq!(config::load(path.to_str()).unwrap().backend, Backend::Cli);
+    assert_eq!(config::load(path.to_str()).unwrap().backend, Backend::Api);
     let output = Command::new(env!("CARGO_BIN_EXE_neutronsync"))
         .args(["sync", "--backend", "invalid"])
         .output()
