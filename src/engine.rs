@@ -19,11 +19,12 @@ use anyhow::Result;
 
 use crate::events::{EventSink, SyncEvent};
 
+use crate::backend::{effective_dry_run, select};
 use crate::config::{remote_join, strip_root, Config, ConflictPolicy, LocalDelete, Pair};
 use crate::datefmt::{epoch_to_stamp, now_epoch};
 use crate::logger::Logger;
 use crate::models::{same_content, Action, Change, Compare, DownloadJob, Entry, Op, Plan};
-use crate::protoncli::{ListOutcome, ProtonCli, Remote};
+use crate::protoncli::{ListOutcome, Remote};
 use crate::trash::trash_local;
 
 pub struct SyncResult {
@@ -42,7 +43,7 @@ pub struct RunSummary {
     pub pairs: usize,
 }
 
-/// One-shot reconcile of the given pairs with a fresh ProtonCli.
+/// One-shot reconcile of the given pairs with the configured backend.
 pub fn run_sync(
     cfg: &Config,
     pairs: &[Pair],
@@ -64,21 +65,13 @@ pub fn run_sync_with(
     events: Option<&dyn EventSink>,
     cancel: Option<&AtomicBool>,
 ) -> RunSummary {
-    let proton = ProtonCli::new(cfg);
-    if proton.resolve_binary().is_none() {
-        log.error("proton-drive not found on PATH");
-        if let Some(sink) = events {
-            sink.emit(&SyncEvent::Error {
-                pair: None,
-                text: "proton-drive not found on PATH".into(),
-            });
-        }
-        return RunSummary {
-            applied: 0,
-            errors: 1,
-            pairs: 0,
-        };
-    }
+    let run_log = sync_logger(cfg, log);
+    let log = &run_log;
+    let proton = match sync_remote(cfg, log, events) {
+        Ok(remote) => remote,
+        Err(summary) => return summary,
+    };
+    let dry_run = effective_dry_run(&proton, dry_run, log);
     let mut engine = Engine::new(cfg, proton, log, dry_run);
     engine.set_observer(events, cancel);
     let (mut applied, mut errors) = (0usize, 0usize);
@@ -121,16 +114,14 @@ pub fn run_sync_scoped(
     events: Option<&dyn EventSink>,
     cancel: Option<&AtomicBool>,
 ) -> RunSummary {
-    let proton = ProtonCli::new(cfg);
-    if proton.resolve_binary().is_none() {
-        log.error("proton-drive not found on PATH");
-        return RunSummary {
-            applied: 0,
-            errors: 1,
-            pairs: 0,
-        };
-    }
-    let mut engine = Engine::new(cfg, proton, log, false);
+    let run_log = sync_logger(cfg, log);
+    let log = &run_log;
+    let proton = match sync_remote(cfg, log, events) {
+        Ok(remote) => remote,
+        Err(summary) => return summary,
+    };
+    let dry_run = effective_dry_run(&proton, false, log);
+    let mut engine = Engine::new(cfg, proton, log, dry_run);
     engine.set_observer(events, cancel);
     match engine.sync_pair_scoped(pair, false, Some(scope)) {
         Ok(r) => RunSummary {
@@ -226,15 +217,13 @@ pub fn run_sync_shallow(
     events: Option<&dyn EventSink>,
     cancel: Option<&AtomicBool>,
 ) -> RunSummary {
-    let proton = ProtonCli::new(cfg);
-    if proton.resolve_binary().is_none() {
-        log.error("proton-drive not found on PATH");
-        return RunSummary {
-            applied: 0,
-            errors: 1,
-            pairs: 0,
-        };
-    }
+    let run_log = sync_logger(cfg, log);
+    let log = &run_log;
+    let proton = match sync_remote(cfg, log, events) {
+        Ok(remote) => remote,
+        Err(summary) => return summary,
+    };
+    let dry_run = effective_dry_run(&proton, false, log);
     // Show which folder is being checked (so the banner isn't a generic
     // "Scanning folder pairs" during a single-folder reconcile).
     if let Some(sink) = events {
@@ -244,7 +233,7 @@ pub fn run_sync_shallow(
             current: remote_join(&pair.remote, folder),
         });
     }
-    let mut engine = Engine::new(cfg, proton, log, false);
+    let mut engine = Engine::new(cfg, proton, log, dry_run);
     engine.set_observer(events, cancel);
     match engine.sync_pair_shallow(pair, folder) {
         Ok((r, _children)) => RunSummary {
@@ -283,21 +272,13 @@ pub fn run_sync_streaming(
     events: Option<&dyn EventSink>,
     cancel: Option<&AtomicBool>,
 ) -> RunSummary {
-    let proton = ProtonCli::new(cfg);
-    if proton.resolve_binary().is_none() {
-        log.error("proton-drive not found on PATH");
-        if let Some(sink) = events {
-            sink.emit(&SyncEvent::Error {
-                pair: Some(pair.name.clone()),
-                text: "proton-drive not found on PATH".into(),
-            });
-        }
-        return RunSummary {
-            applied: 0,
-            errors: 1,
-            pairs: 0,
-        };
-    }
+    let run_log = sync_logger(cfg, log);
+    let log = &run_log;
+    let proton = match sync_remote(cfg, log, events) {
+        Ok(remote) => remote,
+        Err(summary) => return summary,
+    };
+    let dry_run = effective_dry_run(&proton, false, log);
     // Refuse a vanished local root (unmounted drive) rather than walk into an
     // empty mountpoint and read every remote file as a deletion.
     if !pair.local.exists() {
@@ -321,7 +302,7 @@ pub fn run_sync_streaming(
     // One shared baseline snapshot for the whole walk. Each folder reads only its
     // own (disjoint) rows from it, and only its own reconcile writes them, so a
     // snapshot taken now stays correct throughout.
-    let base = match crate::state::load_baseline(&cfg.state_dir, &pair.name) {
+    let base = match sync_baseline(cfg, &pair.name, dry_run) {
         Ok(b) => std::sync::Arc::new(b),
         Err(e) => {
             log.error(&format!("baseline load failed for {:?}: {e}", pair.name));
@@ -366,8 +347,15 @@ pub fn run_sync_streaming(
                 s.spawn(|| {
                     // One Engine (and CLI cache) per worker, reused across the
                     // folders it handles this level to amortise CLI startup.
-                    let proton = ProtonCli::new(cfg);
-                    let mut eng = Engine::new(cfg, proton, log, false);
+                    let proton = match select(cfg) {
+                        Ok(remote) => remote,
+                        Err(e) => {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                            log.error(&e.to_string());
+                            return;
+                        }
+                    };
+                    let mut eng = Engine::new(cfg, proton, log, dry_run);
                     eng.set_observer(events, cancel);
                     loop {
                         if is_cancelled() {
@@ -406,7 +394,7 @@ pub fn run_sync_streaming(
         frontier.dedup();
     }
 
-    if !is_cancelled() {
+    if !dry_run && !is_cancelled() {
         let _ = crate::state::set_last_synced(&cfg.state_dir, &pair.name, now_epoch());
     }
     let applied = applied.load(Ordering::Relaxed);
@@ -440,19 +428,17 @@ pub fn run_sync_shallow_many(
     events: Option<&dyn EventSink>,
     cancel: Option<&AtomicBool>,
 ) -> RunSummary {
+    let run_log = sync_logger(cfg, log);
+    let log = &run_log;
+    let proton = match sync_remote(cfg, log, events) {
+        Ok(remote) => remote,
+        Err(summary) => return summary,
+    };
+    let dry_run = effective_dry_run(&proton, false, log);
     if folders.is_empty() {
         return RunSummary {
             applied: 0,
             errors: 0,
-            pairs: 0,
-        };
-    }
-    let proton = ProtonCli::new(cfg);
-    if proton.resolve_binary().is_none() {
-        log.error("proton-drive not found on PATH");
-        return RunSummary {
-            applied: 0,
-            errors: 1,
             pairs: 0,
         };
     }
@@ -467,7 +453,7 @@ pub fn run_sync_shallow_many(
             pairs: 1,
         };
     }
-    let base = match crate::state::load_baseline(&cfg.state_dir, &pair.name) {
+    let base = match sync_baseline(cfg, &pair.name, dry_run) {
         Ok(b) => std::sync::Arc::new(b),
         Err(e) => {
             log.error(&format!("baseline load failed for {:?}: {e}", pair.name));
@@ -503,8 +489,15 @@ pub fn run_sync_shallow_many(
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| {
-                let proton = ProtonCli::new(cfg);
-                let mut eng = Engine::new(cfg, proton, log, false);
+                let proton = match select(cfg) {
+                    Ok(remote) => remote,
+                    Err(e) => {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                        log.error(&e.to_string());
+                        return;
+                    }
+                };
+                let mut eng = Engine::new(cfg, proton, log, dry_run);
                 eng.set_observer(events, cancel);
                 loop {
                     if is_cancelled() {
@@ -554,10 +547,47 @@ pub fn run_sync_shallow_many(
     }
 }
 
+fn sync_logger(cfg: &Config, log: &Logger) -> Logger {
+    if cfg.backend == crate::config::Backend::Api {
+        log.without_file()
+    } else {
+        log.clone()
+    }
+}
+
+fn sync_remote(
+    cfg: &Config,
+    log: &Logger,
+    events: Option<&dyn EventSink>,
+) -> std::result::Result<Box<dyn Remote + Send + Sync>, RunSummary> {
+    select(cfg).map_err(|e| {
+        log.error(&e.to_string());
+        if let Some(sink) = events {
+            sink.emit(&SyncEvent::Error {
+                pair: None,
+                text: e.to_string(),
+            });
+        }
+        RunSummary {
+            applied: 0,
+            errors: 1,
+            pairs: 0,
+        }
+    })
+}
+
+fn sync_baseline(cfg: &Config, pair: &str, read_only: bool) -> Result<BTreeMap<String, Entry>> {
+    if read_only {
+        crate::state::load_baseline_read_only(&cfg.state_dir, pair)
+    } else {
+        crate::state::load_baseline(&cfg.state_dir, pair)
+    }
+}
+
 pub struct Engine<'a, R: Remote> {
     cfg: &'a Config,
     remote: R,
-    log: &'a Logger,
+    log: Logger,
     dry_run: bool,
     gio: Option<PathBuf>,
     ensured: HashSet<String>,
@@ -567,6 +597,12 @@ pub struct Engine<'a, R: Remote> {
 
 impl<'a, R: Remote> Engine<'a, R> {
     pub fn new(cfg: &'a Config, remote: R, log: &'a Logger, dry_run: bool) -> Self {
+        let log = if remote.read_only() {
+            log.without_file()
+        } else {
+            log.clone()
+        };
+        let dry_run = effective_dry_run(&remote, dry_run, &log);
         Engine {
             cfg,
             remote,
@@ -730,7 +766,7 @@ impl<'a, R: Remote> Engine<'a, R> {
         let scoped_base = scope.map(|s| remote_join(&pair.remote, s));
         let base = scoped_base.as_deref().unwrap_or(pair.remote.as_str());
         let pair_name = pair.name.as_str();
-        let log = self.log;
+        let log = &self.log;
         let events = self.events;
         let counter = AtomicUsize::new(0);
         let progress = |p: &str| {
@@ -782,7 +818,7 @@ impl<'a, R: Remote> Engine<'a, R> {
         let base: BTreeMap<String, Entry> = if resync {
             BTreeMap::new()
         } else {
-            let full = crate::state::load_baseline(&self.cfg.state_dir, &pair.name)?;
+            let full = sync_baseline(self.cfg, &pair.name, self.remote.read_only())?;
             match scope {
                 Some(s) => {
                     let prefix = format!("{s}/");
@@ -1475,7 +1511,7 @@ impl<'a, R: Remote> Engine<'a, R> {
         }
 
         let events = self.events;
-        let log = self.log;
+        let log = &self.log;
         let pair_name = pair.name.as_str();
         let local_root = &pair.local;
         let applied = AtomicUsize::new(0);
@@ -1768,7 +1804,7 @@ impl<'a, R: Remote> Engine<'a, R> {
         pair: &Pair,
         folder: &str,
     ) -> Result<(SyncResult, Vec<String>)> {
-        let base_all = crate::state::load_baseline(&self.cfg.state_dir, &pair.name)?;
+        let base_all = sync_baseline(self.cfg, &pair.name, self.remote.read_only())?;
         self.sync_pair_shallow_with_base(pair, folder, &base_all)
     }
 
@@ -1779,7 +1815,7 @@ impl<'a, R: Remote> Engine<'a, R> {
     /// with any `Remote` (including the test fake) and is the tested reference
     /// for the walk's semantics.
     pub fn sync_pair_streaming(&mut self, pair: &Pair) -> Result<SyncResult> {
-        let base = crate::state::load_baseline(&self.cfg.state_dir, &pair.name)?;
+        let base = sync_baseline(self.cfg, &pair.name, self.remote.read_only())?;
         let mut applied = 0usize;
         let mut errors: Vec<String> = Vec::new();
         let mut frontier: Vec<String> = vec![String::new()];

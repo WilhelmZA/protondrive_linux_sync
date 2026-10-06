@@ -99,6 +99,20 @@ pub fn load_baseline(state_dir: &Path, name: &str) -> Result<BTreeMap<String, En
     stats.load_baseline(name)
 }
 
+/// Read without creating a DB, migrating legacy JSON, or touching WAL/SHM files.
+pub fn load_baseline_read_only(state_dir: &Path, name: &str) -> Result<BTreeMap<String, Entry>> {
+    let entries = if state_dir.join("stats.db").exists() {
+        Stats::copied_baseline(state_dir, name)?
+    } else {
+        BTreeMap::new()
+    };
+    if entries.is_empty() {
+        Ok(read_json_baseline(state_dir, name).unwrap_or(entries))
+    } else {
+        Ok(entries)
+    }
+}
+
 pub fn save_baseline(
     state_dir: &Path,
     name: &str,

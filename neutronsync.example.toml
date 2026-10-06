@@ -2,6 +2,10 @@
 # (or run `neutronsync init`), then edit. See README.md.
 
 [cli]
+# Backend defaults to "cli"; "api" is read-only until Phase 2.
+# backend = "cli"
+# Optional sidecar path; default: next to neutronsync, then on PATH.
+# sidecar = "/path/to/neutronsync-drive"
 # Path to the official proton-drive binary. Leave as-is to find it on $PATH.
 binary = "proton-drive"
 # Flags appended to `filesystem upload` so an existing remote file is overwritten

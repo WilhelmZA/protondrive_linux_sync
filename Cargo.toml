@@ -25,6 +25,7 @@ clap = { version = "4", features = ["derive"] }
 sha1_smol = "1"
 walkdir = "2"
 anyhow = "1"
+tempfile = "3"
 eframe = { version = "0.35", optional = true }
 egui-phosphor = { version = "0.13", optional = true, default-features = false, features = ["regular"] }
 rfd = { version = "0.17.2", optional = true }

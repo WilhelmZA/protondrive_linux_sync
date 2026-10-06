@@ -6,7 +6,7 @@ use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Rotate `sync.log` once it passes this size, keeping one previous generation
 /// (`sync.log.1`). The log records every operation, so an unrotated file grows
@@ -20,15 +20,35 @@ struct LogFile {
     size: u64,
 }
 
+#[derive(Clone)]
 pub struct Logger {
     verbose: bool,
     quiet: bool,
-    file: Option<Mutex<LogFile>>,
+    file: Option<Arc<Mutex<LogFile>>>,
     tx: Option<Sender<String>>,
     console: bool,
 }
 
 impl Logger {
+    /// Console output without creating a state directory or log file.
+    pub fn console(verbose: bool, quiet: bool) -> Self {
+        Self {
+            verbose,
+            quiet,
+            file: None,
+            tx: None,
+            console: true,
+        }
+    }
+
+    /// Preserve console/channel reporting but suppress disk writes for planning.
+    pub fn without_file(&self) -> Self {
+        Self {
+            file: None,
+            ..self.clone()
+        }
+    }
+
     pub fn new(log_dir: &Path, verbose: bool, quiet: bool) -> Self {
         // Logs record decrypted file paths, so keep them private to the user:
         // the directory is created 0700 and the log file 0600 (modes apply when
@@ -40,7 +60,7 @@ impl Logger {
             .create(log_dir)
             .ok()
             .and_then(|_| open_log(&path))
-            .map(Mutex::new);
+            .map(|f| Arc::new(Mutex::new(f)));
         Logger {
             verbose,
             quiet,

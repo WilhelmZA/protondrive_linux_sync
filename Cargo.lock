@@ -2592,6 +2592,7 @@ dependencies = [
  "serde_json",
  "sha1_smol",
  "sha2",
+ "tempfile",
  "toml",
  "tray-icon",
  "ureq",

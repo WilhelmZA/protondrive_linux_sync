@@ -8,8 +8,10 @@
 //! depend on the same core (config, engine, adapter, state).
 
 pub mod auth_signal;
+pub mod backend;
 pub mod config;
 pub mod datefmt;
+pub mod driveapi;
 pub mod engine;
 pub mod events;
 pub mod ignore;
@@ -29,6 +31,10 @@ pub mod watcher;
 pub const EXAMPLE_CONFIG: &str = r#"# neutronsync configuration. See README.md.
 
 [cli]
+# Backend defaults to "cli"; "api" is read-only until Phase 2.
+# backend = "cli"
+# Optional sidecar path; default: next to neutronsync, then on PATH.
+# sidecar = "/path/to/neutronsync-drive"
 # Path to the official proton-drive binary. Leave as-is to find it on $PATH.
 binary = "proton-drive"
 # Both upload and download prompt interactively without a conflict strategy,

@@ -996,8 +996,7 @@ impl eframe::App for App {
                         // daemon's possibly stale signed_out flag (up to 20s lag
                         // without a refresh signal).
                         if mine.account.checked {
-                            pubd.signed_out =
-                                mine.account.binary_found && !mine.account.signed_in;
+                            pubd.signed_out = mine.account.binary_found && !mine.account.signed_in;
                         }
                         pubd
                     }
@@ -3262,6 +3261,8 @@ fn combo_compare(ui: &mut egui::Ui, v: &mut Compare) -> bool {
 // -- starter config ----------------------------------------------------------
 fn starter_config(path: &PathBuf) -> Config {
     Config {
+        backend: neutronsync::config::Backend::Cli,
+        sidecar: None,
         binary: "proton-drive".into(),
         upload_flags: vec![
             "--file-conflict-strategy".into(),

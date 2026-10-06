@@ -34,6 +34,11 @@ use crate::models::{DownloadJob, Entry, TreeScan};
 
 /// The remote operations the engine needs. A fake implements this in tests.
 pub trait Remote {
+    /// Forces planning only, including local operations and state persistence.
+    fn read_only(&self) -> bool {
+        false
+    }
+
     fn list_dir(&self, remote_path: &str) -> Result<Vec<Entry>>;
 
     /// Like [`list_dir`] but distinguishes a genuine "not found" from an empty
@@ -821,7 +826,7 @@ fn first_nonempty(a: &str, b: &str) -> String {
 /// Whether a remote node name is a single, safe local path component: not
 /// empty, not "." or "..", and free of path separators or NUL. Rejecting the
 /// rest stops a hostile or shared node name from escaping a pair's local root.
-fn is_safe_component(name: &str) -> bool {
+pub(crate) fn is_safe_component(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."

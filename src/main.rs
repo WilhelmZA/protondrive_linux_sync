@@ -5,7 +5,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use neutronsync::config::{self, Config};
+use neutronsync::backend::{effective_dry_run, select};
+use neutronsync::config::{self, Backend, Config};
 use neutronsync::engine::Engine;
 use neutronsync::events::{EventSink, SyncEvent};
 use neutronsync::logger::Logger;
@@ -81,6 +82,9 @@ enum Cmd {
     Doctor { path: Option<String> },
     /// Run the bidirectional sync.
     Sync {
+        /// Override the configured remote backend for this run.
+        #[arg(long, value_enum)]
+        backend: Option<Backend>,
         /// Pair name(s) to sync (default: all).
         pair: Vec<String>,
         #[arg(long)]
@@ -116,11 +120,12 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
         Cmd::Status => cmd_status(cli),
         Cmd::Doctor { path } => cmd_doctor(cli, path.as_deref()),
         Cmd::Sync {
+            backend,
             pair,
             dry_run,
             resync,
             json,
-        } => cmd_sync(cli, pair, *dry_run, *resync, *json),
+        } => cmd_sync(cli, pair, *dry_run, *resync, *json, *backend),
         Cmd::Watch { pair } => cmd_watch(cli, pair),
     }
 }
@@ -245,9 +250,19 @@ fn cmd_sync(
     dry_run: bool,
     resync: bool,
     json: bool,
+    backend: Option<Backend>,
 ) -> anyhow::Result<ExitCode> {
-    let cfg = load_cfg(cli)?;
-    let log = Logger::new(&cfg.log_dir(), cli.verbose, cli.quiet);
+    let mut cfg = load_cfg(cli)?;
+    if let Some(backend) = backend {
+        cfg.backend = backend;
+    }
+    let proton = select(&cfg)?;
+    let log = if proton.read_only() {
+        Logger::console(cli.verbose, cli.quiet)
+    } else {
+        Logger::new(&cfg.log_dir(), cli.verbose, cli.quiet)
+    };
+    let dry_run = effective_dry_run(&proton, dry_run, &log);
 
     // Select pairs.
     let selected: Vec<&neutronsync::config::Pair> = if pairs.is_empty() {
@@ -266,14 +281,6 @@ fn cmd_sync(
         out
     };
 
-    let proton = ProtonCli::new(&cfg);
-    if proton.resolve_binary().is_none() {
-        log.error(&format!(
-            "proton-drive not found (configured: {:?}). Install it or set cli.binary.",
-            cfg.binary
-        ));
-        return Ok(ExitCode::from(1));
-    }
     if dry_run {
         log.info("DRY RUN - no changes will be made.\n");
     }

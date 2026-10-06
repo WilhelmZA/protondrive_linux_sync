@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+- Optional read-only API backend through one shared `neutronsync-drive` sidecar. Configure `[cli] backend = "api"` and optional `sidecar`, or use `sync --backend api`. Phase 1 forces planning only and preserves local files and state, including activity history and logs.
+
 ### Fixed
 - cli-drive 0.8.0 changed the `filesystem list -j` shape: `activeRevision` is no longer wrapped in `{ok,value}`, so NeutronSync missed `claimedSize` / `claimedModificationTime` and fell back to the encrypted `totalStorageSize`. Every file then looked modified and the watcher re-uploaded (and conflict-copied) the tree. Both JSON shapes are accepted now, and encrypted size is never used as content size.
 - After that thrash, same-size files with drifted mtimes were still treated as dual edits and keep-both multiplied conflict copies. Same size (unless both sha1s disagree) now refreshes the baseline instead of conflicting, and `*(conflict *)*` names are ignored so conflict copies cannot re-enter sync.

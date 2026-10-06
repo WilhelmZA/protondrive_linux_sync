@@ -22,6 +22,20 @@ The official `proton-drive` CLI can upload, download, list, and manage sharing, 
 - **In-app updates.** Checks GitHub releases on a channel you choose (stable or pre-release), then downloads and installs the new version for you: it picks the asset matching how you installed (`.deb` or `.rpm`), installs it through your package manager so your package list stays correct, and restarts the app. A copy that no package manager owns is downloaded for you to install by hand.
 - **Signed releases.** Commits and tags are GPG-signed; releases ship `.deb`, `.rpm`, and a portable binary tarball.
 
+## Remote backend
+
+The default backend is `cli`. Phase 1 adds an optional `api` backend using the `neutronsync-drive` sidecar. Build it with `sidecar/build.sh` and use its separate signed-in session. The API backend is read-only until Phase 2: even without `--dry-run`, sync warns and only builds a plan. It leaves local files, the baseline, sync timestamps, activity history and state logs unchanged.
+
+```toml
+[cli]
+backend = "api"                       # default: "cli"
+sidecar = "/path/to/neutronsync-drive" # optional
+```
+
+Without `sidecar`, NeutronSync looks next to its executable, then on `PATH` for `neutronsync-drive`. API sync does not require the `proton-drive` binary. All sync entry points honour the configured backend; auth probes and sign-in in the watcher, service and GUI still use the CLI in this phase.
+
+Use `neutronsync sync --dry-run --backend api` to override the config for one run. `--backend cli` selects the CLI instead. API excludes hide paths and their descendants from the plan, but Phase 1 still lists those folders remotely.
+
 ## Requirements
 
 - Linux with a recent Rust toolchain (edition 2021) if building from source.

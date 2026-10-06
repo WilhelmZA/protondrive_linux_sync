@@ -13,6 +13,14 @@ use crate::models::Compare;
 
 pub const DEFAULT_REMOTE_ROOT: &str = "/my-files";
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    #[default]
+    Cli,
+    Api,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LocalDelete {
     Trash,
@@ -51,6 +59,8 @@ pub struct Pair {
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub backend: Backend,
+    pub sidecar: Option<PathBuf>,
     pub binary: String,
     pub upload_flags: Vec<String>,
     pub download_flags: Vec<String>,
@@ -132,6 +142,8 @@ struct RawConfig {
 
 #[derive(Deserialize, Default)]
 struct RawCli {
+    backend: Option<String>,
+    sidecar: Option<String>,
     binary: Option<String>,
     upload_flags: Option<Vec<String>>,
     download_flags: Option<Vec<String>>,
@@ -294,6 +306,11 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
 
     let cli = raw.cli.unwrap_or_default();
     let opts = raw.options.unwrap_or_default();
+    let backend = match cli.backend.as_deref().unwrap_or("cli") {
+        "cli" => Backend::Cli,
+        "api" => Backend::Api,
+        other => bail!("cli.backend must be cli|api, got {other:?}"),
+    };
 
     let remote_root = {
         let r = opts
@@ -370,6 +387,8 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
     }
 
     Ok(Config {
+        backend,
+        sidecar: cli.sidecar.map(|p| expand(&p)),
         binary: cli.binary.unwrap_or_else(|| "proton-drive".to_string()),
         upload_flags: migrate_transfer_flags(
             cli.upload_flags.unwrap_or_else(default_upload_flags),
@@ -508,6 +527,9 @@ pub fn strip_root<'a>(root: &str, p: &'a str) -> Option<&'a str> {
 // --- writing (used by the GUI) ---------------------------------------------
 #[derive(Serialize)]
 struct OutCli {
+    backend: Backend,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sidecar: Option<PathBuf>,
     binary: String,
     upload_flags: Vec<String>,
     download_flags: Vec<String>,
@@ -587,6 +609,8 @@ fn update_channel_str(v: UpdateChannel) -> &'static str {
 pub fn to_toml(cfg: &Config) -> Result<String> {
     let out = OutConfig {
         cli: OutCli {
+            backend: cfg.backend,
+            sidecar: cfg.sidecar.clone(),
             binary: cfg.binary.clone(),
             upload_flags: cfg.upload_flags.clone(),
             download_flags: cfg.download_flags.clone(),
@@ -661,10 +685,8 @@ mod tests {
 
     #[test]
     fn migrates_legacy_conflict_strategy_download() {
-        let got = migrate_transfer_flags(
-            vec!["-c".into(), "replace".into()],
-            TransferKind::Download,
-        );
+        let got =
+            migrate_transfer_flags(vec!["-c".into(), "replace".into()], TransferKind::Download);
         assert_eq!(
             got,
             vec![

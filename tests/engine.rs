@@ -150,6 +150,8 @@ impl Remote for FakeRemote {
 // --- helpers ----------------------------------------------------------------
 fn cfg(root: &Path) -> Config {
     Config {
+        backend: neutronsync::config::Backend::Cli,
+        sidecar: None,
         binary: "proton-drive".into(),
         upload_flags: vec![],
         download_flags: vec![],

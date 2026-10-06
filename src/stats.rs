@@ -32,6 +32,25 @@ pub struct OpRecord {
 }
 
 impl Stats {
+    /// Read a disposable copy, including committed WAL rows. Opening the source
+    /// even with SQLITE_OPEN_READ_ONLY can create/update its shared-memory file.
+    /// Never initialise/migrate schema or remove pending rows on this path.
+    pub(crate) fn copied_baseline(state_dir: &Path, pair: &str) -> Result<BTreeMap<String, Entry>> {
+        let scratch = tempfile::tempdir()?;
+        let copy = scratch.path().join("stats.db");
+        std::fs::copy(state_dir.join("stats.db"), &copy)?;
+        let wal = state_dir.join("stats.db-wal");
+        match std::fs::copy(&wal, scratch.path().join("stats.db-wal")) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let stats = Self {
+            conn: Mutex::new(Connection::open(&copy)?),
+        };
+        stats.load_baseline(pair)
+    }
+
     /// Open (creating if needed) the stats DB under `state_dir`.
     pub fn open(state_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(state_dir).ok();
