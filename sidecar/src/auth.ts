@@ -33,6 +33,7 @@ export class Auth {
   private refreshFlight: Promise<void> | null = null;
   private generation = 0;
   private initialized = false;
+  private initializationFailed = false;
   private retryAt = 0;
   onClear: () => void = () => {};
 
@@ -47,9 +48,17 @@ export class Auth {
 
   async init() {
     if (this.initialized) return;
-    this.initialized = true;
-    try { this.session = await this.store.load(); }
-    catch { this.log.write('warn', 'Session storage unavailable'); }
+    try {
+      this.session = await this.store.load();
+      this.initialized = true;
+      this.initializationFailed = false;
+    } catch {
+      // main awaits init before opening either transport. Storage failure must
+      // stop startup, not expose a false signed-out account or clear persistence.
+      this.initializationFailed = true;
+      this.log.write('warn', 'Session storage unavailable');
+      throw new Fault('fatal');
+    }
   }
 
   private async raw(path: string, init: RequestInit, session?: Session | null): Promise<Response> {
@@ -241,7 +250,10 @@ export class Auth {
       throw new Fault('auth');
     }
   }
-  status() { return { signed_in: !!this.session?.keyPassphrase && !this.pending, account: this.session?.keyPassphrase && !this.pending ? this.session.account : null }; }
+  status() {
+    if (this.initializationFailed) throw new Fault('fatal');
+    return { signed_in: !!this.session?.keyPassphrase && !this.pending, account: this.session?.keyPassphrase && !this.pending ? this.session.account : null };
+  }
   requireSession(): Session {
     if (!this.status().signed_in) throw new Fault('auth');
     return this.session!;
