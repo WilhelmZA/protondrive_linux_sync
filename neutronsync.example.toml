@@ -3,28 +3,21 @@
 
 [cli]
 # Backend defaults to "api", using the packaged sidecar for two-way sync.
-# Select "cli" only as a legacy fallback if the API backend fails.
 # backend = "api"
 # Optional sidecar path; default: next to neutronsync, then on PATH.
 # sidecar = "/path/to/neutronsync-drive"
-# Legacy CLI backend only: path to proton-drive (resolved on $PATH).
-binary = "proton-drive"
-# Flags appended to `filesystem upload` so an existing remote file is overwritten
-# when the local copy changed. cli-drive ≥ 0.8.0 uses separate file/folder
-# strategies (the old --conflict-strategy flag was removed). Legacy configs with
-# --conflict-strategy are rewritten on load.
-upload_flags = ["--file-conflict-strategy", "replace", "--folder-conflict-strategy", "replace"]
-# Concurrent folder-listers for the remote tree scan (0 = auto, capped at 8).
-# scan_threads = 8
-# Concurrent file downloads during a sync (0 = auto, ~4). Downloads are
-# bandwidth-bound, so more isn't always faster and can hit rate limits.
-# download_threads = 4
-# download also prompts without a strategy; overwrite the local copy on download
-# (0.8 renamed the overwrite strategy from replace → remove).
-download_flags = ["--file-conflict-strategy", "remove", "--folder-conflict-strategy", "remove"]
-# Optional: force where the CLI stores your session credentials.
-# One of "keychain", "pass", "unsafe_file". Omit to use the CLI default.
+
+# --- Legacy CLI backend (removed in 0.5.0) ---------------------------------
+# Set backend = "cli" only as a fallback. Requires a separate proton-drive
+# install and sign-in. These keys do nothing on the API backend.
+# backend = "cli"
+# binary = "proton-drive"
+# upload_flags = ["--file-conflict-strategy", "replace", "--folder-conflict-strategy", "replace"]
+# download_flags = ["--file-conflict-strategy", "remove", "--folder-conflict-strategy", "remove"]
+# fresh_cache = true
 # credentials_store = "keychain"
+# scan_threads = 8
+# download_threads = 4
 
 [options]
 # Proton's per-user root. Remote paths in [[pair]] are resolved under this
@@ -54,13 +47,17 @@ conflict = "keep-both"
 #   sha1        strictest; hashes local files and compares to Proton's claimedDigests.sha1
 compare = "size+mtime"
 
-# Watch mode (`neutronsync watch`). Two tiers catch remote changes:
-#   scan_interval - short: re-check only "hot" (recently active) folders often.
-#   poll_interval - long: full rescan of everything (the safety net).
-# debounce is how long a burst of local file events settles before syncing.
-poll_interval = 900
-scan_interval = 120
-debounce = 2
+# API backend: seconds between safety-net full walks (default one day).
+# The GUI offers 6 h, 12 h, 1 day and 7 days. Ignored when backend = "cli".
+# full_walk_interval = 86400
+
+# Legacy CLI watch pacing (ignored on the API backend):
+#   poll_interval - floor for the adaptive full rescan
+#   scan_interval - short re-check of "hot" folders
+#   debounce - how long a burst of local file events settles before syncing
+# poll_interval = 900
+# scan_interval = 120
+# debounce = 2
 
 # GUI preferences (also toggled from Settings; saved back here automatically).
 #   auto_sync    - start the watch daemon on launch and keep it running.

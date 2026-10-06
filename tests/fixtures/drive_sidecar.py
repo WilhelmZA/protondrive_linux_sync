@@ -214,11 +214,68 @@ def mutable(request):
         send(dict(id=rid, error=dict(code=-32000, message='scripted', data=dict(code=str(e), retry_after=controls.get('retry_after', 0)))))
 
 
+def scripted_auth(method, params):
+    """Scripted auth.* replies for GUI screenshots and sign-in tests.
+
+    Select the script with username (auth.login) or NEUTRONSYNC_FAKE_AUTH:
+    ok, totp, mailbox, hv, error. Existing tests that never call auth.login
+    keep the previous auth.status-only behaviour.
+    """
+    script = os.environ.get("NEUTRONSYNC_FAKE_AUTH", "").strip()
+    if method == "auth.status":
+        signed_in = read_json("controls.json", {}).get("signed_in", True)
+        if script == "signed_out":
+            signed_in = False
+        return dict(signed_in=signed_in, account=str(os.getpid()))
+    if method == "auth.logout":
+        controls = read_json("controls.json", {})
+        controls["signed_in"] = False
+        (home / "controls.json").write_text(json.dumps(controls))
+        return dict(ok=True)
+    if method == "auth.submit_2fa":
+        code = params.get("code", "")
+        if code == "bad":
+            raise Failure("auth")
+        if script == "mailbox" or code == "mailbox":
+            return dict(need_mailbox_password=True)
+        return dict(ok=True)
+    if method == "auth.submit_mailbox_password":
+        if params.get("password") == "bad":
+            raise Failure("auth")
+        return dict(ok=True)
+    if method == "auth.login":
+        # Env script wins so GUI screenshot runs can force a step regardless of typed username.
+        user = script or params.get("username") or "ok"
+        if user in ("error", "bad"):
+            raise Failure("auth")
+        if user in ("totp", "need_2fa"):
+            return dict(need_2fa=True)
+        if user in ("mailbox", "need_mailbox_password"):
+            return dict(need_mailbox_password=True)
+        if user in ("hv", "needs-hv", "need_human_verification"):
+            return dict(
+                need_human_verification=True,
+                token="hv-token",
+                methods=["captcha"],
+                url="https://verify.proton.me/?methods=captcha&token=hv-token",
+            )
+        if user in ("ok", "normal", "signed_out") or params.get("hv_token"):
+            return dict(ok=True)
+        return dict(ok=True)
+    raise Failure("fatal")
+
+
 for line in sys.stdin:
     request = json.loads(line)
     method, params, rid = request["method"], request["params"], request["id"]
     with (home / "calls").open("a") as out:
         out.write(json.dumps(request) + "\n")
+    if method.startswith("auth."):
+        try:
+            send(dict(id=rid, result=scripted_auth(method, params)))
+        except Failure as e:
+            send(dict(id=rid, error=dict(code=-32000, message="scripted", data=dict(code=str(e), retry_after=0))))
+        continue
     if method == 'events.subscribe':
         controls = read_json('controls.json', {})
         if controls.get('refuse_cursor') and params.get('since_event_id'):
@@ -245,9 +302,7 @@ for line in sys.stdin:
         continue
     result = None
     code = None
-    if method == "auth.status":
-        result = dict(signed_in=read_json('controls.json', {}).get('signed_in', True), account=str(os.getpid()))
-    elif method == "node.resolve":
+    if method == "node.resolve":
         path = params["path"]
         leaf = path.rsplit("/", 1)[-1]
         if leaf == "die":

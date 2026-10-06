@@ -85,8 +85,14 @@ impl PairState {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AccountState {
     pub checked: bool,
-    pub binary_found: bool,
+    /// On the API backend: the sidecar answered. On the CLI backend: a binary was found on PATH.
+    pub backend_ready: bool,
     pub signed_in: bool,
+    /// Proton account name from the API probe. Empty on the CLI backend.
+    #[serde(default)]
+    pub account: String,
+    /// Sidecar path or identity on the API backend; binary version/path on the CLI backend.
+    /// On probe failure this holds the error text shown on the sign-in page.
     pub version: String,
     /// A login/version check is in flight (drives the Refresh spinner).
     pub checking: bool,
@@ -625,22 +631,23 @@ impl Controller {
         thread::spawn(move || {
             if cfg.backend == crate::config::Backend::Api {
                 let result = crate::driveapi::DriveApi::new(&cfg).and_then(|api| api.status());
-                let (usable, signed_in, version) = match result {
+                let (usable, signed_in, account, version) = match result {
                     Ok(status) => (
                         true,
                         status["signed_in"] == true,
-                        format!(
-                            "neutronsync-drive — {}",
-                            status["account"].as_str().unwrap_or("not signed in")
-                        ),
+                        status["account"].as_str().unwrap_or("").to_string(),
+                        crate::driveapi::resolve_sidecar(&cfg)
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "neutronsync-drive".into()),
                     ),
-                    Err(error) => (false, false, error.to_string()),
+                    Err(error) => (false, false, String::new(), error.to_string()),
                 };
                 let mut s = state.lock().unwrap();
                 s.account = AccountState {
                     checked: true,
-                    binary_found: usable,
+                    backend_ready: usable,
                     signed_in,
+                    account,
                     version,
                     checking: false,
                 };
@@ -658,15 +665,17 @@ impl Controller {
             let account = match proton.resolve_binary() {
                 Some(p) => AccountState {
                     checked: true,
-                    binary_found: true,
+                    backend_ready: true,
                     signed_in,
+                    account: String::new(),
                     version: format!("{} ({})", proton.version(), p.display()),
                     checking: false,
                 },
                 None => AccountState {
                     checked: true,
-                    binary_found: false,
+                    backend_ready: false,
                     signed_in: false,
+                    account: String::new(),
                     version: "proton-drive NOT FOUND on PATH".into(),
                     checking: false,
                 },
@@ -676,7 +685,7 @@ impl Controller {
                 s.account = account;
                 if signed_in {
                     s.signed_out = false;
-                } else if s.account.binary_found {
+                } else if s.account.backend_ready {
                     s.signed_out = true;
                 }
             }

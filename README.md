@@ -14,10 +14,12 @@ NeutronSync keeps local folders and their Proton Drive counterparts in sync thro
 
 ## Features
 
+- **Proton Drive SDK sidecar.** The packaged `neutronsync-drive` helper talks to Proton through the official Drive SDK. You sign in inside NeutronSync; the session lives in your system keyring.
+- **Change feed.** Remote edits on other devices arrive within seconds. Local folders are watched live; only the folders that changed are re-checked. A daily full check is the safety net.
 - **Bidirectional three-way merge.** A per-pair baseline lets it tell "new on the remote" apart from "deleted locally", so changes on either side are applied correctly instead of blindly mirrored.
 - **Safe by default.** Deletions are opt-in and recoverable (remote to Proton trash, local to the desktop trash). A missing baseline unions both sides rather than mass-deleting. Conflicts keep both copies. An unmounted local folder or a vanished remote base is refused, not mistaken for a mass delete.
 - **Selective sync.** Exclude sub-folders per pair. Excluded paths are never touched on Proton; you can optionally free up local space by removing the local copy while the cloud copy stays.
-- **Live sync.** A watch daemon reconciles on local change (inotify, debounced) and does a periodic full rescan to catch everything else, including changes made on your other devices.
+- **Live sync.** A watch daemon reconciles on local change (inotify, debounced) and follows Proton's change feed for remote edits.
 - **Native GUI or CLI.** An egui desktop app (single binary, optional system tray) or a lean command-line tool. Same engine, same config.
 - **In-app updates.** Checks GitHub releases on a channel you choose (stable or pre-release), then downloads and installs the new version for you: it picks the asset matching how you installed (`.deb` or `.rpm`), installs it through your package manager so your package list stays correct, and restarts the app. A copy that no package manager owns is downloaded for you to install by hand.
 - **Signed releases.** Commits and tags are GPG-signed; releases ship `.deb`, `.rpm`, and a portable binary tarball.
@@ -89,7 +91,7 @@ sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
 
 ### GUI
 
-Launch **NeutronSync** from your app menu. Enter your username and password in the sign-in form. If prompted, enter your TOTP code or mailbox password. For human verification, open the shown `verify.proton.me` link, complete verification, then select **Retry sign-in**. Password fields stay masked. Add folder pairs on the Folders page and select **Choose folders to sync** to set exclusions. The Account page also provides sign-in and sign-out.
+Launch **NeutronSync** from your app menu. The sign-in page takes your Proton username and password (and two-factor or mailbox password when Proton asks). For human verification, open the verification page, complete it, then select **Retry sign-in**. Password fields stay masked and are cleared after each attempt. The Account page shows whether you are signed in and lets you sign out or refresh. In Settings → Advanced, **Backend** shows which backend is active and **Full check every** sets how often the API safety-net walk runs (6 h, 12 h, 1 day, or 7 days). Add folder pairs on the Folders page and select **Folders to sync** to set exclusions.
 
 ### CLI
 
@@ -135,11 +137,8 @@ TOML at `~/.config/neutronsync/neutronsync.toml` (override with `-c PATH` or `$N
 
 ```toml
 [cli]
-binary = "proton-drive"
-upload_flags = ["--file-conflict-strategy", "replace", "--folder-conflict-strategy", "replace"]
-download_flags = ["--file-conflict-strategy", "remove", "--folder-conflict-strategy", "remove"]
-fresh_cache = true            # throwaway metadata cache per run (avoids stale listings)
-# credentials_store = "keychain"   # keychain | pass | unsafe_file
+backend = "api"                       # default; this line may be omitted
+# sidecar = "/path/to/neutronsync-drive"  # optional; else next to neutronsync, then PATH
 
 [options]
 remote_root = "/my-files"     # Proton's per-user root
@@ -147,7 +146,7 @@ propagate_deletes = false     # deletes cross over (recoverably); false = never 
 local_delete = "trash"        # trash | remove
 conflict = "keep-both"        # keep-both | newer | skip
 compare = "size+mtime"        # size | size+mtime | sha1
-poll_interval = 900           # watch: seconds between full rescans
+full_walk_interval = 86400    # API: seconds between safety-net full checks (default 1 day)
 update_channel = "stable"     # stable | prerelease
 # check_on_launch = false     # GUI: check for updates on start (notify only)
 
@@ -158,7 +157,22 @@ remote = "Documents"          # -> /my-files/Documents
 # exclude = ["APPS"]          # sub-paths never synced; the Proton copy is untouched
 ```
 
-`fresh_cache` matters: the CLI caches directory metadata and serves it stale, so without a fresh cache per run it would miss changes made on another device.
+#### Legacy CLI backend
+
+Set `[cli] backend = "cli"` only as a fallback. It goes away in 0.5.0 and needs a separate `proton-drive` install and sign-in. Keys used only on that backend:
+
+```toml
+[cli]
+backend = "cli"
+binary = "proton-drive"
+upload_flags = ["--file-conflict-strategy", "replace", "--folder-conflict-strategy", "replace"]
+download_flags = ["--file-conflict-strategy", "remove", "--folder-conflict-strategy", "remove"]
+fresh_cache = true            # throwaway metadata cache per run (avoids stale listings)
+# credentials_store = "keychain"
+
+[options]
+poll_interval = 900           # CLI watch: floor for adaptive full rescans (seconds)
+```
 
 ## Running in the background (systemd --user)
 
@@ -184,12 +198,13 @@ The API sign-in form passes credentials over the private local socket to the sid
 
 ## Troubleshooting
 
-- **Sidecar missing:** reinstall the package or build `sidecar/` and place `neutronsync-drive` beside the Rust binaries or on `PATH`. You can also set `cli.sidecar`. The legacy fallback is `[cli] backend = "cli"`.
+- **Sign-in service didn't start:** the GUI shows this when `neutronsync-drive` cannot be started or reached. Reinstall the package, or build `sidecar/` and place `neutronsync-drive` beside the Rust binaries or on `PATH`, or set `cli.sidecar`. Check the socket under `$XDG_RUNTIME_DIR/neutronsync-drive/` (or `$HOME/.cache/neutronsync-drive/` when `XDG_RUNTIME_DIR` is unset). The legacy fallback is `[cli] backend = "cli"`.
 - **`secret-tool` missing:** install `libsecret-tools` on Debian/Ubuntu or `libsecret` on Fedora/RHEL.
-- **No Secret Service session:** start and unlock your desktop keyring. Run NeutronSync in the same user D-Bus session. A headless service needs that session too.
-- **Human verification:** complete the shown Proton verification link, then retry sign-in. The CLI waits for Enter before retrying.
+- **Keyring locked / no Secret Service:** start and unlock your desktop keyring. Run NeutronSync in the same user D-Bus session. A headless service needs that session too.
+- **Human verification:** complete the shown Proton verification link, then retry sign-in. The CLI `login` command waits for Enter before retrying.
 - **Signed out:** sign in from Account or run `neutronsync login`. Refresh the Account page if needed. The watcher resumes from its saved event cursor.
 - **Sidecar path differs:** all clients in one user session must select the same executable. Align `cli.sidecar` before reconnecting.
+- **Reading sync.log:** under the configured `state_dir` (default `~/.local/state/neutronsync/sync.log`). Timestamps are UTC.
 
 ## Known limitations
 

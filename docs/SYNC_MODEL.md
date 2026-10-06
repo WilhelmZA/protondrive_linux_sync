@@ -1,15 +1,26 @@
 # Sync model
 
-How NeutronSync decides what to sync, when, and why. This is the design behind `src/engine.rs` and `src/watcher.rs`. It is written for contributors; users only need the "How it works" section of the [README](../README.md).
+How NeutronSync decides what to sync, when, and why. This is the design behind `src/engine.rs`, `src/watcher.rs` and `src/watcher_feed.rs`. It is written for contributors; users only need the "How it works" section of the [README](../README.md).
 
-## The constraint that shapes everything
+## API backend (default)
 
-NeutronSync drives the official `proton-drive` CLI. That CLI has two properties that dictate the whole design:
+The default backend talks to Proton Drive through `neutronsync-drive`, a long-lived sidecar on Proton's Drive SDK. That design has three properties that shape the watcher:
 
-1. **No change feed.** There is no "what changed on Proton since X" API. The only way to learn about a remote-side change (an edit made on another device) is to list the folder again and compare.
-2. **A cache that serves stale listings.** A default run can show a file that another device already trashed. So every listing NeutronSync makes runs with a throwaway `PROTON_DRIVE_CACHE_DIR`, and each concurrent scan worker gets its own, so parallel CLI processes never share (and corrupt) one cache.
+1. **A change feed.** The sidecar polls remote events every five seconds and delivers batches the watcher can acknowledge. Remote edits on other devices arrive within seconds without a full re-walk.
+2. **One shared session.** GUI, tray, CLI and watch processes share one sidecar over a user-only socket. Sign-in and token refresh happen once per user session.
+3. **Full walks as a safety net.** A full walk still runs on first sync, when Proton asks for a refresh (`events.refresh_required`), when events cannot be mapped, and once per `[options] full_walk_interval` (default one day).
 
-Everything below follows from "local changes are cheap to detect, remote changes cost a re-walk."
+Local changes stay cheap: a recursive inotify watch triggers a shallow reconcile of the one folder whose direct contents changed. Remote events enter the same shallow-folder queue. Events are hints; the three-way merge still decides every change.
+
+### Remote change feed
+
+With `[cli] backend = "api"`, the sidecar's acknowledged delivery mode repeats each batch until the watcher acknowledges it. The watcher maps parent UIDs to pair-relative folders using cached root UIDs, baseline `remote_id` values, then depth-bounded `node.path` resolution. Moves and trash also queue the node's old baseline parent. A changed baseline folder queues its own contents. An unresolved event schedules a full walk; a resolved path outside every pair is logged as `out_of_scope`.
+
+Remote events and local inotify changes share the shallow-folder queue. Every event records one disposition (`mapped`, `out_of_scope`, `walk` or `deferred`), and each batch records counts. Events never issue filesystem operations directly.
+
+First start subscribes before walking and stores the starting cursor only after that walk succeeds. Subsequent batches persist their cursor in `stats.db` before acknowledgement, after all their reconciles succeed. Failed batches remain unacknowledged for replay. Three consecutive failed deliveries trigger one `apply_failed` recovery walk and acknowledgement. Restart and authentication recovery subscribe with the stored cursor. A refused cursor requires one `resume_gap` walk.
+
+`[options] full_walk_interval` sets the API safety-net interval in seconds, default `86400`. The GUI Settings page offers 6 h, 12 h, 1 day and 7 days. Sign-out pauses sync; sidecar authentication recovery resumes from the saved cursor.
 
 ## Baseline and the three-way merge
 
@@ -25,24 +36,18 @@ Why shallow is correct and not lossy:
 
 - The watch is recursive, so a change deeper in the tree arrives as its **own** event and reconciles its **own** folder. Walking the subtree on every change would redo work that the deeper events already cover.
 - A directory event reconciles that directory; a file event (or a delete, where the path can no longer be stat-ed) reconciles the file's parent. Both converge on "the folder whose direct listing changed."
-- With the CLI backend, the hot pass and full walk catch remote-only changes. With the API backend, the remote feed queues them directly.
+- With the API backend, the remote feed queues remote-only changes directly. With the legacy CLI backend, the hot pass and full walk catch them.
 
 Consequences that are intentional:
 
 - Deleting a whole sub-folder locally trashes the remote folder (recoverably) and cleans that sub-folder's descendant rows out of the baseline (the shallow commit only removed the folder's own row, so descendants are pruned explicitly).
-- A brand-new remote sub-folder initially appears as an empty local folder. The CLI full walk fills it; API events for its children queue their parent for shallow reconcile.
+- A brand-new remote sub-folder initially appears as an empty local folder. API events for its children queue their parent for shallow reconcile; the CLI full walk fills it.
 
-## API backend: remote change feed
+## Legacy CLI backend
 
-With `[cli] backend = "api"`, the sidecar polls remote events every five seconds. Its acknowledged delivery mode repeats each batch until the watcher acknowledges it. The watcher maps parent UIDs to pair-relative folders using cached root UIDs, baseline `remote_id` values, then depth-bounded `node.path` resolution. Moves and trash also queue the node's old baseline parent. A changed baseline folder queues its own contents. An unresolved event schedules a full walk; a resolved path outside every pair is logged as `out_of_scope`.
+The `proton-drive` CLI backend remains available until release 0.5.0 as a fallback (`[cli] backend = "cli"`). It has no change feed: the only way to learn about a remote-side change is to list the folder again and compare. The CLI also caches directory metadata and can serve it stale, so every listing runs with a throwaway `PROTON_DRIVE_CACHE_DIR`. Everything below follows from "local changes are cheap to detect, remote changes cost a re-walk."
 
-Remote events and local inotify changes share the shallow-folder queue. Every event records one disposition (`mapped`, `out_of_scope`, `walk` or `deferred`), and each batch records counts. Events never issue filesystem operations directly. Both listings and the existing three-way merge decide every operation.
-
-First start subscribes before walking and stores the starting cursor only after that walk succeeds. Subsequent batches persist their cursor in `stats.db` before acknowledgement, after all their reconciles succeed. Failed batches remain unacknowledged for replay. Three consecutive failed deliveries trigger one `apply_failed` recovery walk and acknowledgement. Restart and authentication recovery subscribe with the stored cursor. A refused cursor requires one `resume_gap` walk.
-
-`[options] full_walk_interval` sets the API safety-net interval in seconds, default `86400`. Refresh notices schedule a `refresh_required` walk. The watcher logs every API full-walk cause. The CLI backend ignores this option and keeps the adaptive pacing below. API sign-out comes from sidecar notifications or authentication errors; recovery probes `auth.status` without running the CLI.
-
-## CLI startup order: quick wins first, full walk last
+### CLI startup order: quick wins first, full walk last
 
 When the watcher starts it does not lead with the expensive full walk. It attaches the file watch **first** (so changes made during startup are captured, not lost in a blind window), then:
 
@@ -52,9 +57,9 @@ When the watcher starts it does not lead with the expensive full walk. It attach
 
 So syncing starts almost immediately and the full walk stops being a gate.
 
-## CLI full walk: an adaptively paced safety net
+### CLI full walk: an adaptively paced safety net
 
-The full walk scans both trees end to end. It is the only thing that catches remote-only changes across the whole tree, so it must run, but on a large tree it is expensive and pointless to run constantly. So it is **paced to its own cost**: after each full walk NeutronSync measures how long it took and schedules the next one at roughly `duration * 6` (`FULL_WALK_MULTIPLIER`), floored at the configured `poll_interval` and capped so it always eventually runs. A 15-minute walk reruns about every 90 minutes; small, active folders stay fresh in between through the shallow and hot syncs.
+The full walk scans both trees end to end. It is the only thing that catches remote-only changes across the whole tree on this backend, so it must run, but on a large tree it is expensive and pointless to run constantly. So it is **paced to its own cost**: after each full walk NeutronSync measures how long it took and schedules the next one at roughly `duration * 6` (`FULL_WALK_MULTIPLIER`), floored at the configured `poll_interval` and capped so it always eventually runs. A 15-minute walk reruns about every 90 minutes; small, active folders stay fresh in between through the shallow and hot syncs. `full_walk_interval` does not affect this backend.
 
 The full walk **streams**: rather than scan the whole tree and only then apply, it walks folder-by-folder (a concurrent breadth-first walk, `run_sync_streaming`) and reconciles each folder as it is discovered, transferring immediately. So uploads and downloads overlap the walk instead of waiting for a full scan. Each folder is handled by the same shallow, direct-children primitive (`sync_pair_shallow_with_base`), and the walk descends into the child folders that reconcile reports (skipping any it just deleted or that are excluded).
 
@@ -81,7 +86,8 @@ In tray mode the background tray daemon owns the watcher and does the syncing in
 
 | Key | Meaning |
 | --- | --- |
-| `poll_interval` | Floor for the adaptive full-walk interval (seconds). |
+| `full_walk_interval` | API safety-net full-walk interval (seconds; default 86400). Ignored by the CLI backend. |
+| `poll_interval` | CLI only: floor for the adaptive full-walk interval (seconds). |
 | `scan_interval` | How often the hot-folder pass runs (seconds). |
 | `debounce` | Filesystem-event debounce window (seconds). |
 | `scan_threads` | Concurrent remote-scan workers (0 = auto, capped at 8). |

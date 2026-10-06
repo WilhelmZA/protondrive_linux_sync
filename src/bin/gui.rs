@@ -20,7 +20,7 @@ use eframe::egui::{
 
 use neutronsync::config::{self, Config, ConflictPolicy, LocalDelete, Pair, UpdateChannel};
 use neutronsync::models::{Compare, Entry};
-use neutronsync::protoncli::{ProtonCli, Remote};
+use neutronsync::protoncli::ProtonCli;
 use neutronsync::service::{ActivityKind, ActivityOp, AppState, Controller, PairState, Phase};
 use neutronsync::updater::{self, UpdateInfo};
 
@@ -682,8 +682,7 @@ impl App {
         let cfg = self.cfg.clone();
         let path = self.browser_path.clone();
         thread::spawn(move || {
-            let proton = ProtonCli::new(&cfg);
-            let _ = tx.send(proton.list_dir(&path).map_err(|e| e.to_string()));
+            let _ = tx.send(neutronsync::backend::list_remote(&cfg, &path));
         });
     }
 
@@ -702,8 +701,7 @@ impl App {
         let cfg = self.cfg.clone();
         let remote = self.cfg.pairs[i].remote.clone();
         thread::spawn(move || {
-            let proton = ProtonCli::new(&cfg);
-            let _ = tx.send(proton.list_dir(&remote).map_err(|e| e.to_string()));
+            let _ = tx.send(neutronsync::backend::list_remote(&cfg, &remote));
         });
     }
 
@@ -1008,7 +1006,7 @@ impl eframe::App for App {
                         // daemon's possibly stale signed_out flag (up to 20s lag
                         // without a refresh signal).
                         if mine.account.checked {
-                            pubd.signed_out = mine.account.binary_found && !mine.account.signed_in;
+                            pubd.signed_out = mine.account.backend_ready && !mine.account.signed_in;
                         }
                         pubd
                     }
@@ -1052,7 +1050,8 @@ impl eframe::App for App {
         // First-run / broken-prereq gate: show the sign-in page unless we have
         // CONFIRMED a working, signed-in CLI. Covers both "proton-drive missing"
         // (page_signin renders install guidance) and "present but signed out".
-        let signin = snap.account.checked && !(snap.account.binary_found && snap.account.signed_in);
+        let signin =
+            snap.account.checked && !(snap.account.backend_ready && snap.account.signed_in);
 
         if !signin {
             self.nav_rail(root_ui, &snap);
@@ -1843,6 +1842,16 @@ impl App {
                 });
 
                 settings_group(ui, "ADVANCED", |ui| {
+                    let backend_label = match self.cfg.backend {
+                        neutronsync::config::Backend::Api => "Proton Drive SDK (neutronsync-drive)",
+                        neutronsync::config::Backend::Cli => "Legacy CLI (proton-drive)",
+                    };
+                    if setting_row(ui, "Backend", "", |ui| {
+                        ui.label(RichText::new(backend_label).size(12.5).color(DIM));
+                        false
+                    }) {
+                        // read-only
+                    }
                     if setting_row(ui, "Remote root", "", |ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.cfg.remote_root)
@@ -1852,25 +1861,40 @@ impl App {
                     }) {
                         self.dirty = true;
                     }
-                    if setting_row(ui, "proton-drive binary", "", |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.cfg.binary).desired_width(220.0),
+                    if self.cfg.backend == neutronsync::config::Backend::Api
+                        && setting_row(
+                            ui,
+                            "Full check every",
+                            "Safety-net walk of every folder on both sides.",
+                            |ui| combo_full_walk(ui, &mut self.cfg.full_walk_interval),
                         )
-                        .changed()
-                    }) {
-                        self.dirty = true;
-                    }
-                    let fc = self.cfg.fresh_cache;
-                    if setting_row(
-                        ui,
-                        "Fresh metadata each run",
-                        "Avoids stale directory listings from the CLI cache.",
-                        |ui| switch(ui, fc),
-                    ) {
-                        self.cfg.fresh_cache = !fc;
+                    {
                         self.dirty = true;
                     }
                 });
+                if self.cfg.backend == neutronsync::config::Backend::Cli {
+                    settings_group(ui, "LEGACY CLI BACKEND", |ui| {
+                        if setting_row(ui, "proton-drive binary", "", |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.cfg.binary)
+                                    .desired_width(220.0),
+                            )
+                            .changed()
+                        }) {
+                            self.dirty = true;
+                        }
+                        let fc = self.cfg.fresh_cache;
+                        if setting_row(
+                            ui,
+                            "Fresh metadata each run",
+                            "Avoids stale directory listings from the CLI cache.",
+                            |ui| switch(ui, fc),
+                        ) {
+                            self.cfg.fresh_cache = !fc;
+                            self.dirty = true;
+                        }
+                    });
+                }
 
                 settings_group(ui, "DANGER ZONE", |ui| {
                     if setting_row(
@@ -1892,17 +1916,64 @@ impl App {
     fn page_account(&mut self, ui: &mut egui::Ui, snap: &AppState) {
         self.page_header(ui, "Account", |_ui, _app| {});
         if self.cfg.backend == neutronsync::config::Backend::Api {
-            ui.label(&snap.account.version);
-            if snap.account.signed_in {
-                ui.label("Signed in");
-                if ui.button("Sign out").clicked() {
+            let acc = &snap.account;
+            let (col, label) = if !acc.checked || acc.checking {
+                (DIM, "Checking…")
+            } else if acc.signed_in {
+                (OK, "Signed in")
+            } else if acc.backend_ready {
+                (DANGER, "Not signed in")
+            } else {
+                (WARN, "Sign-in service unavailable")
+            };
+            ui.horizontal(|ui| {
+                status_dot(ui, col, false);
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(label)
+                        .font(FontId::new(16.0, ff_bold()))
+                        .color(TEXT),
+                );
+            });
+            ui.add_space(10.0);
+            ui.label(RichText::new("Proton account").color(DIM));
+            let name = if acc.account.is_empty() {
+                "—"
+            } else {
+                acc.account.as_str()
+            };
+            ui.label(RichText::new(name).size(13.0).color(TEXT));
+            if !acc.version.is_empty() {
+                ui.label(RichText::new(&acc.version).size(12.0).color(DIM));
+            }
+            ui.add_space(16.0);
+            let checking = acc.checking;
+            ui.horizontal(|ui| {
+                if button(ui, None, "Sign out", Btn::Ghost, false, acc.signed_in).clicked() {
                     self.confirm_logout = true;
                 }
-            } else {
+                if button(
+                    ui,
+                    Some(Icon::Sync),
+                    "Refresh",
+                    Btn::Ghost,
+                    false,
+                    !checking,
+                )
+                .clicked()
+                {
+                    self.last_account_poll = ui.ctx().input(|i| i.time);
+                    self.ctrl.refresh_account(false);
+                }
+                if checking {
+                    ui.add_space(4.0);
+                    ui.spinner();
+                    ui.label(RichText::new("Checking…").color(DIM));
+                }
+            });
+            if acc.backend_ready && !acc.signed_in {
+                ui.add_space(20.0);
                 self.api_signin_form(ui);
-            }
-            if ui.button("Refresh").clicked() {
-                self.ctrl.refresh_account(false);
             }
             return;
         }
@@ -1911,7 +1982,7 @@ impl App {
             (DIM, "Checking…")
         } else if acc.signed_in {
             (OK, "Signed in")
-        } else if acc.binary_found {
+        } else if acc.backend_ready {
             (DANGER, "Not signed in")
         } else {
             (WARN, "proton-drive not found")
@@ -1985,8 +2056,12 @@ impl App {
         );
         ui.add_space(6.0);
         ui.label(
-            RichText::new("Bidirectional Proton Drive folder sync with a built-in API sidecar.")
-                .color(DIM),
+            RichText::new(if self.cfg.backend == neutronsync::config::Backend::Api {
+                "Bidirectional Proton Drive folder sync through the Proton Drive SDK."
+            } else {
+                "Bidirectional Proton Drive folder sync through the proton-drive CLI."
+            })
+            .color(DIM),
         );
         ui.add_space(12.0);
         ui.label(
@@ -2015,17 +2090,31 @@ impl App {
                 .color(ACCENT),
         );
         ui.add_space(8.0);
-        ui.label(
-            RichText::new(
-                "NeutronSync is an independent, unofficial tool with no access to your \
-                 Proton account. It simply drives Proton's official proton-drive CLI, which \
-                 you sign in yourself. Your password and Proton credentials are never seen, \
-                 stored, or sent by NeutronSync — the CLI keeps your session in your OS \
-                 keyring, and all encryption and decryption is done by Proton's own software.",
-            )
-            .size(12.5)
-            .color(DIM),
-        );
+        if self.cfg.backend == neutronsync::config::Backend::Api {
+            ui.label(
+                RichText::new(
+                    "NeutronSync is an independent, unofficial tool. It talks to Proton Drive \
+                     through neutronsync-drive, a helper built on Proton's official Drive SDK. \
+                     You sign in inside NeutronSync. Your password goes only to Proton. The \
+                     session is kept in your system keyring. Proton's SDK code does all \
+                     encryption and decryption, on this computer.",
+                )
+                .size(12.5)
+                .color(DIM),
+            );
+        } else {
+            ui.label(
+                RichText::new(
+                    "NeutronSync is an independent, unofficial tool with no access to your \
+                     Proton account. It simply drives Proton's official proton-drive CLI, which \
+                     you sign in yourself. Your password and Proton credentials are never seen, \
+                     stored, or sent by NeutronSync — the CLI keeps your session in your OS \
+                     keyring, and all encryption and decryption is done by Proton's own software.",
+                )
+                .size(12.5)
+                .color(DIM),
+            );
+        }
         ui.add_space(6.0);
         ui.label(
             RichText::new(
@@ -2043,21 +2132,34 @@ impl App {
                 .color(ACCENT),
         );
         ui.add_space(8.0);
-        ui.label(
-            RichText::new(
-                "Proton's CLI has no \"recently changed\" feed, so NeutronSync watches your \
-                 local folders live and aims the work where the activity is. A local change \
-                 reconciles just the folder that changed (not the whole tree); deeper changes \
-                 arrive as their own events. On startup it syncs folders with fresh local \
-                 changes first, then recently active folders, then everything else. A full \
-                 walk of both sides is the safety net that catches edits made on your other \
-                 devices (the CLI only reveals those by re-walking); it is paced to how long \
-                 a walk takes, so a big tree is not re-walked constantly. Remote-side changes \
-                 therefore appear on the next pass, not instantly.",
-            )
-            .size(12.5)
-            .color(DIM),
-        );
+        if self.cfg.backend == neutronsync::config::Backend::Api {
+            ui.label(
+                RichText::new(
+                    "Local folders are watched live, and only the changed folder is reconciled. \
+                     Proton Drive changes arrive through Proton's change feed within seconds, \
+                     and only the affected folders are re-checked. A full walk runs on first \
+                     sync, when Proton asks for a refresh, and once a day as a safety net.",
+                )
+                .size(12.5)
+                .color(DIM),
+            );
+        } else {
+            ui.label(
+                RichText::new(
+                    "Proton's CLI has no \"recently changed\" feed, so NeutronSync watches your \
+                     local folders live and aims the work where the activity is. A local change \
+                     reconciles just the folder that changed (not the whole tree); deeper changes \
+                     arrive as their own events. On startup it syncs folders with fresh local \
+                     changes first, then recently active folders, then everything else. A full \
+                     walk of both sides is the safety net that catches edits made on your other \
+                     devices (the CLI only reveals those by re-walking); it is paced to how long \
+                     a walk takes, so a big tree is not re-walked constantly. Remote-side changes \
+                     therefore appear on the next pass, not instantly.",
+                )
+                .size(12.5)
+                .color(DIM),
+            );
+        }
 
         ui.add_space(20.0);
         ui.label(
@@ -2248,17 +2350,84 @@ impl App {
 
     fn page_signin(&mut self, ui: &mut egui::Ui, snap: &AppState) {
         if self.cfg.backend == neutronsync::config::Backend::Api {
-            self.page_header(ui, "Sign in to Proton Drive", |_ui, _app| {});
-            ui.label(&snap.account.version);
-            if snap.account.binary_found {
-                self.api_signin_form(ui);
-            }
-            if ui.button("Check again").clicked() {
-                self.ctrl.refresh_account(false);
-            }
+            let ready = snap.account.backend_ready;
+            let logo = self.logo_tex.clone();
+            let col_w: f32 = 470.0;
+            let est_h = if ready { 420.0 } else { 360.0 };
+            ui.add_space(((ui.available_height() - est_h) / 2.0).max(24.0));
+            let side = ((ui.available_width() - col_w) / 2.0).max(0.0);
+            ui.horizontal(|ui| {
+                ui.add_space(side);
+                ui.vertical(|ui| {
+                    ui.set_width(col_w);
+                    ui.vertical_centered(|ui| {
+                        let (lr, _) = ui.allocate_exact_size(vec2(72.0, 72.0), Sense::hover());
+                        draw_logo(ui.painter(), lr, logo.as_ref());
+                        ui.add_space(20.0);
+                        let title = if ready {
+                            "Sign in to Proton Drive"
+                        } else {
+                            "Sign-in service didn't start"
+                        };
+                        ui.label(
+                            RichText::new(title)
+                                .font(FontId::new(24.0, ff_bold()))
+                                .color(TEXT),
+                        );
+                        ui.add_space(10.0);
+                        if ready {
+                            ui.label(
+                                RichText::new(
+                                    "Your password goes only to Proton; NeutronSync keeps the \
+                                     session in the system keyring.",
+                                )
+                                .size(13.5)
+                                .color(TEXT),
+                            );
+                        }
+                    });
+                    if ready {
+                        ui.add_space(20.0);
+                        self.api_signin_form(ui);
+                    } else {
+                        ui.add_space(20.0);
+                        card_frame().show(ui, |ui| {
+                            ui.set_width(col_w - 34.0);
+                            let err = if snap.account.version.is_empty() {
+                                "The sign-in service could not be reached."
+                            } else {
+                                snap.account.version.as_str()
+                            };
+                            ui.label(RichText::new(err).size(12.5).color(DANGER));
+                            ui.add_space(10.0);
+                            ui.label(
+                                RichText::new("Reinstall NeutronSync, or set [cli] sidecar.")
+                                    .size(12.5)
+                                    .color(DIM),
+                            );
+                        });
+                        ui.add_space(22.0);
+                        ui.vertical_centered(|ui| {
+                            if button(
+                                ui,
+                                Some(Icon::Sync),
+                                "Check again",
+                                Btn::Primary,
+                                false,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                self.last_account_poll = ui.ctx().input(|i| i.time);
+                                self.ctrl.refresh_account(false);
+                            }
+                        });
+                    }
+                });
+            });
             return;
         }
-        let found = snap.account.binary_found;
+        let found = snap.account.backend_ready;
         let logo = self.logo_tex.clone();
         let col_w: f32 = 470.0;
 
@@ -2442,83 +2611,142 @@ impl App {
                 }
                 Err(error) => {
                     self.api_signin.password.clear();
-                    self.api_signin.error = Some(error);
+                    self.api_signin.error = Some(plain_signin_error(error));
                 }
             }
         }
         let busy = self.api_signin.pending.is_some();
-        ui.add_enabled_ui(!busy, |ui| {
+        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let col_w = ui.available_width().min(470.0);
+        let field_w = (col_w - 34.0).max(200.0);
+        let mut submit = false;
+        let mut open_verify: Option<String> = None;
+        card_frame().show(ui, |ui| {
+            ui.set_width(field_w);
+            ui.add_enabled_ui(!busy, |ui| {
+                let form = &mut self.api_signin;
+                let two_factor = form.step["need_2fa"] == true;
+                let mailbox = form.step["need_mailbox_password"] == true;
+                let hv = form.step["need_human_verification"] == true;
+                let pad = egui::Margin::symmetric(4, 2);
+                if hv {
+                    ui.label(
+                        RichText::new("Complete human verification, then retry sign-in.")
+                            .size(12.5)
+                            .color(TEXT),
+                    );
+                    ui.add_space(10.0);
+                    if let Some(url) = form.step["url"]
+                        .as_str()
+                        .filter(|url| url.starts_with("https://verify.proton.me/"))
+                    {
+                        if button(
+                            ui,
+                            None,
+                            "Open verification page",
+                            Btn::Secondary,
+                            false,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            open_verify = Some(url.to_string());
+                        }
+                        ui.add_space(8.0);
+                    }
+                } else if two_factor || mailbox {
+                    ui.label(
+                        RichText::new(if two_factor {
+                            "Two-factor code"
+                        } else {
+                            "Mailbox password"
+                        })
+                        .size(12.5)
+                        .color(DIM),
+                    );
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut form.factor)
+                            .password(true)
+                            .desired_width(field_w - 16.0)
+                            .margin(pad),
+                    );
+                } else {
+                    ui.label(RichText::new("Username").size(12.5).color(DIM));
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut form.username)
+                            .desired_width(field_w - 16.0)
+                            .margin(pad),
+                    );
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("Password").size(12.5).color(DIM));
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut form.password)
+                            .password(true)
+                            .desired_width(field_w - 16.0)
+                            .margin(pad),
+                    );
+                }
+                if let Some(error) = &form.error {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(error).size(12.5).color(DANGER));
+                }
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    let label = if hv { "Retry sign-in" } else { "Sign in" };
+                    if button(ui, Some(Icon::User), label, Btn::Primary, false, !busy).clicked()
+                        || (enter && !busy)
+                    {
+                        submit = true;
+                    }
+                    if busy {
+                        ui.add_space(8.0);
+                        ui.spinner();
+                    }
+                });
+            });
+        });
+        if let Some(url) = open_verify {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        }
+        if submit && !busy {
             let form = &mut self.api_signin;
             let two_factor = form.step["need_2fa"] == true;
             let mailbox = form.step["need_mailbox_password"] == true;
-            if two_factor || mailbox {
-                ui.label(if two_factor {
-                    "TOTP code"
-                } else {
-                    "Mailbox password"
-                });
-                ui.add(egui::TextEdit::singleline(&mut form.factor).password(true));
-            } else {
-                ui.label("Username");
-                ui.text_edit_singleline(&mut form.username);
-                ui.label("Password");
-                ui.add(egui::TextEdit::singleline(&mut form.password).password(true));
-            }
             let hv = form.step["need_human_verification"] == true;
-            if hv {
-                ui.label("Complete human verification, then retry sign-in.");
-                if let Some(url) = form.step["url"]
-                    .as_str()
-                    .filter(|url| url.starts_with("https://verify.proton.me/"))
-                {
-                    ui.hyperlink_to("verify.proton.me", url);
-                    if ui.button("Open browser").clicked() {
-                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
-                    }
+            let (method, params) = if two_factor {
+                (
+                    "auth.submit_2fa",
+                    serde_json::json!({"code": std::mem::take(&mut form.factor)}),
+                )
+            } else if mailbox {
+                (
+                    "auth.submit_mailbox_password",
+                    serde_json::json!({"password": std::mem::take(&mut form.factor)}),
+                )
+            } else {
+                let mut params =
+                    serde_json::json!({"username": form.username, "password": form.password});
+                if hv {
+                    params["hv_token"] = form.step["token"].clone();
+                    params["hv_type"] = form.step["methods"][0].clone();
                 }
-            }
-            if let Some(error) = &form.error {
-                ui.colored_label(DANGER, error);
-            }
-            if ui
-                .button(if hv { "Retry sign-in" } else { "Sign in" })
-                .clicked()
-            {
-                let (method, params) = if two_factor {
-                    (
-                        "auth.submit_2fa",
-                        serde_json::json!({"code":std::mem::take(&mut form.factor)}),
-                    )
-                } else if mailbox {
-                    (
-                        "auth.submit_mailbox_password",
-                        serde_json::json!({"password":std::mem::take(&mut form.factor)}),
-                    )
-                } else {
-                    let mut params =
-                        serde_json::json!({"username":form.username,"password":form.password});
-                    if hv {
-                        params["hv_token"] = form.step["token"].clone();
-                        params["hv_type"] = form.step["methods"][0].clone();
-                    }
-                    ("auth.login", params)
-                };
-                let (tx, rx) = std::sync::mpsc::channel();
-                form.pending = Some(rx);
-                form.error = None;
-                let cfg = self.cfg.clone();
-                let ctx = ui.ctx().clone();
-                thread::spawn(move || {
-                    let result = neutronsync::driveapi::DriveApi::new(&cfg)
-                        .and_then(|api| api.auth(method, params))
-                        .map_err(|e| e.to_string());
-                    let _ = tx.send(result);
-                    ctx.request_repaint();
-                });
-            }
-        });
-        if busy {
-            ui.spinner();
+                ("auth.login", params)
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            form.pending = Some(rx);
+            form.error = None;
+            let cfg = self.cfg.clone();
+            let ctx = ui.ctx().clone();
+            thread::spawn(move || {
+                let result = neutronsync::driveapi::DriveApi::new(&cfg)
+                    .and_then(|api| api.auth(method, params))
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(result);
+                ctx.request_repaint();
+            });
         }
     }
 
@@ -3400,6 +3628,40 @@ fn combo_compare(ui: &mut egui::Ui, v: &mut Compare) -> bool {
                 (Compare::Sha1, "SHA-1 (exact)"),
             ] {
                 changed |= ui.selectable_value(v, val, lbl).clicked();
+            }
+        });
+    changed
+}
+
+fn plain_signin_error(error: String) -> String {
+    error
+        .replace("sign in with the sidecar", "sign in again")
+        .replace("api backend: ", "")
+}
+
+fn combo_full_walk(ui: &mut egui::Ui, v: &mut u64) -> bool {
+    const CHOICES: [(u64, &str); 4] = [
+        (21600, "6 h"),
+        (43200, "12 h"),
+        (86400, "1 day"),
+        (604800, "7 days"),
+    ];
+    let text = CHOICES
+        .iter()
+        .find(|(secs, _)| *secs == *v)
+        .map(|(_, label)| *label)
+        .unwrap_or("Custom");
+    let display = if text == "Custom" {
+        format!("{v} s")
+    } else {
+        text.to_string()
+    };
+    let mut changed = false;
+    egui::ComboBox::from_id_salt("full_walk_interval")
+        .selected_text(display)
+        .show_ui(ui, |ui| {
+            for (secs, label) in CHOICES {
+                changed |= ui.selectable_value(v, secs, label).clicked();
             }
         });
     changed

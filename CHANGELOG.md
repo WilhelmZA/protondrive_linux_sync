@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Fixed
+- The GUI remote folder browser and "Folders to sync" picker list through the configured backend, so both work on an API-only install with no `proton-drive` binary.
+
+### Changed
+- API sign-in and Account pages use the same centred card layout as the rest of the app, including a clear "Sign-in service didn't start" state when the sidecar is missing.
+- Settings → Advanced shows a read-only Backend row, a "Full check every" control for `full_walk_interval` on the API backend, and hides CLI-only rows unless `backend = "cli"`.
+- About, README, SYNC_MODEL, SECURITY, CONTRIBUTING, GUI_API and the example config describe the API backend first; the CLI is one legacy section that goes away in 0.5.0.
+
 ## [0.4.0] - 2026-10-06
 
 ### Added

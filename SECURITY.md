@@ -6,7 +6,7 @@ The `neutronsync-drive` sidecar owns the Proton API session. It stores the accou
 
 One sidecar serves the user session and performs token refresh. A shared in-flight refresh prevents parallel API requests from rotating the same refresh token independently. The session-wide socket and advisory lock extend that ownership across GUI, tray, CLI and watch processes. This prevents competing refreshers from invalidating each other's session.
 
-Credentials cross the local Unix socket during sign-in. Password fields are masked. Credentials never enter logs, activity records, configuration or process arguments. Error messages use typed codes instead of server text that could echo secrets. Processes running as the same user are inside the trust boundary: they can connect to the socket and access that user's keyring. Root and a compromised desktop session are also outside this protection.
+Credentials cross the local Unix socket during sign-in. The GUI sign-in form sends username, password, two-factor codes and mailbox passwords only to the sidecar over that user-only socket. It never writes them to disk or logs, and it clears the password and code fields after each attempt. Password fields are masked. Credentials never enter logs, activity records, configuration or process arguments. Error messages use typed codes instead of server text that could echo secrets. Processes running as the same user are inside the trust boundary: they can connect to the socket and access that user's keyring. Root and a compromised desktop session are also outside this protection.
 
 ## Local transport
 

@@ -41,14 +41,22 @@ struct PairState {
     tracked: usize,                      // files under management
 }
 
-struct AccountState { checked, binary_found, signed_in: bool, version: String }
+struct AccountState {
+    checked: bool,
+    backend_ready: bool,   // API: sidecar answered; CLI: binary found on PATH
+    signed_in: bool,
+    account: String,       // Proton account name from the API probe (empty on CLI)
+    version: String,       // sidecar path/identity (API) or binary version/path (CLI);
+                           // on probe failure, the error text for the sign-in page
+    checking: bool,        // refresh in flight (Refresh spinner)
+}
 struct ActivityItem { ts: i64, kind: ActivityKind /*Info|Sync|Error*/, text: String }
 ```
 
 Rendering hints:
 - Per-pair row: name, `phase`, a progress bar from `progress.fraction()`, and `current_op` as a subtitle. Colour by `phase` (Synced=green, Error=red, Scanning/Syncing=accent).
 - Activity tab: iterate `activity` (it's already capped), colour by `kind`.
-- Account tab: dot from `signed_in`, show `version`.
+- Account tab: status from `backend_ready` / `signed_in`, show `account` and `version`.
 
 ## Commands (all non-blocking)
 
@@ -58,7 +66,7 @@ controller.sync(vec!["docs".into()], true);  // dry-run just "docs"
 controller.cancel();                         // stop the current sync (before next op)
 controller.start_watch(vec![]);              // live-sync all pairs
 controller.stop_watch();
-controller.refresh_account();                // re-check login/version
+controller.refresh_account(false);           // re-check login; on API probes the sidecar via auth.status
 controller.is_busy();  controller.is_watching();
 ```
 

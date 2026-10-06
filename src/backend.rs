@@ -25,6 +25,13 @@ pub fn select(cfg: &Config) -> Result<Box<dyn Remote + Send + Sync>> {
     }
 }
 
+/// List a remote folder through the configured backend. Used by the GUI browser and folder picker.
+pub fn list_remote(cfg: &Config, path: &str) -> std::result::Result<Vec<Entry>, String> {
+    select(cfg)
+        .and_then(|remote| remote.list_dir(path))
+        .map_err(|e| e.to_string())
+}
+
 pub fn effective_dry_run(remote: &dyn Remote, requested: bool, log: &Logger) -> bool {
     if remote.read_only() && !requested {
         log.warn("read-only backend: forcing a dry run, nothing will change");

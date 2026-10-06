@@ -669,7 +669,53 @@ pub fn save(cfg: &Config, path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{migrate_transfer_flags, TransferKind};
+    use super::{load, migrate_transfer_flags, save, TransferKind};
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn full_walk_interval_round_trip_gui_values() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("cfg.toml");
+        fs::write(
+            &path,
+            r#"
+[cli]
+backend = "api"
+[options]
+state_dir = "/tmp/ns-test-state"
+[[pair]]
+name = "x"
+local = "/tmp/ns-test-local"
+remote = "Documents"
+"#,
+        )
+        .unwrap();
+        let mut cfg = load(path.to_str()).unwrap();
+        assert_eq!(cfg.full_walk_interval, 86400);
+        for secs in [21600_u64, 43200, 86400, 604800] {
+            cfg.full_walk_interval = secs;
+            save(&cfg, &path).unwrap();
+            let loaded = load(path.to_str()).unwrap();
+            assert_eq!(loaded.full_walk_interval, secs);
+        }
+        // Absent key loads as the one-day default.
+        fs::write(
+            &path,
+            r#"
+[cli]
+backend = "api"
+[options]
+state_dir = "/tmp/ns-test-state"
+[[pair]]
+name = "x"
+local = "/tmp/ns-test-local"
+remote = "Documents"
+"#,
+        )
+        .unwrap();
+        assert_eq!(load(path.to_str()).unwrap().full_walk_interval, 86400);
+    }
 
     #[test]
     fn migrates_legacy_conflict_strategy_upload() {
