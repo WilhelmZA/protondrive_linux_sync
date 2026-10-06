@@ -580,6 +580,71 @@ fn cancelled_engine_run_does_not_confirm_untransferred_files() {
 }
 
 #[test]
+fn missing_remote_hint_is_complete_and_keeps_local_descendants() {
+    let h = Harness::new();
+    h.remote("folder", "test", None);
+    h.remote("child", "folder", Some("keep until parent confirmation"));
+    h.run();
+    h.api.trash("/my-files/test/folder").unwrap();
+    let before = h.writes().len();
+    let log = Logger::silent();
+    let (result, _) = Engine::new(&h.cfg, DriveApi::new(&h.cfg).unwrap(), &log, false)
+        .sync_pair_shallow(&h.cfg.pairs[0], "folder")
+        .unwrap();
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(result.applied, 0);
+    assert_eq!(
+        fs::read_to_string(h.cfg.pairs[0].local.join("folder/child")).unwrap(),
+        "keep until parent confirmation"
+    );
+    assert!(h.baseline().contains_key("folder/child"));
+    assert_eq!(h.writes().len(), before);
+}
+
+#[test]
+fn missing_remote_hint_with_unreadable_local_folder_still_fails() {
+    let h = Harness::new();
+    h.remote("folder", "test", None);
+    h.remote("child", "folder", Some("keep unreadable contents"));
+    h.run();
+    h.api.trash("/my-files/test/folder").unwrap();
+    let folder = h.cfg.pairs[0].local.join("folder");
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o000)).unwrap();
+    let log = Logger::silent();
+    let result = Engine::new(&h.cfg, DriveApi::new(&h.cfg).unwrap(), &log, false)
+        .sync_pair_shallow(&h.cfg.pairs[0], "folder");
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+    let (result, _) = result.unwrap();
+    assert!(!result.errors.is_empty());
+    assert_eq!(result.applied, 0);
+    assert_eq!(
+        fs::read_to_string(folder.join("child")).unwrap(),
+        "keep unreadable contents"
+    );
+}
+
+#[test]
+fn remote_transport_error_in_hinted_folder_still_fails() {
+    let h = Harness::new();
+    h.remote("folder", "test", None);
+    h.remote("child", "folder", Some("keep on transport error"));
+    h.run();
+    h.controls(json!({"list_errors":{"folder":"transient"}}));
+    let before = h.writes().len();
+    let log = Logger::silent();
+    let (result, _) = Engine::new(&h.cfg, DriveApi::new(&h.cfg).unwrap(), &log, false)
+        .sync_pair_shallow(&h.cfg.pairs[0], "folder")
+        .unwrap();
+    assert!(!result.errors.is_empty());
+    assert_eq!(result.applied, 0);
+    assert_eq!(
+        fs::read_to_string(h.cfg.pairs[0].local.join("folder/child")).unwrap(),
+        "keep on transport error"
+    );
+    assert_eq!(h.writes().len(), before);
+}
+
+#[test]
 fn transfer_thread_overrides_fallback_clamp_and_error_callbacks() {
     let h = Harness::new();
     for i in 0..10 {

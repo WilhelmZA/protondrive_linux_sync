@@ -84,6 +84,16 @@ remote = "/my-files/test"
     fn event(&self, kind: &str, parent: &str) {
         self.write("feed.json", json!([{"last_event_id":"1","events":[{"type":kind,"node_uid":"file","parent_uid":parent}]}]));
     }
+    fn record_cli_calls(&self) {
+        let cli = self.dir.path().join("cli");
+        fs::write(&cli, "#!/usr/bin/env python3\nimport json, sys\nfrom pathlib import Path\nwith Path(__file__).with_name('cli-calls').open('a') as out:\n    out.write(json.dumps(sys.argv[1:]) + '\\n')\nprint('[]')\n").unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = self.dir.path().join("config.toml");
+        let config = fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"/no-cli-may-run\"", &format!("{cli:?}"));
+        fs::write(path, config).unwrap();
+    }
     fn start(&mut self) {
         let log = fs::OpenOptions::new()
             .create(true)
@@ -296,6 +306,7 @@ fn crash_between_apply_and_save_replays_without_transfer_or_baseline_change() {
 #[test]
 fn signed_out_pauses_and_auth_status_resumes_without_cli() {
     let mut h = Harness::new();
+    h.record_cli_calls();
     h.ready();
     h.write("controls.json", json!({"signed_in":false}));
     h.write(
@@ -313,20 +324,22 @@ fn signed_out_pauses_and_auth_status_resumes_without_cli() {
     assert_eq!(h.local("a/file"), "after-login");
     assert_eq!(h.walks(), 1);
     assert!(h.log().contains("signed back in"));
+    h.stop();
+    assert!(
+        h.records("cli-calls").is_empty(),
+        "API watch invoked the CLI"
+    );
 }
 #[test]
 fn cli_has_no_feed_and_keeps_adaptive_pacing() {
     use neutronsync::protoncli::{ProtonCli, Remote};
     let mut h = Harness::new();
     assert!(ProtonCli::new(&h.cfg).change_feed().is_none());
-    let cli = h.dir.path().join("cli");
-    fs::write(&cli, "#!/usr/bin/env python3\nprint('[]')\n").unwrap();
-    fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+    h.record_cli_calls();
     let path = h.dir.path().join("config.toml");
     let config = fs::read_to_string(&path)
         .unwrap()
         .replace("backend = \"api\"", "backend = \"cli\"")
-        .replace("\"/no-cli-may-run\"", &format!("{cli:?}"))
         .replace("full_walk_interval = 86400", "full_walk_interval = 1");
     fs::write(path, config).unwrap();
     h.start();
@@ -336,6 +349,85 @@ fn cli_has_no_feed_and_keeps_adaptive_pacing() {
     assert_eq!(h.log().matches("watch: full walk done").count(), 1);
     assert!(h.records("starts").is_empty());
     assert!(h.records("calls").is_empty());
+    assert!(
+        !h.records("cli-calls").is_empty(),
+        "CLI recorder did not run"
+    );
+}
+
+fn folder_departure(destination: Option<(&str, &str)>, parent: &str) {
+    let mut h = Harness::new();
+    let path = h.dir.path().join("config.toml");
+    let config = fs::read_to_string(&path)
+        .unwrap()
+        .replace("backend = \"api\"", "backend = \"api\"\nscan_threads = 1");
+    fs::write(path, config).unwrap();
+    let mut tree = h.tree();
+    tree["sub"] = json!({"name":"sub","type":"folder","parent_uid":"a"});
+    h.write("tree.json", tree);
+    h.file("sub", "child", "folder contents");
+    h.ready();
+    assert_eq!(h.local("a/sub/child"), "folder contents");
+    // Restart after seeding to exclude startup inotify echoes from the event test.
+    h.stop();
+    h.start();
+    h.wait(|| {
+        h.records("calls")
+            .iter()
+            .filter(|c| c["method"] == "events.subscribe")
+            .count()
+            == 2
+    });
+    let call_start = h.records("calls").len();
+    let mut tree = h.tree();
+    if let Some((parent, name)) = destination {
+        tree["sub"]["parent_uid"] = json!(parent);
+        tree["sub"]["name"] = json!(name);
+    } else {
+        tree.as_object_mut().unwrap().remove("sub");
+        tree.as_object_mut().unwrap().remove("file");
+    }
+    h.write("tree.json", tree);
+    h.write("feed.json", json!([{"last_event_id":"1","events":[{"type":if destination.is_some(){"node_updated"}else{"node_deleted"},"node_uid":"sub","parent_uid":parent}]}]));
+    h.applied();
+    h.wait(|| h.records("acks").iter().any(|a| a["event_id"] == "1"));
+    h.wait(|| h.log().contains("uid=sub disposition=mapped"));
+    assert!(!h.cfg.pairs[0].local.join("a/sub").exists());
+    if let Some((parent, name)) = destination {
+        let target = format!("{parent}/{name}/child");
+        h.wait(|| h.cfg.pairs[0].local.join(&target).is_file());
+        assert_eq!(h.local(&target), "folder contents");
+    }
+    h.stop();
+    assert_eq!(h.walks(), 1, "{}", h.log());
+    assert!(
+        !h.log().contains("uid=sub disposition=deferred"),
+        "{}",
+        h.log()
+    );
+    let calls = h.records("calls");
+    assert!(calls[call_start..]
+        .iter()
+        .any(|c| c["method"] == "node.resolve" && c["params"]["path"] == "/my-files/test/a/sub"));
+    assert!(!h.records("writes").iter().any(|c| matches!(
+        c["method"].as_str(),
+        Some("node.trash" | "file.upload" | "node.create_folder")
+    )));
+}
+
+#[test]
+fn remote_folder_move_acks_first_delivery_without_full_walk() {
+    folder_departure(Some(("b", "sub")), "b");
+}
+
+#[test]
+fn remote_folder_rename_acks_first_delivery_without_full_walk() {
+    folder_departure(Some(("a", "renamed")), "a");
+}
+
+#[test]
+fn remote_folder_trash_acks_first_delivery_without_full_walk() {
+    folder_departure(None, "a");
 }
 
 #[test]

@@ -1924,13 +1924,13 @@ impl<'a, R: Remote> Engine<'a, R> {
         // exhaustion under the concurrent walk) must NOT be read as "everything
         // here was deleted" — that would trash still-present remote files. Flag
         // it and suppress deletes this run, exactly like a failed remote listing.
-        let local_failed = match std::fs::read_dir(&dir_path) {
+        let (local_failed, local_missing) = match std::fs::read_dir(&dir_path) {
             Err(e) => {
                 self.log.warn(&format!(
                     "shallow: local listing failed for {}: {e}; syncing without deletions",
                     dir_path.display()
                 ));
-                true
+                (true, e.kind() == std::io::ErrorKind::NotFound)
             }
             Ok(rd) => {
                 for e in rd.flatten() {
@@ -1999,7 +1999,7 @@ impl<'a, R: Remote> Engine<'a, R> {
                         }
                     }
                 }
-                false
+                (false, false)
             }
         };
 
@@ -2114,10 +2114,10 @@ impl<'a, R: Remote> Engine<'a, R> {
 
         let tracked = new_base.len();
         let (mut result, deleted_ok) = self.apply(pair, plan, new_base, prune_excluded);
-        // A stale hint for an untracked folder absent on both sides is already settled.
-        let absent_both =
-            remote_missing && local_failed && base_direct.is_empty() && !dir_path.exists();
-        if self.remote.change_feed().is_some() && (remote_failed || local_failed) && !absent_both {
+        // A moved or trashed folder's old path remains a valid hint. Missing paths
+        // still suppress deletes above, but only real listing failures block ack.
+        let listing_error = (remote_failed && !remote_missing) || (local_failed && !local_missing);
+        if self.remote.change_feed().is_some() && listing_error {
             result
                 .errors
                 .push("incomplete shallow listing; feed batch must retry".into());
