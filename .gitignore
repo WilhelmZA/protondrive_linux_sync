@@ -16,3 +16,7 @@ logs/
 
 # Non-redistributable reference assets (design refs, kept local only)
 /reference/
+
+# Standalone Phase 0 sidecar
+/sidecar/node_modules/
+/sidecar/dist/
