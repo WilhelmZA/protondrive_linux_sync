@@ -131,7 +131,15 @@ export class Auth {
     let response = await this.raw(path, init, this.session);
     if (response.status === 401) {
       try { await this.refresh(used); }
-      catch { await this.signOut(); throw new Fault('auth'); }
+      catch (error) {
+        // A dead refresh token already signed out inside refresh(). A network
+        // blip must not: wiping the keyring is what forces a full login.
+        if (!(error instanceof Fault) || error.code === 'auth') {
+          await this.signOut();
+          throw new Fault('auth');
+        }
+        throw error;
+      }
       if (!this.session) throw new Fault('auth');
       response = await this.raw(path, init, this.session);
       if (response.status === 401) { await this.signOut(); throw new Fault('auth'); }
@@ -180,7 +188,13 @@ export class Auth {
   }
 
   async login(username: string, password: string, hv?: { token: string; type: HvType }): Promise<LoginResult> {
-    await this.logout();
+    // Drop the in-memory session only. The keyring copy stays until a new one
+    // is saved, so a failed attempt (or a login screen shown by mistake) cannot
+    // destroy a session that still works. Do not bump `generation` here: an
+    // in-flight refresh treats that as logout and clears the store.
+    this.session = null;
+    this.pending = null;
+    this.onClear();
     const info = await this.json('/auth/v4/info', { method: 'POST', body: JSON.stringify({ Username: username, Intent: 'Proton' }) }, false);
     let proof: Awaited<ReturnType<typeof getSrp>>;
     try { proof = await this.crypto.proof(info, { username, password }); }
@@ -253,6 +267,23 @@ export class Auth {
   status() {
     if (this.initializationFailed) throw new Fault('fatal');
     return { signed_in: !!this.session?.keyPassphrase && !this.pending, account: this.session?.keyPassphrase && !this.pending ? this.session.account : null };
+  }
+  /**
+   * Startup reads the keyring once. If that read happens before the keyring is
+   * unlocked, or otherwise misses a session that is sitting in the store, the
+   * process used to stay signed out forever. Load again when memory is empty.
+   * A login in progress (`pending`) and a live session are left alone, so a
+   * newer in-memory token is never replaced by a stale keyring copy.
+   */
+  async rehydrate() {
+    if (this.initializationFailed || this.session || this.pending) return;
+    try {
+      const loaded = await this.store.load();
+      if (this.session || this.pending) return;
+      if (loaded?.keyPassphrase) this.session = loaded;
+    } catch {
+      // Locked or unreadable storage is not a sign-out. The next status tries again.
+    }
   }
   requireSession(): Session {
     if (!this.status().signed_in) throw new Fault('auth');

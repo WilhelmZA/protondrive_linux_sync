@@ -71,7 +71,7 @@ export async function serve(auth: Auth, getDrive: () => Promise<Drive>, close: (
         }
         case 'auth.submit_2fa': return auth.submit2fa(text(p, 'code'));
         case 'auth.submit_mailbox_password': return auth.submitMailbox(text(p, 'password'));
-        case 'auth.status': return auth.status();
+        case 'auth.status': await auth.rehydrate(); return auth.status();
         case 'auth.logout': return auth.logout();
         case 'node.resolve': return (await getDrive()).resolve(text(p, 'path'));
         case 'node.path': return (await getDrive()).path(text(p, 'uid'));

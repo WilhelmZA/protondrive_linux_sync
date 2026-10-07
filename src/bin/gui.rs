@@ -208,6 +208,19 @@ fn button(
     small: bool,
     enabled: bool,
 ) -> egui::Response {
+    button_width(ui, icon, label, kind, small, enabled, None)
+}
+
+/// Like [`button`], but at least `width` wide, with the label centred in it.
+fn button_width(
+    ui: &mut egui::Ui,
+    icon: Option<Icon>,
+    label: &str,
+    kind: Btn,
+    small: bool,
+    enabled: bool,
+    width: Option<f32>,
+) -> egui::Response {
     let h = if small { 30.0 } else { 34.0 };
     let fs = if small { 12.5 } else { 13.0 };
     let font = FontId::new(fs, ff_bold());
@@ -216,7 +229,8 @@ fn button(
     let gap = 7.0;
     let tw = galley_w(ui, label, font.clone());
     let iw = if icon.is_some() { icon_sz + gap } else { 0.0 };
-    let w = pad * 2.0 + iw + tw;
+    let natural = pad * 2.0 + iw + tw;
+    let w = width.unwrap_or(natural).max(natural);
     let (rect, resp) = ui.allocate_exact_size(
         vec2(w, h),
         if enabled {
@@ -261,7 +275,10 @@ fn button(
     if bg.a() > 0 {
         painter.rect_filled(rect, 8.0, bg);
     }
-    let mut x = rect.left() + pad;
+    // Hug-width buttons already have `pad` on each side, so centring the
+    // icon+label lands in the same place. A wider button (the sign-in action)
+    // keeps that label in the middle instead of on the left edge.
+    let mut x = rect.left() + (rect.width() - iw - tw) / 2.0;
     if let Some(ic) = icon {
         let ir = Rect::from_center_size(
             pos2(x + icon_sz / 2.0, rect.center().y),
@@ -1052,6 +1069,17 @@ impl eframe::App for App {
         // (page_signin renders install guidance) and "present but signed out".
         let signin =
             snap.account.checked && !(snap.account.backend_ready && snap.account.signed_in);
+        // The gate used to probe once. A session that was already in the keyring,
+        // or that becomes readable after the keyring unlocks, never got a second
+        // look, so the login page stayed up until Refresh. Keep asking.
+        if signin {
+            let now = ctx.input(|i| i.time);
+            if now - self.last_account_poll > 2.5 && !snap.account.checking {
+                self.ctrl.refresh_account(true);
+                self.last_account_poll = now;
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(400));
+        }
 
         if !signin {
             self.nav_rail(root_ui, &snap);
@@ -2640,13 +2668,15 @@ impl App {
                         .as_str()
                         .filter(|url| url.starts_with("https://verify.proton.me/"))
                     {
-                        if button(
+                        let width = ui.available_width();
+                        if button_width(
                             ui,
                             None,
                             "Open verification page",
                             Btn::Secondary,
                             false,
                             true,
+                            Some(width),
                         )
                         .clicked()
                         {
@@ -2694,18 +2724,21 @@ impl App {
                     ui.label(RichText::new(error).size(12.5).color(DANGER));
                 }
                 ui.add_space(14.0);
-                ui.horizontal(|ui| {
-                    let label = if hv { "Retry sign-in" } else { "Sign in" };
-                    if button(ui, Some(Icon::User), label, Btn::Primary, false, !busy).clicked()
-                        || (enter && !busy)
-                    {
-                        submit = true;
-                    }
-                    if busy {
-                        ui.add_space(8.0);
+                let label = if hv { "Retry sign-in" } else { "Sign in" };
+                let width = ui.available_width();
+                if button_width(ui, Some(Icon::User), label, Btn::Primary, false, !busy, Some(width))
+                    .clicked()
+                    || (enter && !busy)
+                {
+                    submit = true;
+                }
+                if busy {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space((ui.available_width() - 24.0).max(0.0) / 2.0);
                         ui.spinner();
-                    }
-                });
+                    });
+                }
             });
         });
         if let Some(url) = open_verify {

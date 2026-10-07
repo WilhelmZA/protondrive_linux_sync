@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Fixed
+- The sign-in button spans the form with its label centred, instead of sitting on the left edge of the card.
+- A session that is still in the keyring is picked up again if the sidecar missed it at startup (the keyring was locked, or the read came back empty). The login page keeps checking, so it leaves on its own. A failed sign-in attempt and a refresh that only hit a network error no longer delete that saved session.
+
 ## [0.4.1] - 2026-10-07
 
 ### Fixed

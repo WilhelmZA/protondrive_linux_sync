@@ -110,7 +110,7 @@ describe('authentication over fake HTTP', () => {
     expect(h.store.value).toBeNull();
     expect(h.auth.status().signed_in).toBe(false);
   });
-  test('proactive refresh keeps the session on a transient failure; failed 401 refresh signs out', async () => {
+  test('a transient refresh failure keeps the session, including after a 401', async () => {
     const h = harness();
     await h.auth.login('normal', 'password-secret');
     h.backend.refreshFailure(503);
@@ -120,9 +120,25 @@ describe('authentication over fake HTTP', () => {
     expect(h.notifications).toHaveLength(0);
     h.auth.session!.expiresAt = Date.now() + 3_600_000;
     h.backend.expireAccess();
-    await expect(h.auth.json('/fixture/root')).rejects.toMatchObject({ code: 'auth' });
-    expect(h.notifications.filter(n => n.method === 'auth.signed_out')).toHaveLength(1);
-    expect(h.store.value).toBeNull();
+    await expect(h.auth.json('/fixture/root')).rejects.toMatchObject({ code: 'transient' });
+    expect(h.notifications.filter(n => n.method === 'auth.signed_out')).toHaveLength(0);
+    expect(h.store.value).not.toBeNull();
+    expect(h.auth.status().signed_in).toBe(true);
+  });
+  test('a missed startup load is recovered from the store, and a failed login does not wipe it', async () => {
+    const h = harness();
+    await h.auth.login('normal', 'password-secret');
+    const saved = h.store.value;
+    h.auth.session = null;
+    expect(h.auth.status().signed_in).toBe(false);
+    await h.auth.rehydrate();
+    expect(h.auth.status()).toEqual({ signed_in: true, account: 'normal' });
+    await expect(h.auth.login('normal', 'bad-password')).rejects.toMatchObject({ code: 'auth' });
+    expect(h.store.value).toEqual(saved);
+    h.auth.session = null;
+    h.auth.pending = null;
+    await h.auth.rehydrate();
+    expect(h.auth.status().signed_in).toBe(true);
   });
   test('logging boundary suppresses arbitrary strings, objects and error stacks', async () => {
     const h = harness();
