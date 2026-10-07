@@ -12,6 +12,22 @@
 
 NeutronSync keeps local folders and their Proton Drive counterparts in sync through a three-way-merge engine. Its CLI and native GUI share one core library. The bundled `neutronsync-drive` sidecar uses Proton's SDK and owns the API session.
 
+<p align="center">
+  <img src="docs/screenshots/activity-syncing.png" width="840" alt="NeutronSync Activity page during a sync: a status banner, files in flight and the recent file feed">
+</p>
+
+## Screenshots
+
+The pictures use example folders and files. See [`docs/screenshots.md`](docs/screenshots.md) for every page, including the sign-in steps.
+
+| Folders | Settings |
+| --- | --- |
+| [![Folders page: three folder pairs with their local and Proton paths, an Auto switch and a progress bar on the one that is syncing](docs/screenshots/folders.png)](docs/screenshots/folders.png) | [![Settings page: grouped cards with switches and drop-downs](docs/screenshots/settings.png)](docs/screenshots/settings.png) |
+
+| Account | Sign in |
+| --- | --- |
+| [![Account page: the signed-in Proton account, where the session is stored and the helper in use](docs/screenshots/account.png)](docs/screenshots/account.png) | [![Sign-in page: a centred card with username and password fields](docs/screenshots/sign-in.png)](docs/screenshots/sign-in.png) |
+
 ## Features
 
 - **Proton Drive SDK sidecar.** The packaged `neutronsync-drive` helper talks to Proton through the official Drive SDK. You sign in inside NeutronSync; the session lives in your system keyring.
@@ -214,7 +230,7 @@ The API sign-in form passes credentials over the private local socket to the sid
 
 ## Development
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for layout, build, and release notes, and [`docs/GUI_API.md`](docs/GUI_API.md) for the GUI backend API.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for layout, build, and release notes, and [`docs/GUI_API.md`](docs/GUI_API.md) for the GUI backend API. `scripts/screenshots.sh` regenerates the documentation screenshots from example data in a private X server.
 
 ## License
 

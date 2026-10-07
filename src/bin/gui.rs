@@ -38,6 +38,10 @@ const ACCENT_LO: Color32 = Color32::from_rgb(0x5C, 0x3E, 0xDB);
 const OK: Color32 = Color32::from_rgb(0x3C, 0xBB, 0x87);
 const DANGER: Color32 = Color32::from_rgb(0xE0, 0x50, 0x64);
 const WARN: Color32 = Color32::from_rgb(0xD8, 0xA0, 0x50);
+/// Off-state switch track: visibly a control, even on a PANEL2 card.
+const TRACK_OFF: Color32 = Color32::from_rgb(0x3B, 0x39, 0x4A);
+/// Disabled filled button: muted, with a legible label.
+const BTN_OFF: Color32 = Color32::from_rgb(0x2E, 0x2C, 0x3E);
 
 fn line_col() -> Color32 {
     Color32::from_rgba_unmultiplied(255, 255, 255, 20)
@@ -139,13 +143,35 @@ fn rel_time(ts: i64) -> String {
     let d = (now_secs() - ts).max(0);
     match d {
         0..=44 => "just now".into(),
-        45..=89 => "1 minute ago".into(),
-        90..=3599 => format!("{} minutes ago", d / 60),
+        45..=119 => "1 minute ago".into(),
+        120..=3599 => format!("{} minutes ago", d / 60),
         3600..=7199 => "1 hour ago".into(),
         7200..=86399 => format!("{} hours ago", d / 3600),
         86400..=172799 => "yesterday".into(),
         _ => format!("{} days ago", d / 86400),
     }
+}
+
+/// "1 folder" / "2 folders".
+fn plural(n: usize, one: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{} {one}s", thousands(n))
+    }
+}
+
+/// 1284 -> "1,284".
+fn thousands(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn galley_w(ui: &egui::Ui, text: &str, font: FontId) -> f32 {
@@ -246,6 +272,9 @@ fn button_width(
     let painter = ui.painter();
 
     let (bg, fg) = match kind {
+        // A disabled filled button goes muted rather than translucent, so the
+        // label stays readable instead of fading into the accent.
+        Btn::Primary | Btn::Secondary if !enabled => (BTN_OFF, DIM),
         Btn::Primary => {
             let base = if down {
                 ACCENT_LO
@@ -255,7 +284,7 @@ fn button_width(
             (base, TEXT)
         }
         Btn::Secondary => {
-            let base = mix(PANEL2, mix(PANEL2, TEXT, 0.10), hov);
+            let base = mix(SEL, mix(SEL, TEXT, 0.10), hov);
             (if down { ACCENT_LO } else { base }, TEXT)
         }
         Btn::Ghost => (
@@ -303,11 +332,21 @@ fn switch(ui: &mut egui::Ui, on: bool) -> bool {
     let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
     let t = ui.ctx().animate_bool_with_time(resp.id, on, 0.16);
     let painter = ui.painter();
-    let track = mix(PANEL2, ACCENT, t);
+    let hov = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
+    let off = mix(TRACK_OFF, mix(TRACK_OFF, TEXT, 0.08), hov);
+    let track = mix(off, mix(ACCENT, ACCENT_HI, hov), t);
     painter.rect_filled(rect, h / 2.0, track);
     let kr = h / 2.0 - 3.0;
     let cx = rect.left() + h / 2.0 + t * (w - h);
-    painter.circle_filled(pos2(cx, rect.center().y), kr, mix(DIM, TEXT, t));
+    let knob = pos2(cx, rect.center().y);
+    // soft shadow under the knob lifts it off the track
+    painter.circle_filled(knob + vec2(0.0, 1.0), kr, Color32::from_black_alpha(60));
+    painter.circle_filled(knob, kr, mix(Color32::from_rgb(0xD4, 0xD2, 0xDE), TEXT, t));
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     resp.clicked()
 }
 
@@ -315,7 +354,7 @@ fn switch(ui: &mut egui::Ui, on: bool) -> bool {
 fn meter(ui: &mut egui::Ui, width: f32, frac: f32, col: Color32, id: egui::Id) {
     let (rect, _) = ui.allocate_exact_size(vec2(width, 6.0), Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 3.0, PANEL2);
+    painter.rect_filled(rect, 3.0, TRACK_OFF);
     let f = ui
         .ctx()
         .animate_value_with_time(id, frac.clamp(0.0, 1.0), 0.5);
@@ -565,6 +604,10 @@ struct App {
     // window just ensures one exists and exits on close (the daemon lives on).
     mode_daemon: bool,
     _win_lock: Option<PidLock>,
+
+    // `--screenshots <dir>`: drive the window through scripted scenes with
+    // made-up data and write one PNG per scene. None in normal use.
+    demo: Option<Demo>,
 }
 
 impl App {
@@ -620,6 +663,7 @@ impl App {
             confirm_remove_local: None,
             mode_daemon,
             _win_lock: win_lock,
+            demo: None,
         };
         // Resume Auto sync if it was on last time — but not in daemon mode, where
         // the daemon owns the watcher (only one watcher may hold the lock).
@@ -1013,7 +1057,9 @@ impl eframe::App for App {
         // published live state instead (scanning, syncing, per-file ops), keeping
         // this window's own account check. Falls back to our own state if the
         // daemon hasn't published yet.
-        let snap = {
+        let snap = if let Some(state) = self.demo_frame(ctx) {
+            state
+        } else {
             let mine = self.ctrl.snapshot();
             if self.mode_daemon {
                 match Controller::read_status(&self.cfg.state_dir) {
@@ -1074,7 +1120,7 @@ impl eframe::App for App {
         // The gate used to probe once. A session that was already in the keyring,
         // or that becomes readable after the keyring unlocks, never got a second
         // look, so the login page stayed up until Refresh. Keep asking.
-        if signin {
+        if signin && self.demo.is_none() {
             let now = ctx.input(|i| i.time);
             if now - self.last_account_poll > 2.5 && !snap.account.checking {
                 self.ctrl.refresh_account(true);
@@ -1153,7 +1199,11 @@ impl App {
                                 .font(FontId::new(13.5, ff_bold()))
                                 .color(TEXT),
                         );
-                        ui.label(RichText::new("protondrive for linux").size(11.0).color(DIM));
+                        ui.label(
+                            RichText::new("Proton Drive sync for Linux")
+                                .size(11.0)
+                                .color(DIM),
+                        );
                     });
                 });
                 ui.add_space(16.0);
@@ -1426,12 +1476,15 @@ impl App {
                 current_op_line(snap),
             )
         } else if watching {
-            (
-                ACCENT,
-                Icon::Cloud,
-                "Auto sync on",
-                format!("Watching {} folder(s) for changes", self.auto_names().len()),
-            )
+            (ACCENT, Icon::Cloud, "Auto sync on", {
+                let tracked: usize = snap.pairs.iter().map(|p| p.tracked).sum();
+                let folders = plural(self.auto_names().len(), "folder");
+                if tracked > 0 {
+                    format!("Watching {folders} · {} tracked", plural(tracked, "file"))
+                } else {
+                    format!("Watching {folders} for changes")
+                }
+            })
         } else if snap.pairs.iter().any(|p| p.phase == Phase::Error) {
             (
                 DANGER,
@@ -1958,51 +2011,124 @@ impl App {
             } else {
                 (WARN, "Sign-in service unavailable")
             };
-            ui.horizontal(|ui| {
-                status_dot(ui, col, false);
-                ui.add_space(2.0);
-                ui.label(
-                    RichText::new(label)
-                        .font(FontId::new(16.0, ff_bold()))
-                        .color(TEXT),
-                );
-            });
-            ui.add_space(10.0);
-            ui.label(RichText::new("Proton account").color(DIM));
-            let name = if acc.account.is_empty() {
-                "—"
-            } else {
-                acc.account.as_str()
-            };
-            ui.label(RichText::new(name).size(13.0).color(TEXT));
-            if !acc.version.is_empty() {
-                ui.label(RichText::new(&acc.version).size(12.0).color(DIM));
-            }
-            ui.add_space(16.0);
             let checking = acc.checking;
-            ui.horizontal(|ui| {
-                if button(ui, None, "Sign out", Btn::Ghost, false, acc.signed_in).clicked() {
-                    self.confirm_logout = true;
-                }
-                if button(
-                    ui,
-                    Some(Icon::Sync),
-                    "Refresh",
-                    Btn::Ghost,
-                    false,
-                    !checking,
-                )
-                .clicked()
-                {
-                    self.last_account_poll = ui.ctx().input(|i| i.time);
-                    self.ctrl.refresh_account(false);
-                }
-                if checking {
-                    ui.add_space(4.0);
-                    ui.spinner();
-                    ui.label(RichText::new("Checking…").color(DIM));
-                }
+            let name = if acc.account.is_empty() {
+                "No Proton account".to_string()
+            } else {
+                acc.account.clone()
+            };
+            let mut sign_out = false;
+            let mut refresh = false;
+
+            // identity card: avatar, account, status, actions
+            ui.scope(|ui| {
+                ui.set_max_width((ui.available_width() - 15.0).max(200.0));
+                card_frame().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        let (ar, _) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::hover());
+                        let initial = acc
+                            .account
+                            .chars()
+                            .next()
+                            .map(|c| c.to_uppercase().to_string())
+                            .unwrap_or_default();
+                        let p = ui.painter();
+                        if acc.signed_in {
+                            p.circle_filled(ar.center(), 24.0, ACCENT);
+                            p.text(
+                                ar.center(),
+                                Align2::CENTER_CENTER,
+                                initial,
+                                FontId::new(20.0, ff_bold()),
+                                TEXT,
+                            );
+                        } else {
+                            p.circle_filled(ar.center(), 24.0, SEL);
+                            draw_icon(p, ar.shrink(13.0), Icon::User, DIM);
+                        }
+                        ui.add_space(12.0);
+                        ui.vertical(|ui| {
+                            ui.add_space(2.0);
+                            ui.label(
+                                RichText::new(&name)
+                                    .font(FontId::new(16.0, ff_bold()))
+                                    .color(if acc.signed_in { TEXT } else { DIM }),
+                            );
+                            ui.add_space(3.0);
+                            ui.horizontal(|ui| {
+                                status_dot_small(ui, col);
+                                ui.label(RichText::new(label).size(12.5).color(DIM));
+                                if checking {
+                                    ui.add_space(2.0);
+                                    ui.add(egui::Spinner::new().size(12.0).color(DIM));
+                                }
+                            });
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if acc.signed_in
+                                && button(ui, None, "Sign out", Btn::Secondary, true, true)
+                                    .clicked()
+                            {
+                                sign_out = true;
+                            }
+                            if button(ui, Some(Icon::Sync), "Refresh", Btn::Ghost, true, !checking)
+                                .clicked()
+                            {
+                                refresh = true;
+                            }
+                        });
+                    });
+
+                    if acc.signed_in || acc.keyring_locked {
+                        ui.add_space(14.0);
+                        ui.separator();
+                        ui.add_space(12.0);
+                        let (kcol, kicon, ktext) = if acc.keyring_locked {
+                            (
+                                WARN,
+                                Icon::Info,
+                                "Session saved in the system keyring, which is locked",
+                            )
+                        } else {
+                            (OK, Icon::Check, "Session saved in the system keyring")
+                        };
+                        ui.horizontal(|ui| {
+                            let (ir, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
+                            ui.painter().rect_filled(ir, 6.0, kcol.gamma_multiply(0.16));
+                            draw_icon(ui.painter(), ir.shrink(5.0), kicon, kcol);
+                            ui.add_space(8.0);
+                            ui.label(RichText::new(ktext).size(13.0).color(TEXT));
+                        });
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(
+                                "Your password went to Proton only. Signing out removes the \
+                                 session from this computer; your files stay in Proton Drive.",
+                            )
+                            .size(12.0)
+                            .color(DIM),
+                        );
+                        if !acc.version.is_empty() {
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Helper").size(12.0).color(DIM2));
+                                ui.add_space(6.0);
+                                ui.label(RichText::new(&acc.version).size(12.0).color(DIM));
+                            });
+                        }
+                    }
+                });
             });
+
+            if sign_out {
+                self.confirm_logout = true;
+            }
+            if refresh {
+                self.last_account_poll = ui.ctx().input(|i| i.time);
+                self.ctrl.refresh_account(false);
+            }
+
             if acc.keyring_locked {
                 ui.add_space(16.0);
                 ui.label(
@@ -2396,7 +2522,13 @@ impl App {
             let locked = snap.account.keyring_locked;
             let logo = self.logo_tex.clone();
             let col_w: f32 = 470.0;
-            let est_h = if locked { 320.0 } else if ready { 420.0 } else { 360.0 };
+            let est_h = if locked {
+                320.0
+            } else if ready {
+                420.0
+            } else {
+                360.0
+            };
             ui.add_space(((ui.available_height() - est_h) / 2.0).max(24.0));
             let side = ((ui.available_width() - col_w) / 2.0).max(0.0);
             ui.horizontal(|ui| {
@@ -2761,8 +2893,16 @@ impl App {
                 ui.add_space(14.0);
                 let label = if hv { "Retry sign-in" } else { "Sign in" };
                 let width = ui.available_width();
-                if button_width(ui, Some(Icon::User), label, Btn::Primary, false, !busy, Some(width))
-                    .clicked()
+                if button_width(
+                    ui,
+                    Some(Icon::User),
+                    label,
+                    Btn::Primary,
+                    false,
+                    !busy,
+                    Some(width),
+                )
+                .clicked()
                     || (enter && !busy)
                 {
                     submit = true;
@@ -3352,7 +3492,7 @@ fn activity_row(ui: &mut egui::Ui, op: &ActivityOp, ts: i64, line: &str) -> Opti
 
 fn pair_status(ui: &mut egui::Ui, ps: Option<&PairState>, watching: bool) {
     let first_run = ps.map_or(false, |p| p.last_synced.is_none());
-    let (col, text) = match ps.map(|p| p.phase) {
+    let (col, mut text) = match ps.map(|p| p.phase) {
         Some(Phase::Scanning) => (
             ACCENT,
             if first_run {
@@ -3364,12 +3504,17 @@ fn pair_status(ui: &mut egui::Ui, ps: Option<&PairState>, watching: bool) {
         ),
         Some(Phase::Syncing) => (
             ACCENT,
-            if first_run {
-                "Initializing…"
-            } else {
-                "Syncing…"
-            }
-            .to_string(),
+            match ps.map(|p| p.progress) {
+                Some(pr) if pr.total > 0 && !first_run => {
+                    format!(
+                        "Syncing · {} of {}",
+                        thousands(pr.done),
+                        thousands(pr.total)
+                    )
+                }
+                _ if first_run => "Initializing…".to_string(),
+                _ => "Syncing…".to_string(),
+            },
         ),
         Some(Phase::Error) => (
             DANGER,
@@ -3387,6 +3532,12 @@ fn pair_status(ui: &mut egui::Ui, ps: Option<&PairState>, watching: bool) {
             }
         }
     };
+    // how much this folder holds, once a sync has counted it
+    if let Some(n) = ps.map(|p| p.tracked).filter(|n| *n > 0) {
+        if !matches!(ps.map(|p| p.phase), Some(Phase::Error)) {
+            text.push_str(&format!(" · {}", plural(n, "file")));
+        }
+    }
     ui.horizontal(|ui| {
         status_dot_small(ui, col);
         ui.label(RichText::new(text).size(12.0).color(DIM));
@@ -3926,6 +4077,416 @@ fn run_daemon() {
     ctrl.stop_watch();
 }
 
+// ============================================================================
+// --screenshots: scripted scenes with made-up data, one PNG each
+// ============================================================================
+
+/// One documentation capture: which page, with which state.
+struct Scene {
+    file: &'static str,
+    nav: Nav,
+    state: fn() -> AppState,
+}
+
+struct Demo {
+    dir: PathBuf,
+    scenes: Vec<Scene>,
+    index: usize,
+    /// Wall-clock time the current scene was switched in; captures wait for
+    /// the page fade and nav indicator to finish before asking for pixels.
+    since: Option<f64>,
+    requested: bool,
+    /// Keeps the scratch state dir alive for the run.
+    _scratch: tempfile::TempDir,
+}
+
+const DEMO_HOME: &str = "/home/alex";
+
+fn demo_pairs() -> Vec<Pair> {
+    let pair = |name: &str, local: &str| Pair {
+        name: name.into(),
+        local: PathBuf::from(format!("{DEMO_HOME}/{local}")),
+        remote: format!("/my-files/{name}"),
+        auto: true,
+        exclude: Vec::new(),
+    };
+    let mut docs = pair("Documents", "Documents");
+    docs.exclude = vec!["Archive/2019".into(), "Scans/raw".into()];
+    let mut photos = pair("Photos", "Pictures");
+    photos.auto = true;
+    let mut work = pair("Work", "Work");
+    work.auto = false;
+    vec![docs, photos, work]
+}
+
+fn demo_pair_state(
+    pair: &Pair,
+    phase: Phase,
+    last_synced: Option<i64>,
+    tracked: usize,
+) -> PairState {
+    PairState {
+        name: pair.name.clone(),
+        local: pair.local.display().to_string(),
+        remote: pair.remote.clone(),
+        phase,
+        progress: neutronsync::service::Progress::default(),
+        scanned_folders: 0,
+        current_op: None,
+        last_error: None,
+        last_synced,
+        tracked,
+    }
+}
+
+fn demo_op(
+    ts: i64,
+    action: &str,
+    pair: &str,
+    path: &str,
+    error: Option<&str>,
+) -> neutronsync::service::ActivityItem {
+    let op = ActivityOp {
+        action: action.into(),
+        path: path.into(),
+        pair: pair.into(),
+        ok: error.is_none(),
+        error: error.map(String::from),
+    };
+    neutronsync::service::ActivityItem {
+        ts,
+        kind: if op.ok {
+            ActivityKind::Sync
+        } else {
+            ActivityKind::Error
+        },
+        text: format!("{action} {path}"),
+        op: Some(op),
+    }
+}
+
+/// Signed in, three folders, a recent history of file movements.
+fn demo_state_synced() -> AppState {
+    let now = now_secs();
+    let pairs = demo_pairs();
+    let mut s = AppState {
+        pairs: vec![
+            demo_pair_state(&pairs[0], Phase::Synced, Some(now - 95), 1_284),
+            demo_pair_state(&pairs[1], Phase::Synced, Some(now - 1_900), 6_410),
+            demo_pair_state(&pairs[2], Phase::Synced, Some(now - 4 * 3600), 312),
+        ],
+        account: neutronsync::service::AccountState {
+            checked: true,
+            backend_ready: true,
+            signed_in: true,
+            keyring_locked: false,
+            account: "alex@proton.me".into(),
+            version: "/usr/bin/neutronsync-drive".into(),
+            checking: false,
+        },
+        watching: true,
+        ..Default::default()
+    };
+    let history: &[(i64, &str, &str, &str, Option<&str>)] = &[
+        (
+            95,
+            "upload",
+            "Documents",
+            "Finance/2026/Invoices/2026-10 Studio rent.pdf",
+            None,
+        ),
+        (
+            140,
+            "download",
+            "Documents",
+            "Reading/Papers/Attention is all you need.pdf",
+            None,
+        ),
+        (
+            310,
+            "mkdir-remote",
+            "Documents",
+            "Finance/2026/Receipts",
+            None,
+        ),
+        (
+            330,
+            "upload",
+            "Documents",
+            "Finance/2026/Receipts/IMG_2210.jpg",
+            None,
+        ),
+        (
+            1_900,
+            "download",
+            "Photos",
+            "2026-09 Cape Town/DSC04471.ARW",
+            None,
+        ),
+        (
+            1_930,
+            "download",
+            "Photos",
+            "2026-09 Cape Town/DSC04472.ARW",
+            None,
+        ),
+        (
+            2_100,
+            "upload",
+            "Photos",
+            "2026-10 Garden/IMG_0412.HEIC",
+            Some("api backend: rate_limited"),
+        ),
+        (
+            2_600,
+            "delete-remote",
+            "Photos",
+            "2026-09 Cape Town/duplicates/DSC04471 (1).ARW",
+            None,
+        ),
+        (
+            4 * 3600,
+            "upload",
+            "Work",
+            "Proposals/Nkosi Architects/Proposal v3.docx",
+            None,
+        ),
+        (
+            4 * 3600 + 20,
+            "rename-remote",
+            "Work",
+            "Proposals/Nkosi Architects/Proposal v3.docx",
+            None,
+        ),
+        (
+            6 * 3600,
+            "download",
+            "Work",
+            "Clients/Shared/Brand guide 2026.pdf",
+            None,
+        ),
+        (
+            26 * 3600,
+            "upload",
+            "Documents",
+            "Personal/Insurance/Policy schedule 2026.pdf",
+            None,
+        ),
+        (
+            27 * 3600,
+            "upload",
+            "Documents",
+            "Personal/Insurance/Claim form.pdf",
+            None,
+        ),
+    ];
+    for (ago, action, pair, path, err) in history.iter().rev() {
+        s.activity
+            .push_back(demo_op(now - ago, action, pair, path, *err));
+    }
+    s
+}
+
+/// Same account, but a sync is running on the Photos folder.
+fn demo_state_syncing() -> AppState {
+    let mut s = demo_state_synced();
+    s.busy = true;
+    s.pairs[1].phase = Phase::Syncing;
+    s.pairs[1].progress = neutronsync::service::Progress {
+        done: 37,
+        total: 120,
+    };
+    s.pairs[1].current_op = Some("upload 2026-10 Garden/IMG_0413.HEIC".into());
+    s.active = vec![
+        ActivityOp {
+            action: "upload".into(),
+            path: "2026-10 Garden/IMG_0413.HEIC".into(),
+            pair: "Photos".into(),
+            ok: true,
+            error: None,
+        },
+        ActivityOp {
+            action: "upload".into(),
+            path: "2026-10 Garden/IMG_0414.HEIC".into(),
+            pair: "Photos".into(),
+            ok: true,
+            error: None,
+        },
+        ActivityOp {
+            action: "download".into(),
+            path: "Finance/2026/Statements/October.pdf".into(),
+            pair: "Documents".into(),
+            ok: true,
+            error: None,
+        },
+    ];
+    s
+}
+
+/// The sidecar answered, but there is no session: the sign-in page shows.
+fn demo_state_signed_out() -> AppState {
+    let mut s = demo_state_synced();
+    s.account.signed_in = false;
+    s.account.account.clear();
+    s.watching = false;
+    s.signed_out = true;
+    s
+}
+
+/// The keyring is locked; the session is still in it.
+fn demo_state_keyring_locked() -> AppState {
+    let mut s = demo_state_signed_out();
+    s.signed_out = false;
+    s.account.keyring_locked = true;
+    s
+}
+
+fn demo_scenes() -> Vec<Scene> {
+    vec![
+        Scene {
+            file: "activity-syncing.png",
+            nav: Nav::Activity,
+            state: demo_state_syncing,
+        },
+        Scene {
+            file: "activity.png",
+            nav: Nav::Activity,
+            state: demo_state_synced,
+        },
+        Scene {
+            file: "folders.png",
+            nav: Nav::Folders,
+            state: demo_state_syncing,
+        },
+        Scene {
+            file: "settings.png",
+            nav: Nav::Settings,
+            state: demo_state_synced,
+        },
+        Scene {
+            file: "account.png",
+            nav: Nav::Account,
+            state: demo_state_synced,
+        },
+        Scene {
+            file: "sign-in.png",
+            nav: Nav::Activity,
+            state: demo_state_signed_out,
+        },
+        Scene {
+            file: "keyring-locked.png",
+            nav: Nav::Activity,
+            state: demo_state_keyring_locked,
+        },
+    ]
+}
+
+impl App {
+    /// A window wired to scripted data instead of the user's config. Writes
+    /// nothing under $HOME: config and state live in a scratch directory.
+    fn new_demo(cc: &eframe::CreationContext<'_>, dir: PathBuf) -> Self {
+        install_theme(&cc.egui_ctx);
+        cc.egui_ctx.set_zoom_factor(2.0);
+        let scratch = tempfile::tempdir().expect("scratch dir for --screenshots");
+        let config_path = scratch.path().join("neutronsync.toml");
+        let mut cfg = starter_config(&config_path);
+        cfg.state_dir = scratch.path().join("state");
+        // Never reach the user's running sidecar from a documentation run.
+        cfg.sidecar = Some(scratch.path().join("no-sidecar"));
+        cfg.pairs = demo_pairs();
+        cfg.auto_sync = true;
+        let ctrl = Controller::new(cfg.clone());
+        let _ = std::fs::create_dir_all(&dir);
+        App {
+            ctrl,
+            cfg,
+            config_path,
+            config_loaded: true,
+            nav: Nav::Activity,
+            nav_t: 1.0,
+            dirty: false,
+            toast: None,
+            update: std::sync::Arc::new(std::sync::Mutex::new(UpdateState::Idle)),
+            confirm_logout: false,
+            confirm_reset: false,
+            login_poll_until: None,
+            last_account_poll: 0.0,
+            api_signin: ApiSignIn::default(),
+            browser_open: false,
+            browser_path: String::new(),
+            browser_entries: Vec::new(),
+            browser_loading: false,
+            browser_error: None,
+            browser_rx: None,
+            logo_tex: None,
+            excl_open: None,
+            excl_entries: Vec::new(),
+            excl_loading: false,
+            excl_error: None,
+            excl_rx: None,
+            excl_newly: Vec::new(),
+            confirm_remove_local: None,
+            mode_daemon: false,
+            _win_lock: None,
+            demo: Some(Demo {
+                dir,
+                scenes: demo_scenes(),
+                index: 0,
+                since: None,
+                requested: false,
+                _scratch: scratch,
+            }),
+        }
+    }
+
+    /// Advance the scripted run by one frame. Returns the state to render, or
+    /// None when this is not a `--screenshots` run.
+    fn demo_frame(&mut self, ctx: &egui::Context) -> Option<AppState> {
+        let demo = self.demo.as_mut()?;
+        // A capture from the previous frame lands as an input event.
+        let shot = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        if let Some(image) = shot {
+            if let Some(scene) = demo.scenes.get(demo.index) {
+                let [w, h] = image.size;
+                let path = demo.dir.join(scene.file);
+                let saved =
+                    ::image::RgbaImage::from_raw(w as u32, h as u32, image.as_raw().to_vec())
+                        .ok_or_else(|| "pixel buffer size mismatch".to_string())
+                        .and_then(|img| img.save(&path).map_err(|e| e.to_string()));
+                match saved {
+                    Ok(()) => eprintln!("wrote {}", path.display()),
+                    Err(e) => eprintln!("could not write {}: {e}", path.display()),
+                }
+            }
+            demo.index += 1;
+            demo.since = None;
+            demo.requested = false;
+        }
+        let Some(scene) = demo.scenes.get(demo.index) else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return Some(AppState::default());
+        };
+        let now = ctx.input(|i| i.time);
+        let nav = scene.nav;
+        let state = (scene.state)();
+        if demo.since.is_none() {
+            demo.since = Some(now);
+            self.nav = nav;
+            self.nav_t = 1.0;
+        } else if !demo.requested && now - demo.since.unwrap_or(now) > 0.9 {
+            demo.requested = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        Some(state)
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
@@ -3933,6 +4494,30 @@ fn main() -> eframe::Result<()> {
     if args.iter().any(|a| a == "--tray") {
         run_daemon();
         return Ok(());
+    }
+
+    // Documentation captures: `neutronsync-gui --screenshots docs/screenshots`.
+    if let Some(pos) = args.iter().position(|a| a == "--screenshots") {
+        let dir = PathBuf::from(
+            args.get(pos + 1)
+                .cloned()
+                .unwrap_or_else(|| "screenshots".into()),
+        );
+        // Twice the logical size, rendered at zoom 2.0, for crisp images.
+        let viewport = egui::ViewportBuilder::default()
+            .with_inner_size([2360.0, 1480.0])
+            .with_decorations(false)
+            .with_title("NeutronSync for Linux")
+            .with_app_id("neutronsync-screenshots");
+        let options = eframe::NativeOptions {
+            viewport,
+            ..Default::default()
+        };
+        return eframe::run_native(
+            "neutronsync-screenshots",
+            options,
+            Box::new(move |cc| Ok(Box::new(App::new_demo(cc, dir)))),
+        );
     }
 
     // Force the X11 (XWayland) backend if the user prefers it.

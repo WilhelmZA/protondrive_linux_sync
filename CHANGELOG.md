@@ -4,9 +4,20 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+- Screenshots of every page in the README and `docs/screenshots.md`, generated from example data by `neutronsync-gui --screenshots <dir>` (wrapped by `scripts/screenshots.sh`, which runs in a private X server and touches none of your files).
+
+### Changed
+- The Account page is an identity card: avatar, account, status, where the session is kept and which helper is in use, with Refresh and Sign out beside it.
+- Folder cards show the file count and, while syncing, "37 of 120"; the Activity banner reports how many files are tracked.
+- Switches have a visible track when off, a lifted knob and a hover state; the progress meter uses the same track colour.
+- Disabled filled buttons go muted with a legible label instead of fading into the accent colour.
+- Sidebar tagline reads "Proton Drive sync for Linux".
+
 ### Fixed
 - The sign-in button spans the form with its label centred, instead of sitting on the left edge of the card.
 - A locked system keyring is not a Proton sign-out. The app waits for the unlock and does not show the login form or delete the saved session. A failed sign-in attempt and a refresh that only hit a network error no longer delete that session either.
+- Relative times say "1 minute ago" for anything under two minutes, and counts read "2 folders" rather than "2 folder(s)".
 
 ## [0.4.1] - 2026-10-07
 
