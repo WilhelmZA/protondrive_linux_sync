@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-07
+
 ### Added
 - Screenshots of every page in the README and `docs/screenshots.md`, generated from example data by `neutronsync-gui --screenshots <dir>` (wrapped by `scripts/screenshots.sh`, which runs in a private X server and touches none of your files).
 
