@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-07
+
 ### Fixed
 - The GUI remote folder browser and "Folders to sync" picker list through the configured backend, so both work on an API-only install with no `proton-drive` binary.
 
