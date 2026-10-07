@@ -17,7 +17,7 @@ describe('authentication over fake HTTP', () => {
   test('login persists only an unlocked session and sends the exact app header', async () => {
     const h = harness();
     expect(await h.auth.login('normal', 'password-secret')).toEqual({ ok: true });
-    expect(h.auth.status()).toEqual({ signed_in: true, account: 'normal' });
+    expect(h.auth.status()).toEqual({ signed_in: true, account: 'normal', keyring_locked: false });
     expect(h.store.value?.keyPassphrase).toBe('salted-password-secret');
     expect(h.backend.requests.every(r => r.version === 'external-drive-neutronsync@0.1.0-dev')).toBe(true);
     const restored = new Auth(h.store, fakeCrypto, () => {}, h.log, h.backend.fetch);
@@ -132,7 +132,7 @@ describe('authentication over fake HTTP', () => {
     h.auth.session = null;
     expect(h.auth.status().signed_in).toBe(false);
     await h.auth.rehydrate();
-    expect(h.auth.status()).toEqual({ signed_in: true, account: 'normal' });
+    expect(h.auth.status()).toEqual({ signed_in: true, account: 'normal', keyring_locked: false });
     await expect(h.auth.login('normal', 'bad-password')).rejects.toMatchObject({ code: 'auth' });
     expect(h.store.value).toEqual(saved);
     h.auth.session = null;

@@ -60,6 +60,7 @@ fn probe_auth(cfg: &Config) -> AuthProbe {
     if cfg.backend == crate::config::Backend::Api {
         return match crate::driveapi::DriveApi::new(cfg).and_then(|api| api.status()) {
             Ok(status) if status["signed_in"] == true => AuthProbe::SignedIn,
+            Ok(status) if status["keyring_locked"] == true => AuthProbe::Unknown,
             Ok(_) => AuthProbe::SignedOut,
             Err(_) => AuthProbe::Unknown,
         };

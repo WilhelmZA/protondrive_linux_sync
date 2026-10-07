@@ -19,7 +19,7 @@ try {
   const [stdout, stderr, status] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
   assert.equal(status, 0, stderr);
   const messages = stdout.trim().split('\n').map(line => JSON.parse(line));
-  assert.deepEqual(messages.find(m => m.id === 1)?.result, { signed_in: false, account: null });
+  assert.deepEqual(messages.find(m => m.id === 1)?.result, { signed_in: false, account: null, keyring_locked: false });
   assert.deepEqual(await readdir(cwd), []);
   assert.deepEqual(await readdir(join(root, 'dist')), ['neutronsync-drive']);
   process.stdout.write('Standalone passed: SDK WASM validated; node_modules moved aside; empty working directory; PATH empty.\n');

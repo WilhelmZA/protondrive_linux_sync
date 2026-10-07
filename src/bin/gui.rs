@@ -1023,7 +1023,9 @@ impl eframe::App for App {
                         // daemon's possibly stale signed_out flag (up to 20s lag
                         // without a refresh signal).
                         if mine.account.checked {
-                            pubd.signed_out = mine.account.backend_ready && !mine.account.signed_in;
+                            pubd.signed_out = mine.account.backend_ready
+                                && !mine.account.signed_in
+                                && !mine.account.keyring_locked;
                         }
                         pubd
                     }
@@ -1949,6 +1951,8 @@ impl App {
                 (DIM, "Checking…")
             } else if acc.signed_in {
                 (OK, "Signed in")
+            } else if acc.keyring_locked {
+                (WARN, "Keyring locked")
             } else if acc.backend_ready {
                 (DANGER, "Not signed in")
             } else {
@@ -1999,7 +2003,17 @@ impl App {
                     ui.label(RichText::new("Checking…").color(DIM));
                 }
             });
-            if acc.backend_ready && !acc.signed_in {
+            if acc.keyring_locked {
+                ui.add_space(16.0);
+                ui.label(
+                    RichText::new(
+                        "Your Proton session is still saved. Unlock the system keyring and \
+                         NeutronSync will continue on its own.",
+                    )
+                    .size(12.5)
+                    .color(DIM),
+                );
+            } else if acc.backend_ready && !acc.signed_in {
                 ui.add_space(20.0);
                 self.api_signin_form(ui);
             }
@@ -2379,9 +2393,10 @@ impl App {
     fn page_signin(&mut self, ui: &mut egui::Ui, snap: &AppState) {
         if self.cfg.backend == neutronsync::config::Backend::Api {
             let ready = snap.account.backend_ready;
+            let locked = snap.account.keyring_locked;
             let logo = self.logo_tex.clone();
             let col_w: f32 = 470.0;
-            let est_h = if ready { 420.0 } else { 360.0 };
+            let est_h = if locked { 320.0 } else if ready { 420.0 } else { 360.0 };
             ui.add_space(((ui.available_height() - est_h) / 2.0).max(24.0));
             let side = ((ui.available_width() - col_w) / 2.0).max(0.0);
             ui.horizontal(|ui| {
@@ -2392,7 +2407,9 @@ impl App {
                         let (lr, _) = ui.allocate_exact_size(vec2(72.0, 72.0), Sense::hover());
                         draw_logo(ui.painter(), lr, logo.as_ref());
                         ui.add_space(20.0);
-                        let title = if ready {
+                        let title = if locked {
+                            "Unlock your keyring"
+                        } else if ready {
                             "Sign in to Proton Drive"
                         } else {
                             "Sign-in service didn't start"
@@ -2403,7 +2420,18 @@ impl App {
                                 .color(TEXT),
                         );
                         ui.add_space(10.0);
-                        if ready {
+                        if locked {
+                            ui.label(
+                                RichText::new(
+                                    "Your Proton session is already saved. The system keyring \
+                                     is locked, so NeutronSync can't read it yet. Unlock the \
+                                     keyring and this screen goes away. You don't need to \
+                                     sign in to Proton again.",
+                                )
+                                .size(13.5)
+                                .color(TEXT),
+                            );
+                        } else if ready {
                             ui.label(
                                 RichText::new(
                                     "Your password goes only to Proton; NeutronSync keeps the \
@@ -2414,7 +2442,14 @@ impl App {
                             );
                         }
                     });
-                    if ready {
+                    if locked {
+                        ui.add_space(22.0);
+                        ui.vertical_centered(|ui| {
+                            ui.spinner();
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("Waiting for the keyring…").color(DIM));
+                        });
+                    } else if ready {
                         ui.add_space(20.0);
                         self.api_signin_form(ui);
                     } else {

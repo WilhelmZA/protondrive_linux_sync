@@ -80,12 +80,12 @@ else: sys.exit(2)
         deadline = setTimeout(() => child.kill('SIGKILL'), 5000);
         if (transport === 'socket') {
           for (let i = 0; i < 100 && !existsSync(path); i++) await Bun.sleep(20);
-          expect(await socketStatus(path)).toEqual({ signed_in: true, account: 'migration-test' });
+          expect(await socketStatus(path)).toEqual({ signed_in: true, account: 'migration-test', keyring_locked: false });
         } else {
           const output = await new Response(child.stdout).text();
           expect(await child.exited).toBe(0);
           const status = output.trim().split('\n').map(line => JSON.parse(line)).find(value => value.id === 1);
-          expect(status.result).toEqual({ signed_in: true, account: 'migration-test' });
+          expect(status.result).toEqual({ signed_in: true, account: 'migration-test', keyring_locked: false });
           expect(output).not.toContain('auth.signed_out');
         }
         expect(existsSync(join(directory, 'old-cleared'))).toBe(true);

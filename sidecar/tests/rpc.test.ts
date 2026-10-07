@@ -38,7 +38,7 @@ test('compiled binary implements the complete RPC contract against fake HTTP', a
   });
   try {
     expect((await call('', {}, true)).error).toMatchObject({ code: -32700, data: { code: 'fatal' } });
-    expect((await call('auth.status')).result).toEqual({ signed_in: false, account: null });
+    expect((await call('auth.status')).result).toEqual({ signed_in: false, account: null, keyring_locked: false });
     expect((await call('auth.login', { username: 'totp-two-password', password: 'password-secret' })).result).toEqual({ need_2fa: true });
     expect((await call('auth.submit_2fa', { code: '123456' })).result).toEqual({ need_mailbox_password: true });
     expect((await call('auth.submit_mailbox_password', { password: 'mailbox-secret' })).result).toEqual({ ok: true });

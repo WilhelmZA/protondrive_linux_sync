@@ -13,6 +13,13 @@ export interface SessionStore {
   load(): Promise<Session | null>;
   save(session: Session): Promise<void>;
   clear(): Promise<void>;
+  /** True when the Secret Service collection is locked. Absent on test stores. */
+  isLocked?(): Promise<boolean>;
+}
+
+/** The keyring is locked. This is not "no session" and must not be treated as a sign-out. */
+export class KeyringLocked extends Error {
+  readonly code = 'keyring_locked';
 }
 
 export const keyringAttributes = ['application', 'neutronsync-drive', 'purpose', 'session-v1'];
@@ -20,8 +27,38 @@ export const keyringLabel = 'NeutronSync Drive session';
 // Compatibility identifier only; never use it for a new session.
 export const legacyAttributes = legacySession.attributes;
 
-class InvalidStoredSession extends Fault {
+export class InvalidStoredSession extends Fault {
   constructor() { super('fatal'); }
+}
+
+const lockPaths = ['/org/freedesktop/secrets/aliases/default', '/org/freedesktop/secrets/collection/login'];
+
+/** `dbus-send` prints `variant boolean true|false`; `busctl` prints `b true|false`. */
+export function parseLockedReply(output: string): boolean | null {
+  const match = output.match(/(?:boolean|\bb)\s+(true|false)\b/i);
+  if (!match?.[1]) return null;
+  return match[1].toLowerCase() === 'true';
+}
+
+// A property read does not prompt. `secret-tool lookup` does, and a locked
+// collection often makes that lookup look like "no item", which is how a
+// locked keyring was mistaken for a sign-out.
+async function collectionIsLocked(): Promise<boolean> {
+  for (const path of lockPaths) {
+    try {
+      const child = Bun.spawn([
+        'dbus-send', '--session', '--print-reply', '--reply-timeout=3000',
+        '--dest=org.freedesktop.secrets', path,
+        'org.freedesktop.DBus.Properties.Get',
+        'string:org.freedesktop.Secret.Collection', 'string:Locked',
+      ], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
+      const [output, status] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+      if (status !== 0) continue;
+      const locked = parseLockedReply(output);
+      if (locked !== null) return locked;
+    } catch { continue; }
+  }
+  return false;
 }
 
 export function parseSession(output: string): Session {
@@ -70,7 +107,9 @@ export class SecretServiceStore implements SessionStore {
       return { output, status, hasDiagnostic: diagnostic.trim().length > 0 };
     } catch { throw new Fault('fatal'); }
   }
+  async isLocked() { return collectionIsLocked(); }
   async load(): Promise<Session | null> {
+    if (await this.isLocked()) throw new KeyringLocked();
     if (this.migrate) return migrateSession(new SecretServiceStore(this.attributes, this.label, false), new SecretServiceStore(legacyAttributes, this.label, false));
     const { output, status, hasDiagnostic } = await this.run(['lookup', ...this.attributes]);
     if (status === 1 && !output && !hasDiagnostic) return null;

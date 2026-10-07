@@ -780,7 +780,11 @@ impl RemoteChangeFeed for DriveApi {
         Ok(path)
     }
     fn signed_in(&self) -> Result<bool> {
-        Ok(self.status()?["signed_in"].as_bool().unwrap_or(false))
+        let status = self.status()?;
+        if status["keyring_locked"] == true {
+            bail!(RpcError::new("keyring_locked"));
+        }
+        Ok(status["signed_in"] == true)
     }
 }
 

@@ -45,6 +45,7 @@ struct AccountState {
     checked: bool,
     backend_ready: bool,   // API: sidecar answered; CLI: binary found on PATH
     signed_in: bool,
+    keyring_locked: bool,  // system keyring locked; not a sign-out, no login form
     account: String,       // Proton account name from the API probe (empty on CLI)
     version: String,       // sidecar path/identity (API) or binary version/path (CLI);
                            // on probe failure, the error text for the sign-in page

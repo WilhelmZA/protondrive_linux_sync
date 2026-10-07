@@ -146,6 +146,7 @@ pub(super) fn watch(
     let mut scope = String::new();
     let mut connected = false;
     let mut signed_out = false;
+    let mut keyring_locked = false;
     let mut probe_at = 0;
     let mut next_full = now_epoch() + cfg.full_walk_interval as i64;
     let mut batches = VecDeque::<EventBatch>::new();
@@ -163,11 +164,31 @@ pub(super) fn watch(
             }
             probe_at = now_epoch() + AUTH_REPROBE_SECS;
             match feed.signed_in() {
-                Ok(true) => {}
+                Ok(true) => {
+                    if keyring_locked {
+                        log.info("watch: keyring unlocked — resuming");
+                        keyring_locked = false;
+                    }
+                }
                 Ok(false) => {
+                    keyring_locked = false;
                     if !signed_out {
                         note_auth(events, log, false);
                         signed_out = true;
+                    }
+                    continue;
+                }
+                Err(e)
+                    if e.downcast_ref::<crate::driveapi::RpcError>()
+                        .is_some_and(|e| e.code == "keyring_locked") =>
+                {
+                    // Not a sign-out. The session is still in the keyring; sync
+                    // waits until the user unlocks it. Don't ask them to log in.
+                    if !keyring_locked {
+                        log.info(
+                            "watch: system keyring is locked — sync resumes when you unlock it",
+                        );
+                        keyring_locked = true;
                     }
                     continue;
                 }

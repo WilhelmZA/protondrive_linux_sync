@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { migrateSession, parseSession, type SessionStore } from '../src/store';
+import { KeyringLocked, migrateSession, parseLockedReply, parseSession, type SessionStore } from '../src/store';
 import { MemoryStore, fakeCrypto } from './binary-backend';
 import { Auth } from '../src/auth';
 import { Fault } from '../src/errors';
@@ -69,12 +69,45 @@ test('Auth initialization fails instead of reporting signed out, then retries mi
       broken = false;
       if (restart) auth = create();
       await auth.init();
-      expect(auth.status()).toEqual({ signed_in: true, account: 'test' });
+      expect(auth.status()).toEqual({ signed_in: true, account: 'test', keyring_locked: false });
       expect(await current.load()).toEqual(session);
       expect(await old.load()).toBeNull();
       expect(notices).toEqual([]);
     }
   }
+});
+
+test('a locked keyring is reported as locked and is not read until it unlocks', async () => {
+  const backing = new MemoryStore();
+  await backing.save(session);
+  let locked = true;
+  let loads = 0;
+  const store: SessionStore = {
+    async load() {
+      loads++;
+      if (locked) throw new KeyringLocked();
+      return backing.load();
+    },
+    async save(value) { await backing.save(value); },
+    async clear() { await backing.clear(); },
+  };
+  const auth = new Auth(store, fakeCrypto, () => {}, new SafeLog(() => {}));
+  await auth.init();
+  expect(auth.status()).toEqual({ signed_in: false, account: null, keyring_locked: true });
+  expect(loads).toBe(1);
+  await auth.rehydrate();
+  expect(loads).toBe(2);
+  expect(auth.status().keyring_locked).toBe(true);
+  expect(await backing.load()).toEqual(session);
+  locked = false;
+  await auth.rehydrate();
+  expect(auth.status()).toEqual({ signed_in: true, account: 'test', keyring_locked: false });
+});
+
+test('dbus lock replies parse without treating other text as a lock', () => {
+  expect(parseLockedReply('variant       boolean true')).toBe(true);
+  expect(parseLockedReply('b false')).toBe(false);
+  expect(parseLockedReply('Error org.freedesktop.DBus.Error.ServiceUnknown')).toBeNull();
 });
 
 test('storage read failure does not overwrite a potentially newer target or clear legacy persistence', async () => {

@@ -3,7 +3,7 @@ import { getSrp, computeKeyPassword } from '@protontech/crypto/srp';
 import { version } from '../package.json';
 import { Fault, httpFault } from './errors';
 import type { Notify, SafeLog } from './log';
-import type { Session, SessionStore } from './store';
+import { InvalidStoredSession, KeyringLocked, type Session, type SessionStore } from './store';
 
 // Opt-in diagnostics: path, HTTP status and numeric API code only. Never message text or bodies.
 const apiDebug = process.env.NEUTRONSYNC_DRIVE_DEBUG === '1';
@@ -34,6 +34,7 @@ export class Auth {
   private generation = 0;
   private initialized = false;
   private initializationFailed = false;
+  private keyringLocked = false;
   private retryAt = 0;
   onClear: () => void = () => {};
 
@@ -50,9 +51,17 @@ export class Auth {
     if (this.initialized) return;
     try {
       this.session = await this.store.load();
+      this.keyringLocked = false;
       this.initialized = true;
       this.initializationFailed = false;
-    } catch {
+    } catch (error) {
+      if (error instanceof KeyringLocked) {
+        // Stay up and keep asking. The session is still in the keyring.
+        this.keyringLocked = true;
+        this.initialized = true;
+        this.initializationFailed = false;
+        return;
+      }
       // main awaits init before opening either transport. Storage failure must
       // stop startup, not expose a false signed-out account or clear persistence.
       this.initializationFailed = true;
@@ -266,23 +275,37 @@ export class Auth {
   }
   status() {
     if (this.initializationFailed) throw new Fault('fatal');
-    return { signed_in: !!this.session?.keyPassphrase && !this.pending, account: this.session?.keyPassphrase && !this.pending ? this.session.account : null };
+    const signed_in = !!this.session?.keyPassphrase && !this.pending;
+    return {
+      signed_in,
+      account: signed_in ? this.session!.account : null,
+      keyring_locked: !signed_in && !this.pending && this.keyringLocked,
+    };
   }
   /**
-   * Startup reads the keyring once. If that read happens before the keyring is
-   * unlocked, or otherwise misses a session that is sitting in the store, the
-   * process used to stay signed out forever. Load again when memory is empty.
-   * A login in progress (`pending`) and a live session are left alone, so a
-   * newer in-memory token is never replaced by a stale keyring copy.
+   * Read the keyring again when memory has no session. A locked collection is
+   * reported as `keyring_locked` and is not a sign-out: the login form stays
+   * hidden until a read succeeds and finds nothing. A live session and a login
+   * in progress are left alone, so a newer in-memory token is never replaced
+   * by a stale keyring copy.
    */
   async rehydrate() {
-    if (this.initializationFailed || this.session || this.pending) return;
+    if (this.initializationFailed || this.session || this.pending) {
+      this.keyringLocked = false;
+      return;
+    }
     try {
       const loaded = await this.store.load();
       if (this.session || this.pending) return;
+      this.keyringLocked = false;
       if (loaded?.keyPassphrase) this.session = loaded;
-    } catch {
-      // Locked or unreadable storage is not a sign-out. The next status tries again.
+    } catch (error) {
+      if (error instanceof InvalidStoredSession) {
+        this.keyringLocked = false;
+        return;
+      }
+      this.keyringLocked = true;
+      if (!(error instanceof KeyringLocked)) this.log.write('warn', 'Session storage unavailable');
     }
   }
   requireSession(): Session {

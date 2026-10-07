@@ -88,6 +88,10 @@ pub struct AccountState {
     /// On the API backend: the sidecar answered. On the CLI backend: a binary was found on PATH.
     pub backend_ready: bool,
     pub signed_in: bool,
+    /// The system keyring is locked (or couldn't be read). The Proton session
+    /// may still be in it. This is not a sign-out: don't show the login form.
+    #[serde(default)]
+    pub keyring_locked: bool,
     /// Proton account name from the API probe. Empty on the CLI backend.
     #[serde(default)]
     pub account: String,
@@ -631,28 +635,31 @@ impl Controller {
         thread::spawn(move || {
             if cfg.backend == crate::config::Backend::Api {
                 let result = crate::driveapi::DriveApi::new(&cfg).and_then(|api| api.status());
-                let (usable, signed_in, account, version) = match result {
+                let (usable, signed_in, keyring_locked, account, version) = match result {
                     Ok(status) => (
                         true,
                         status["signed_in"] == true,
+                        status["keyring_locked"] == true,
                         status["account"].as_str().unwrap_or("").to_string(),
                         crate::driveapi::resolve_sidecar(&cfg)
                             .map(|p| p.display().to_string())
                             .unwrap_or_else(|| "neutronsync-drive".into()),
                     ),
-                    Err(error) => (false, false, String::new(), error.to_string()),
+                    Err(error) => (false, false, false, String::new(), error.to_string()),
                 };
                 let mut s = state.lock().unwrap();
                 s.account = AccountState {
                     checked: true,
                     backend_ready: usable,
                     signed_in,
+                    keyring_locked,
                     account,
                     version,
                     checking: false,
                 };
                 if usable {
-                    s.signed_out = !signed_in;
+                    // A locked keyring is not a sign-out. Sync waits; the session stays put.
+                    s.signed_out = !signed_in && !keyring_locked;
                 }
                 drop(s);
                 if signal_watch && signed_in {
@@ -667,6 +674,7 @@ impl Controller {
                     checked: true,
                     backend_ready: true,
                     signed_in,
+                    keyring_locked: false,
                     account: String::new(),
                     version: format!("{} ({})", proton.version(), p.display()),
                     checking: false,
@@ -675,6 +683,7 @@ impl Controller {
                     checked: true,
                     backend_ready: false,
                     signed_in: false,
+                    keyring_locked: false,
                     account: String::new(),
                     version: "proton-drive NOT FOUND on PATH".into(),
                     checking: false,
