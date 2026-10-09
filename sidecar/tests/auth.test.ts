@@ -136,7 +136,7 @@ describe('authentication over fake HTTP', () => {
     await expect(h.auth.login('normal', 'bad-password')).rejects.toMatchObject({ code: 'auth' });
     expect(h.store.value).toEqual(saved);
     h.auth.session = null;
-    h.auth.pending = null;
+    (h.auth as unknown as { pending: null }).pending = null;
     await h.auth.rehydrate();
     expect(h.auth.status().signed_in).toBe(true);
   });
