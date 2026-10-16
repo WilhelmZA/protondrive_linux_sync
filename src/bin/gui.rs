@@ -604,6 +604,9 @@ struct DaemonWatch {
     spawned: bool,
     last_spawn: f64,
     status_missing_since: Option<f64>,
+    /// Set when this window itself started the tray. The "stopped" banner waits
+    /// out the first two seconds, because that spawn is a start, not a restart.
+    startup_grace: bool,
 }
 
 impl DaemonWatch {
@@ -616,6 +619,7 @@ impl DaemonWatch {
             spawned: false,
             last_spawn: 0.0,
             status_missing_since: None,
+            startup_grace: false,
         }
     }
 }
@@ -687,11 +691,11 @@ impl App {
             if !daemon_running(&cfg.state_dir) {
                 spawn_daemon();
                 // egui's clock starts at 0, so this counts as a spawn at open.
+                // The stopped banner waits until the first poll after two seconds.
                 daemon_watch.spawned = true;
                 daemon_watch.last_spawn = 0.0;
                 daemon_watch.attempts = 1;
-                daemon_watch.banner = Some(DaemonBanner::Restarting);
-                daemon_watch.alive = false;
+                daemon_watch.startup_grace = true;
             }
             PidLock::acquire(&cfg.state_dir, WINDOW_LOCK)
         } else {
@@ -785,6 +789,14 @@ impl App {
         }
         self.daemon_watch.last_check = now;
         let alive = daemon_running(&self.cfg.state_dir);
+        if self.daemon_watch.startup_grace && !alive && now - self.daemon_watch.last_spawn < 2.0 {
+            // A tray this window just started is not "stopped" yet. Ignore a
+            // leftover status.json until the grace passes or the lock appears.
+            self.daemon_watch.alive = false;
+            self.daemon_watch.banner = None;
+            return;
+        }
+        self.daemon_watch.startup_grace = false;
         let age = status_age_secs(&self.cfg.state_dir);
         if age.is_some() || !alive {
             self.daemon_watch.status_missing_since = None;
@@ -4275,7 +4287,9 @@ fn wait_tray_child(child: &mut std::process::Child) -> ChildEnd {
 /// itself on Wayland, so instead the tray simply opens a fresh window on demand.
 /// Runs a GTK main loop until the tray "Quit" item is chosen or the process is killed.
 /// Exit code 0 (Quit, or there is no config) tells the supervisor to stop.
-fn run_daemon() {
+/// GTK init failure, a missing tray icon, and the GTK loop ending without Quit
+/// return 1 so the supervisor restarts.
+fn run_daemon() -> i32 {
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::TrayIconBuilder;
 
@@ -4283,7 +4297,7 @@ fn run_daemon() {
         Ok(c) => c,
         Err(_) => {
             eprintln!("neutronsync: no config found; nothing to run in tray mode");
-            return;
+            return 0;
         }
     };
     ensure_desktop_integration();
@@ -4298,7 +4312,8 @@ fn run_daemon() {
 
     if let Err(e) = gtk::init() {
         eprintln!("neutronsync: GTK init failed: {e}");
-        return;
+        ctrl.stop_watch();
+        return 1;
     }
 
     let menu = Menu::new();
@@ -4325,9 +4340,11 @@ fn run_daemon() {
         Ok(t) => t,
         Err(e) => {
             eprintln!("neutronsync: system tray unavailable: {e}");
-            return;
+            ctrl.stop_watch();
+            return 1;
         }
     };
+    let quit = std::sync::Arc::new(AtomicBool::new(false));
 
     // Poll the menu-event channel from within the GTK loop, and hot-reload the
     // config file so added/removed folders and setting changes take effect
@@ -4339,6 +4356,7 @@ fn run_daemon() {
     let mut last_mtime = file_mtime(&config_path);
     let mut want_watch = cfg.auto_sync;
     let mut pending_restart = false;
+    let quit_flag = quit.clone();
     gtk::glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
         // tray menu
         while let Ok(ev) = menu_rx.try_recv() {
@@ -4354,6 +4372,7 @@ fn run_daemon() {
                 }
             } else if id == &quit_id {
                 // Full quit: close the window too (if open), then end the daemon.
+                quit_flag.store(true, Ordering::SeqCst);
                 terminate_window(&state_dir);
                 gtk::main_quit();
             }
@@ -4394,6 +4413,11 @@ fn run_daemon() {
 
     gtk::main();
     ctrl.stop_watch();
+    if quit.load(Ordering::SeqCst) {
+        0
+    } else {
+        1
+    }
 }
 
 // ============================================================================
@@ -4813,8 +4837,7 @@ fn main() -> eframe::Result<()> {
     // Headless tray. `--tray` is the supervisor (lock + restarts). `--tray-child`
     // is the real tray and is not a user-facing command.
     if args.iter().any(|a| a == "--tray-child") {
-        run_daemon();
-        return Ok(());
+        std::process::exit(run_daemon());
     }
     if args.iter().any(|a| a == "--tray") {
         run_tray_supervisor();
