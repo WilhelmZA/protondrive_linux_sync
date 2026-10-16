@@ -9,10 +9,13 @@
 //!
 //! Build/run: `cargo run --features gui --bin neutronsync-gui`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 
 use eframe::egui::{
     self, pos2, vec2, Align2, Color32, FontFamily, FontId, Rect, RichText, Sense, Stroke,
@@ -22,6 +25,7 @@ use neutronsync::config::{self, Config, ConflictPolicy, LocalDelete, Pair, Updat
 use neutronsync::models::{Compare, Entry};
 use neutronsync::protoncli::ProtonCli;
 use neutronsync::service::{ActivityKind, ActivityOp, AppState, Controller, PairState, Phase};
+use neutronsync::tray_policy::{self, ChildEnd, DaemonBanner, SupervisorAction};
 use neutronsync::updater::{self, UpdateInfo};
 
 // --- palette (reference/gui/palette/palette.md) -----------------------------
@@ -416,8 +420,8 @@ fn tray_icon_image() -> Option<tray_icon::Icon> {
 // single-instance locks + process spawning (daemon <-> window coordination)
 // ---------------------------------------------------------------------------
 
-/// Advisory PID lock: a file under `state_dir` holding a PID, cross-checked
-/// against `/proc`. Removed on drop. Used so at most one daemon and one window
+/// Advisory process lock: a PID, start time and boot ID checked against `/proc`.
+/// Removed on drop. Used so at most one daemon and one window
 /// run at a time.
 struct PidLock {
     path: PathBuf,
@@ -431,14 +435,14 @@ impl PidLock {
         if pid_alive_from(&path) {
             return None;
         }
-        std::fs::write(&path, std::process::id().to_string()).ok()?;
+        neutronsync::process_lock::write(&path).ok()?;
         Some(PidLock { path })
     }
 }
 
 impl Drop for PidLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        neutronsync::process_lock::remove_owned(&self.path);
     }
 }
 
@@ -447,11 +451,36 @@ fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// Whether the PID recorded in `lock` names a currently-running process.
+/// Whether the process identity recorded in `lock` is still running.
 fn pid_alive_from(lock: &std::path::Path) -> bool {
-    if let Ok(s) = std::fs::read_to_string(lock) {
-        if let Ok(pid) = s.trim().parse::<u32>() {
-            return std::path::Path::new(&format!("/proc/{pid}")).exists();
+    neutronsync::process_lock::is_alive(lock)
+}
+
+/// Age of `status.json` in seconds, if the file exists and has a modification time.
+fn status_age_secs(state_dir: &Path) -> Option<f64> {
+    let modified = std::fs::metadata(state_dir.join("status.json"))
+        .and_then(|meta| meta.modified())
+        .ok()?;
+    modified.elapsed().ok().map(|age| age.as_secs_f64())
+}
+
+/// Whether a Wayland or X11 display socket for this session still exists.
+fn display_session_present() -> bool {
+    if let Some(path) = tray_policy::wayland_socket_path(
+        std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+        std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+    ) {
+        if path.exists() {
+            return true;
+        }
+    }
+    if let Some(path) = std::env::var("DISPLAY")
+        .ok()
+        .as_deref()
+        .and_then(tray_policy::x11_socket_path)
+    {
+        if path.exists() {
+            return true;
         }
     }
     false
@@ -517,8 +546,12 @@ fn spawn_daemon() {
 fn terminate_window(state_dir: &std::path::Path) {
     let lock = state_dir.join(WINDOW_LOCK);
     if let Ok(s) = std::fs::read_to_string(&lock) {
-        if let Ok(pid) = s.trim().parse::<u32>() {
-            if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        if let Some(pid) = s
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            if pid_alive_from(&lock) {
                 let _ = std::process::Command::new("kill")
                     .arg(pid.to_string())
                     .status();
@@ -562,6 +595,31 @@ struct ApiSignIn {
     pending: Option<std::sync::mpsc::Receiver<Result<serde_json::Value, String>>>,
 }
 
+/// Samples of the tray lock and `status.json`, at most once every two seconds.
+struct DaemonWatch {
+    last_check: f64,
+    alive: bool,
+    banner: Option<DaemonBanner>,
+    attempts: u32,
+    spawned: bool,
+    last_spawn: f64,
+    status_missing_since: Option<f64>,
+}
+
+impl DaemonWatch {
+    fn new() -> Self {
+        Self {
+            last_check: -1.0,
+            alive: true,
+            banner: None,
+            attempts: 0,
+            spawned: false,
+            last_spawn: 0.0,
+            status_missing_since: None,
+        }
+    }
+}
+
 struct App {
     ctrl: Controller,
     cfg: Config,
@@ -603,6 +661,7 @@ struct App {
     // When true (run_in_tray), a headless daemon owns the tray + watcher; this
     // window just ensures one exists and exits on close (the daemon lives on).
     mode_daemon: bool,
+    daemon_watch: DaemonWatch,
     _win_lock: Option<PidLock>,
 
     // `--screenshots <dir>`: drive the window through scripted scenes with
@@ -623,9 +682,16 @@ impl App {
         // With the tray on, a headless daemon owns the tray + watcher; this window
         // just ensures one exists, takes a window lock, and exits on close.
         let mode_daemon = cfg.run_in_tray;
+        let mut daemon_watch = DaemonWatch::new();
         let win_lock = if mode_daemon {
             if !daemon_running(&cfg.state_dir) {
                 spawn_daemon();
+                // egui's clock starts at 0, so this counts as a spawn at open.
+                daemon_watch.spawned = true;
+                daemon_watch.last_spawn = 0.0;
+                daemon_watch.attempts = 1;
+                daemon_watch.banner = Some(DaemonBanner::Restarting);
+                daemon_watch.alive = false;
             }
             PidLock::acquire(&cfg.state_dir, WINDOW_LOCK)
         } else {
@@ -662,6 +728,7 @@ impl App {
             excl_newly: Vec::new(),
             confirm_remove_local: None,
             mode_daemon,
+            daemon_watch,
             _win_lock: win_lock,
             demo: None,
         };
@@ -705,6 +772,53 @@ impl App {
             && !daemon_running(&self.cfg.state_dir)
         {
             spawn_daemon();
+        }
+    }
+
+    /// Sample the tray lock and `status.json` at most every two seconds.
+    fn poll_daemon_liveness(&mut self, now: f64) {
+        if !self.mode_daemon || self.demo.is_some() {
+            return;
+        }
+        if !tray_policy::check_due(now, self.daemon_watch.last_check, 2.0) {
+            return;
+        }
+        self.daemon_watch.last_check = now;
+        let alive = daemon_running(&self.cfg.state_dir);
+        let age = status_age_secs(&self.cfg.state_dir);
+        if age.is_some() || !alive {
+            self.daemon_watch.status_missing_since = None;
+        }
+        let missing_for = if alive && age.is_none() {
+            let since = self.daemon_watch.status_missing_since.get_or_insert(now);
+            Some(now - *since)
+        } else {
+            None
+        };
+        let stale = tray_policy::status_is_stale(age, missing_for);
+        let spawn_due = !self.daemon_watch.spawned || now - self.daemon_watch.last_spawn >= 10.0;
+        let decision =
+            tray_policy::window_liveness(alive, stale, self.daemon_watch.attempts, spawn_due);
+        self.daemon_watch.alive = alive;
+        self.daemon_watch.banner = decision.banner;
+        self.daemon_watch.attempts = decision.attempts;
+        if decision.spawn {
+            spawn_daemon();
+            self.daemon_watch.spawned = true;
+            self.daemon_watch.last_spawn = now;
+        }
+    }
+
+    /// "Try again" resets the failure count and starts background sync once.
+    fn respawn_daemon_now(&mut self, now: f64) {
+        let decision = tray_policy::window_liveness(false, false, 0, true);
+        self.daemon_watch.alive = false;
+        self.daemon_watch.banner = decision.banner;
+        self.daemon_watch.attempts = decision.attempts;
+        if decision.spawn {
+            spawn_daemon();
+            self.daemon_watch.spawned = true;
+            self.daemon_watch.last_spawn = now;
         }
     }
 
@@ -1016,6 +1130,8 @@ impl eframe::App for App {
             }
         }
         self.pump_tray(ctx);
+        let now = ctx.input(|i| i.time);
+        self.poll_daemon_liveness(now);
         // pump the remote browser channel
         if let Some(rx) = &self.browser_rx {
             if let Ok(res) = rx.try_recv() {
@@ -1061,7 +1177,9 @@ impl eframe::App for App {
             state
         } else {
             let mine = self.ctrl.snapshot();
-            if self.mode_daemon {
+            // A dead tray leaves status.json behind. Ignore it and show this
+            // window's own state until background sync is publishing again.
+            if self.mode_daemon && self.daemon_watch.alive {
                 match Controller::read_status(&self.cfg.state_dir) {
                     Some(mut pubd) => {
                         pubd.account = mine.account.clone();
@@ -1134,6 +1252,15 @@ impl eframe::App for App {
         }
 
         egui::containers::CentralPanel::default().show(root_ui, |ui| {
+            let mut try_again = false;
+            if !snap.signed_out {
+                if let Some(kind) = self.daemon_watch.banner {
+                    if daemon_banner(ui, kind) {
+                        try_again = true;
+                    }
+                    ui.add_space(14.0);
+                }
+            }
             if signin {
                 self.page_signin(ui, &snap);
             } else {
@@ -1150,6 +1277,9 @@ impl eframe::App for App {
                         Nav::About => self.page_about(ui),
                     }
                 });
+            }
+            if try_again {
+                self.respawn_daemon_now(now);
             }
         });
 
@@ -1453,15 +1583,20 @@ impl App {
         let never_synced = snap.pairs.iter().any(|p| {
             matches!(p.phase, Phase::Scanning | Phase::Syncing) && p.last_synced.is_none()
         });
+        let suppress_phase =
+            self.mode_daemon && self.daemon_watch.banner.is_some() && !snap.signed_out;
         let (bcol, bicon, btitle, bsub) = if snap.signed_out {
             // A signed-out session is surfaced explicitly — everything else is
-            // blocked on it, so it takes priority over scan/sync/idle states.
+            // blocked on it, so it takes priority over scan/sync/idle states
+            // and over the background-sync banner drawn above this page.
             (
                 DANGER,
                 Icon::Info,
                 "Signed out of Proton",
                 "Sign in on the Account tab to resume syncing".into(),
             )
+        } else if suppress_phase {
+            (ACCENT, Icon::Info, "", String::new())
         } else if active {
             (
                 ACCENT,
@@ -1495,7 +1630,9 @@ impl App {
         } else {
             (OK, Icon::Check, "Synced", last_synced_line(snap))
         };
-        activity_banner(ui, bcol, bicon, btitle, &bsub, busy);
+        if !suppress_phase {
+            let _ = activity_banner(ui, bcol, bicon, btitle, &bsub, busy, None);
+        }
 
         ui.add_space(14.0);
 
@@ -3081,6 +3218,17 @@ impl App {
     }
 }
 
+fn daemon_banner(ui: &mut egui::Ui, kind: DaemonBanner) -> bool {
+    let (col, title, action) = match kind {
+        DaemonBanner::Restarting => (DANGER, "Background sync stopped. Restarting…", None),
+        DaemonBanner::NotResponding => (WARN, "Background sync is not responding", None),
+        DaemonBanner::CouldNotStart => {
+            (DANGER, "Background sync could not start", Some("Try again"))
+        }
+    };
+    activity_banner(ui, col, Icon::Info, title, "", false, action)
+}
+
 fn current_op_line(snap: &AppState) -> String {
     snap.pairs
         .iter()
@@ -3101,7 +3249,9 @@ fn activity_banner(
     title: &str,
     sub: &str,
     spin: bool,
-) {
+    action: Option<&str>,
+) -> bool {
+    let mut clicked = false;
     // full-width, state-tinted status bar
     let frame = egui::Frame::default()
         .fill(col.gamma_multiply(0.11))
@@ -3129,12 +3279,22 @@ fn activity_banner(
                             .font(FontId::new(15.0, ff_bold()))
                             .color(TEXT),
                     );
-                    ui.add_space(1.0);
-                    ui.label(RichText::new(sub).size(12.0).color(DIM));
+                    if !sub.is_empty() {
+                        ui.add_space(1.0);
+                        ui.label(RichText::new(sub).size(12.0).color(DIM));
+                    }
                 });
+                if let Some(label) = action {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if button(ui, None, label, Btn::Secondary, false, true).clicked() {
+                            clicked = true;
+                        }
+                    });
+                }
             });
         });
     });
+    clicked
 }
 
 /// What an Activity row click wants to open locally.
@@ -3944,15 +4104,35 @@ fn auto_names_of(cfg: &Config) -> Vec<String> {
         .collect()
 }
 
-/// Headless tray daemon (`--tray`): owns the system tray (GTK/AppIndicator) and
-/// an optional watcher, with no window. It's the Wayland-native background
-/// presence — the window can't hide/restore/focus itself on Wayland, so instead
-/// the tray simply opens a fresh window on demand. Runs a GTK main loop until
-/// the tray "Quit" item is chosen or the process is killed.
-fn run_daemon() {
-    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-    use tray_icon::TrayIconBuilder;
+static SUPERVISOR_STOP: AtomicBool = AtomicBool::new(false);
+static SUPERVISOR_CHILD: AtomicI32 = AtomicI32::new(0);
 
+extern "C" fn on_supervisor_signal(sig: libc::c_int) {
+    SUPERVISOR_STOP.store(true, Ordering::SeqCst);
+    let pid = SUPERVISOR_CHILD.load(Ordering::SeqCst);
+    if pid > 0 {
+        unsafe {
+            libc::kill(pid, sig);
+        }
+    }
+}
+
+fn install_supervisor_signals() {
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        let handler: extern "C" fn(libc::c_int) = on_supervisor_signal;
+        action.sa_sigaction = handler as *const () as libc::sighandler_t;
+        action.sa_flags = 0;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
+        libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+}
+
+/// `--tray`: hold the tray lock and run `--tray-child`, restarting it after a crash.
+/// Does no GTK, sync, or config watching, so a broken display pipe cannot take it down.
+fn run_tray_supervisor() {
     let cfg = match config::load(None) {
         Ok(c) => c,
         Err(_) => {
@@ -3961,9 +4141,148 @@ fn run_daemon() {
         }
     };
     let _lock = match PidLock::acquire(&cfg.state_dir, DAEMON_LOCK) {
-        Some(l) => l,
+        Some(lock) => lock,
         None => {
             eprintln!("neutronsync: a tray daemon is already running");
+            return;
+        }
+    };
+    install_supervisor_signals();
+    let log = neutronsync::logger::Logger::new(&cfg.state_dir, false, true);
+    let mut restarts: Vec<Instant> = Vec::new();
+    loop {
+        if SUPERVISOR_STOP.load(Ordering::SeqCst) {
+            break;
+        }
+        if !display_session_present() {
+            log.warn("neutronsync: background sync stopped because the display session is gone");
+            break;
+        }
+        let mut child = match spawn_tray_child() {
+            Ok(child) => child,
+            Err(err) => {
+                let line =
+                    format!("neutronsync: background sync restarted (child spawn failed: {err})");
+                if !continue_after_child(&log, &mut restarts, ChildEnd::Code(1), &line) {
+                    break;
+                }
+                continue;
+            }
+        };
+        let end = wait_tray_child(&mut child);
+        if SUPERVISOR_STOP.load(Ordering::SeqCst) {
+            break;
+        }
+        let line = format!(
+            "neutronsync: background sync restarted (child {})",
+            end.describe()
+        );
+        if !continue_after_child(&log, &mut restarts, end, &line) {
+            break;
+        }
+    }
+}
+
+/// Apply the restart policy. Returns true when the supervisor should spawn again.
+fn continue_after_child(
+    log: &neutronsync::logger::Logger,
+    restarts: &mut Vec<Instant>,
+    end: ChildEnd,
+    restart_line: &str,
+) -> bool {
+    let now = Instant::now();
+    let window = Duration::from_secs(5 * 60);
+    restarts.retain(|at| now.saturating_duration_since(*at) < window);
+    match tray_policy::supervisor_action(end, display_session_present(), restarts.len() as u32) {
+        SupervisorAction::StopClean => false,
+        SupervisorAction::StopSessionGone => {
+            log.warn("neutronsync: background sync stopped because the display session is gone");
+            false
+        }
+        SupervisorAction::StopRestartCap => {
+            log.warn("neutronsync: background sync stopped after 5 restarts in 5 minutes");
+            false
+        }
+        SupervisorAction::Restart { delay_secs } => {
+            log.warn(restart_line);
+            restarts.push(now);
+            !sleep_unless_stopped(Duration::from_secs(delay_secs))
+        }
+    }
+}
+
+fn sleep_unless_stopped(total: Duration) -> bool {
+    let step = Duration::from_millis(100);
+    let start = Instant::now();
+    while start.elapsed() < total {
+        if SUPERVISOR_STOP.load(Ordering::SeqCst) {
+            return true;
+        }
+        let left = total.saturating_sub(start.elapsed());
+        thread::sleep(step.min(left));
+    }
+    SUPERVISOR_STOP.load(Ordering::SeqCst)
+}
+
+fn spawn_tray_child() -> std::io::Result<std::process::Child> {
+    let parent = std::process::id() as libc::pid_t;
+    let mut cmd = std::process::Command::new(self_exe());
+    cmd.arg("--tray-child");
+    inherit_session_env(&mut cmd);
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent {
+                libc::raise(libc::SIGTERM);
+                libc::_exit(128 + libc::SIGTERM);
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn()
+}
+
+fn wait_tray_child(child: &mut std::process::Child) -> ChildEnd {
+    let pid = child.id() as libc::pid_t;
+    SUPERVISOR_CHILD.store(pid, Ordering::SeqCst);
+    if SUPERVISOR_STOP.load(Ordering::SeqCst) {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+    let status = child.wait();
+    SUPERVISOR_CHILD.store(0, Ordering::SeqCst);
+    match status {
+        Ok(status) => {
+            if let Some(code) = status.code() {
+                ChildEnd::Code(code)
+            } else if let Some(signal) = status.signal() {
+                ChildEnd::Signal(signal)
+            } else {
+                ChildEnd::Code(1)
+            }
+        }
+        Err(_) => ChildEnd::Code(1),
+    }
+}
+
+/// Headless tray child (`--tray-child`): owns the system tray (GTK/AppIndicator)
+/// and an optional watcher, with no window. The supervisor (`--tray`) holds
+/// `tray-daemon.lock` and restarts this process; this child takes no lock.
+/// It's the Wayland-native background presence — the window can't hide/restore/focus
+/// itself on Wayland, so instead the tray simply opens a fresh window on demand.
+/// Runs a GTK main loop until the tray "Quit" item is chosen or the process is killed.
+/// Exit code 0 (Quit, or there is no config) tells the supervisor to stop.
+fn run_daemon() {
+    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::TrayIconBuilder;
+
+    let cfg = match config::load(None) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("neutronsync: no config found; nothing to run in tray mode");
             return;
         }
     };
@@ -4427,6 +4746,7 @@ impl App {
             excl_newly: Vec::new(),
             confirm_remove_local: None,
             mode_daemon: false,
+            daemon_watch: DaemonWatch::new(),
             _win_lock: None,
             demo: Some(Demo {
                 dir,
@@ -4490,9 +4810,14 @@ impl App {
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    // Headless tray daemon (Wayland-native background presence).
-    if args.iter().any(|a| a == "--tray") {
+    // Headless tray. `--tray` is the supervisor (lock + restarts). `--tray-child`
+    // is the real tray and is not a user-facing command.
+    if args.iter().any(|a| a == "--tray-child") {
         run_daemon();
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--tray") {
+        run_tray_supervisor();
         return Ok(());
     }
 

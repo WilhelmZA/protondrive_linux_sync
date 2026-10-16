@@ -18,11 +18,13 @@ pub mod events;
 pub mod ignore;
 pub mod logger;
 pub mod models;
+pub mod process_lock;
 pub mod protoncli;
 pub mod service;
 pub mod state;
 pub mod stats;
 pub mod trash;
+pub mod tray_policy;
 #[cfg(feature = "gui")]
 pub mod updater;
 pub mod watcher;

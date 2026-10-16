@@ -133,7 +133,7 @@ For each folder pair, NeutronSync keeps a baseline snapshot of the last state th
 - The API watcher subscribes before its first full walk. Later full walks handle refresh notices, unresolved events and the daily safety net. Set `[options] full_walk_interval = 86400` to change that interval in seconds. Sign-out pauses sync; sidecar authentication recovery resumes from the saved cursor.
 - With `backend = "cli"`, startup syncs fresh local changes, recently active ("hot") folders, then everything else. Remote changes arrive on the next hot pass or full walk. Full walks stream folder-by-folder and keep their adaptive pacing: six times the walk duration, floored at `poll_interval` and capped at six hours. `full_walk_interval` does not affect this backend.
 
-When the background tray daemon is doing the work, an open window mirrors its live state, so scanning and per-file transfers show up in Activity in real time. The sync model and its reasoning are written up in [docs/SYNC_MODEL.md](docs/SYNC_MODEL.md).
+When the background tray is doing the work, an open window mirrors its live state, so scanning and per-file transfers show up in Activity in real time. If that tray exits unexpectedly, NeutronSync starts it again. Quitting from the tray menu stops it. An open window notices within a few seconds and shows when background sync has stopped and is restarting, when it is not responding, or when it could not start. The sync model and its reasoning are written up in [docs/SYNC_MODEL.md](docs/SYNC_MODEL.md).
 
 **Safety model.**
 

@@ -125,7 +125,7 @@ fn is_content_change(kind: &notify_debouncer_full::notify::EventKind) -> bool {
 }
 
 /// Single-instance lock so a watch daemon and, say, a systemd timer don't run
-/// the same pairs at once. Advisory: a PID file, checked against /proc.
+/// the same pairs at once. Checks PID, start time and boot ID against /proc.
 struct DaemonLock {
     path: PathBuf,
 }
@@ -134,25 +134,20 @@ impl DaemonLock {
     fn acquire(state_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(state_dir)?;
         let path = state_dir.join("watch.lock");
-        if let Ok(s) = std::fs::read_to_string(&path) {
-            if let Ok(pid) = s.trim().parse::<u32>() {
-                if Path::new(&format!("/proc/{pid}")).exists() {
-                    bail!(
-                        "a neutronsync watch is already running (pid {pid}); \
-                         lock file {}",
-                        path.display()
-                    );
-                }
-            }
+        if crate::process_lock::is_alive(&path) {
+            bail!(
+                "a neutronsync watch is already running; lock file {}",
+                path.display()
+            );
         }
-        std::fs::write(&path, std::process::id().to_string())?;
+        crate::process_lock::write(&path)?;
         Ok(DaemonLock { path })
     }
 }
 
 impl Drop for DaemonLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        crate::process_lock::remove_owned(&self.path);
     }
 }
 
