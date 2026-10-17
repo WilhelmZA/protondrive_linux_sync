@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-17
+
 ### Fixed
 - A background tray that exits unexpectedly starts again on its own. Quitting from the tray menu still stops it, and logging out does not leave it retrying. If it keeps failing, it stops after five restarts in five minutes and writes the reason to the sync log.
 - An open window no longer keeps showing a frozen view after background sync dies or stops updating. It shows "Background sync stopped. Restarting…" and starts it again, "Background sync is not responding" when the tray is still there but has stopped updating, or "Background sync could not start" with Try again after three failed starts.
