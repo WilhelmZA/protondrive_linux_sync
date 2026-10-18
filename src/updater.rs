@@ -382,10 +382,24 @@ fn is_executable(p: &Path) -> bool {
 /// PID-keyed locks, and there is no single shutdown path between them, so a
 /// clean handover has to happen from outside: a detached shell waits for this
 /// process to go away, stops any remaining ones, and starts the pair again.
+///
+/// The helper runs in its own systemd scope when a user manager is available.
+/// Otherwise it shares this process's cgroup, and if the tray runs as a systemd
+/// service, stopping the tray stops that service and kills the helper with it.
 pub fn restart() -> Result<()> {
     let script = "sleep 1; pkill -x neutronsync-gui; sleep 1; \
                   setsid neutronsync-gui --tray >/dev/null 2>&1 < /dev/null & \
                   sleep 1; setsid neutronsync-gui >/dev/null 2>&1 < /dev/null &";
+    let scoped = Command::new("systemd-run")
+        .args(scoped_helper_args(std::process::id(), script))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if scoped {
+        return Ok(());
+    }
     Command::new("setsid")
         .args(["-f", "/bin/sh", "-c", script])
         .stdout(std::process::Stdio::null())
@@ -393,6 +407,26 @@ pub fn restart() -> Result<()> {
         .spawn()
         .context("spawning the restart helper")?;
     Ok(())
+}
+
+/// `systemd-run` arguments that start the restart helper in a new user scope.
+/// `setsid -f` returns at once, so `systemd-run` exits as soon as the scope exists.
+fn scoped_helper_args(pid: u32, script: &str) -> Vec<String> {
+    [
+        "--user",
+        "--scope",
+        "--quiet",
+        "--collect",
+        &format!("--unit=neutronsync-restart-{pid}"),
+        "setsid",
+        "-f",
+        "/bin/sh",
+        "-c",
+        script,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 fn fetch(url: &str) -> Result<String> {
@@ -450,6 +484,26 @@ mod tests {
         // A final release outranks its own pre-releases, and vice versa.
         assert!(is_newer("0.2.0", "0.2.0-beta.1"));
         assert!(!is_newer("0.2.0-beta.1", "0.2.0"));
+    }
+
+    #[test]
+    fn restart_helper_gets_its_own_scope() {
+        let args = scoped_helper_args(42, "true");
+        assert_eq!(
+            args,
+            [
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--unit=neutronsync-restart-42",
+                "setsid",
+                "-f",
+                "/bin/sh",
+                "-c",
+                "true"
+            ]
+        );
     }
 
     /// The asset names here are the ones the release workflow actually produces.

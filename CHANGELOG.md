@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-18
+
+### Fixed
+- Restart now after an in-app update brings the app back when the tray runs as a systemd user service. Before, stopping the tray also stopped the service, which killed the restart step before it could start the new version.
+
 ## [0.5.1] - 2026-10-17
 
 ### Fixed
