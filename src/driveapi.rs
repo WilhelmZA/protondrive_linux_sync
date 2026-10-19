@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use crate::changefeed::{FeedMessage, RemoteChangeFeed, Subscription};
 use crate::config::{remote_join, Config};
 use crate::models::{DownloadJob, Entry, TreeScan, Uploaded};
-use crate::protoncli::{is_safe_component, ListOutcome, Remote};
+use crate::remote::{is_safe_component, ListOutcome, Remote};
 
 pub const SIDECAR_NAME: &str = "neutronsync-drive";
 const CALL_TIMEOUT: Duration = Duration::from_secs(900);
@@ -831,6 +831,6 @@ mod tests {
     #[test]
     fn auth_error_uses_existing_signout_classifier() {
         let error = RpcError::from_value(&json!({"data":{"code":"auth"}}));
-        assert!(crate::protoncli::is_not_logged_in(&error.to_string()));
+        assert!(crate::remote::is_not_logged_in(&error.to_string()));
     }
 }

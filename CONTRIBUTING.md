@@ -4,7 +4,7 @@
 
 A single Cargo crate: a **library** (the reusable core) plus two binaries, plus the Bun sidecar.
 
-- `src/lib.rs` — core: `config`, `models`, `backend` (selects the `Remote`), `driveapi` (API sidecar client), `protoncli` (legacy CLI adapter), `changefeed`, `watcher_feed`, `engine` (three-way merge), `state`, `trash`, `datefmt`, `logger`, `events`, `service` (`Controller` for frontends), `watcher`.
+- `src/lib.rs` — core: `config`, `models`, `backend` (builds the `Remote`), `remote` (the `Remote` trait), `driveapi` (API sidecar client), `changefeed`, `watcher_feed`, `engine` (three-way merge), `state`, `trash`, `datefmt`, `logger`, `events`, `service` (`Controller` for frontends), `watcher`.
 - `src/main.rs` — the `neutronsync` CLI.
 - `src/bin/gui.rs` — the `neutronsync-gui` GUI (behind the `gui` feature).
 - `sidecar/` — `neutronsync-drive`, the Proton Drive SDK helper (Bun).
@@ -48,5 +48,5 @@ cargo generate-rpm            # after a `cargo build --release --features gui`
 ## Conventions
 
 - No third-party runtime deps in the core beyond what's in `Cargo.toml`; keep the CLI light (GUI-only deps go behind the `gui` feature).
-- Keep backend specifics behind the `Remote` trait (`backend::select`); do not leak API or CLI details into the engine.
+- Keep backend specifics behind the `Remote` trait (`backend::select`); do not leak sidecar details into the engine.
 - `cargo test` must stay green; `bun test` in `sidecar/` must stay green; the GUI and CLI should build warning-free.

@@ -43,7 +43,7 @@ struct PairState {
 
 struct AccountState {
     checked: bool,
-    backend_ready: bool,   // API: sidecar answered; CLI: binary found on PATH
+    backend_ready: bool,   // the sidecar answered
     signed_in: bool,
     keyring_locked: bool,  // system keyring locked; not a sign-out, no login form
     account: String,       // Proton account name from the API probe (empty on CLI)

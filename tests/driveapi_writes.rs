@@ -10,7 +10,7 @@ use neutronsync::driveapi::{DriveApi, RpcError};
 use neutronsync::engine::{self, Engine};
 use neutronsync::logger::Logger;
 use neutronsync::models::{DownloadJob, Entry};
-use neutronsync::protoncli::{is_not_logged_in, Remote};
+use neutronsync::remote::{is_not_logged_in, Remote};
 use serde_json::{json, Value};
 
 static SERIAL: Mutex<()> = Mutex::new(());

@@ -23,7 +23,6 @@ use eframe::egui::{
 
 use neutronsync::config::{self, Config, ConflictPolicy, LocalDelete, Pair, UpdateChannel};
 use neutronsync::models::{Compare, Entry};
-use neutronsync::protoncli::ProtonCli;
 use neutronsync::service::{ActivityKind, ActivityOp, AppState, Controller, PairState, Phase};
 use neutronsync::tray_policy::{self, ChildEnd, DaemonBanner, SupervisorAction};
 use neutronsync::updater::{self, UpdateInfo};
@@ -77,7 +76,6 @@ enum Icon {
     Arrow,
     Upload,
     Download,
-    Copy,
 }
 
 fn icon_glyph(icon: Icon) -> &'static str {
@@ -97,7 +95,6 @@ fn icon_glyph(icon: Icon) -> &'static str {
         Icon::Arrow => ph::ARROW_RIGHT,
         Icon::Upload => ph::ARROW_UP,
         Icon::Download => ph::ARROW_DOWN,
-        Icon::Copy => ph::COPY,
     }
 }
 
@@ -507,8 +504,8 @@ fn self_exe() -> std::ffi::OsString {
 }
 
 /// Propagate session-related env vars to a child process. Autostart and manual
-/// spawns must reach the OS keyring via D-Bus; without these the CLI reports
-/// "No session loaded" even when the user is signed in elsewhere.
+/// spawns must reach the OS keyring via D-Bus; without these the sidecar finds
+/// no session even when the user is signed in elsewhere.
 fn inherit_session_env(cmd: &mut std::process::Command) {
     for key in [
         "DBUS_SESSION_BUS_ADDRESS",
@@ -637,8 +634,6 @@ struct App {
     update: std::sync::Arc<std::sync::Mutex<UpdateState>>,
     confirm_logout: bool,
     confirm_reset: bool,
-    // after launching browser login, poll the account until signed in (or deadline)
-    login_poll_until: Option<f64>,
     last_account_poll: f64,
     api_signin: ApiSignIn,
 
@@ -714,7 +709,6 @@ impl App {
             update: std::sync::Arc::new(std::sync::Mutex::new(UpdateState::Idle)),
             confirm_logout: false,
             confirm_reset: false,
-            login_poll_until: None,
             last_account_poll: 0.0,
             api_signin: ApiSignIn::default(),
             browser_open: false,
@@ -1215,24 +1209,6 @@ impl eframe::App for App {
         if self.mode_daemon {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
-        // after a browser login, poll the account until signed in (or deadline),
-        // so the app returns to itself without a manual Refresh.
-        if let Some(until) = self.login_poll_until {
-            let now = ctx.input(|i| i.time);
-            if snap.account.signed_in || now > until {
-                self.login_poll_until = None;
-            } else if now - self.last_account_poll > 2.5 && !snap.account.checking {
-                self.ctrl.refresh_account(true);
-                self.last_account_poll = now;
-            }
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
-        }
-
-        // advance page-fade animation
-        if self.nav_t < 1.0 {
-            let dt = ctx.input(|i| i.stable_dt).min(0.05);
-            self.nav_t = (self.nav_t + dt / 0.26).min(1.0);
-        }
 
         // The startup account probe lands on a background thread and egui only
         // repaints on input, so an idle window would show a stale pre-probe
@@ -1243,8 +1219,8 @@ impl eframe::App for App {
         }
 
         // First-run / broken-prereq gate: show the sign-in page unless we have
-        // CONFIRMED a working, signed-in CLI. Covers both "proton-drive missing"
-        // (page_signin renders install guidance) and "present but signed out".
+        // CONFIRMED a reachable, signed-in sidecar. Covers both "sidecar missing"
+        // (page_signin explains) and "present but signed out".
         let signin =
             snap.account.checked && !(snap.account.backend_ready && snap.account.signed_in);
         // The gate used to probe once. A session that was already in the keyring,
@@ -2074,12 +2050,12 @@ impl App {
                 });
 
                 settings_group(ui, "ADVANCED", |ui| {
-                    let backend_label = match self.cfg.backend {
-                        neutronsync::config::Backend::Api => "Proton Drive SDK (neutronsync-drive)",
-                        neutronsync::config::Backend::Cli => "Legacy CLI (proton-drive)",
-                    };
                     if setting_row(ui, "Backend", "", |ui| {
-                        ui.label(RichText::new(backend_label).size(12.5).color(DIM));
+                        ui.label(
+                            RichText::new("Proton Drive SDK (neutronsync-drive)")
+                                .size(12.5)
+                                .color(DIM),
+                        );
                         false
                     }) {
                         // read-only
@@ -2093,40 +2069,15 @@ impl App {
                     }) {
                         self.dirty = true;
                     }
-                    if self.cfg.backend == neutronsync::config::Backend::Api
-                        && setting_row(
-                            ui,
-                            "Full check every",
-                            "Safety-net walk of every folder on both sides.",
-                            |ui| combo_full_walk(ui, &mut self.cfg.full_walk_interval),
-                        )
-                    {
+                    if setting_row(
+                        ui,
+                        "Full check every",
+                        "Safety-net walk of every folder on both sides.",
+                        |ui| combo_full_walk(ui, &mut self.cfg.full_walk_interval),
+                    ) {
                         self.dirty = true;
                     }
                 });
-                if self.cfg.backend == neutronsync::config::Backend::Cli {
-                    settings_group(ui, "LEGACY CLI BACKEND", |ui| {
-                        if setting_row(ui, "proton-drive binary", "", |ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.cfg.binary)
-                                    .desired_width(220.0),
-                            )
-                            .changed()
-                        }) {
-                            self.dirty = true;
-                        }
-                        let fc = self.cfg.fresh_cache;
-                        if setting_row(
-                            ui,
-                            "Fresh metadata each run",
-                            "Avoids stale directory listings from the CLI cache.",
-                            |ui| switch(ui, fc),
-                        ) {
-                            self.cfg.fresh_cache = !fc;
-                            self.dirty = true;
-                        }
-                    });
-                }
 
                 settings_group(ui, "DANGER ZONE", |ui| {
                     if setting_row(
@@ -2147,221 +2098,149 @@ impl App {
 
     fn page_account(&mut self, ui: &mut egui::Ui, snap: &AppState) {
         self.page_header(ui, "Account", |_ui, _app| {});
-        if self.cfg.backend == neutronsync::config::Backend::Api {
-            let acc = &snap.account;
-            let (col, label) = if !acc.checked || acc.checking {
-                (DIM, "Checking…")
-            } else if acc.signed_in {
-                (OK, "Signed in")
-            } else if acc.keyring_locked {
-                (WARN, "Keyring locked")
-            } else if acc.backend_ready {
-                (DANGER, "Not signed in")
-            } else {
-                (WARN, "Sign-in service unavailable")
-            };
-            let checking = acc.checking;
-            let name = if acc.account.is_empty() {
-                "No Proton account".to_string()
-            } else {
-                acc.account.clone()
-            };
-            let mut sign_out = false;
-            let mut refresh = false;
-
-            // identity card: avatar, account, status, actions
-            ui.scope(|ui| {
-                ui.set_max_width((ui.available_width() - 15.0).max(200.0));
-                card_frame().show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        let (ar, _) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::hover());
-                        let initial = acc
-                            .account
-                            .chars()
-                            .next()
-                            .map(|c| c.to_uppercase().to_string())
-                            .unwrap_or_default();
-                        let p = ui.painter();
-                        if acc.signed_in {
-                            p.circle_filled(ar.center(), 24.0, ACCENT);
-                            p.text(
-                                ar.center(),
-                                Align2::CENTER_CENTER,
-                                initial,
-                                FontId::new(20.0, ff_bold()),
-                                TEXT,
-                            );
-                        } else {
-                            p.circle_filled(ar.center(), 24.0, SEL);
-                            draw_icon(p, ar.shrink(13.0), Icon::User, DIM);
-                        }
-                        ui.add_space(12.0);
-                        ui.vertical(|ui| {
-                            ui.add_space(2.0);
-                            ui.label(
-                                RichText::new(&name)
-                                    .font(FontId::new(16.0, ff_bold()))
-                                    .color(if acc.signed_in { TEXT } else { DIM }),
-                            );
-                            ui.add_space(3.0);
-                            ui.horizontal(|ui| {
-                                status_dot_small(ui, col);
-                                ui.label(RichText::new(label).size(12.5).color(DIM));
-                                if checking {
-                                    ui.add_space(2.0);
-                                    ui.add(egui::Spinner::new().size(12.0).color(DIM));
-                                }
-                            });
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if acc.signed_in
-                                && button(ui, None, "Sign out", Btn::Secondary, true, true)
-                                    .clicked()
-                            {
-                                sign_out = true;
-                            }
-                            if button(ui, Some(Icon::Sync), "Refresh", Btn::Ghost, true, !checking)
-                                .clicked()
-                            {
-                                refresh = true;
-                            }
-                        });
-                    });
-
-                    if acc.signed_in || acc.keyring_locked {
-                        ui.add_space(14.0);
-                        ui.separator();
-                        ui.add_space(12.0);
-                        let (kcol, kicon, ktext) = if acc.keyring_locked {
-                            (
-                                WARN,
-                                Icon::Info,
-                                "Session saved in the system keyring, which is locked",
-                            )
-                        } else {
-                            (OK, Icon::Check, "Session saved in the system keyring")
-                        };
-                        ui.horizontal(|ui| {
-                            let (ir, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
-                            ui.painter().rect_filled(ir, 6.0, kcol.gamma_multiply(0.16));
-                            draw_icon(ui.painter(), ir.shrink(5.0), kicon, kcol);
-                            ui.add_space(8.0);
-                            ui.label(RichText::new(ktext).size(13.0).color(TEXT));
-                        });
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(
-                                "Your password went to Proton only. Signing out removes the \
-                                 session from this computer; your files stay in Proton Drive.",
-                            )
-                            .size(12.0)
-                            .color(DIM),
-                        );
-                        if !acc.version.is_empty() {
-                            ui.add_space(10.0);
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new("Helper").size(12.0).color(DIM2));
-                                ui.add_space(6.0);
-                                ui.label(RichText::new(&acc.version).size(12.0).color(DIM));
-                            });
-                        }
-                    }
-                });
-            });
-
-            if sign_out {
-                self.confirm_logout = true;
-            }
-            if refresh {
-                self.last_account_poll = ui.ctx().input(|i| i.time);
-                self.ctrl.refresh_account(false);
-            }
-
-            if acc.keyring_locked {
-                ui.add_space(16.0);
-                ui.label(
-                    RichText::new(
-                        "Your Proton session is still saved. Unlock the system keyring and \
-                         NeutronSync will continue on its own.",
-                    )
-                    .size(12.5)
-                    .color(DIM),
-                );
-            } else if acc.backend_ready && !acc.signed_in {
-                ui.add_space(20.0);
-                self.api_signin_form(ui);
-            }
-            return;
-        }
         let acc = &snap.account;
-        let (col, label) = if !acc.checked {
+        let (col, label) = if !acc.checked || acc.checking {
             (DIM, "Checking…")
         } else if acc.signed_in {
             (OK, "Signed in")
+        } else if acc.keyring_locked {
+            (WARN, "Keyring locked")
         } else if acc.backend_ready {
             (DANGER, "Not signed in")
         } else {
-            (WARN, "proton-drive not found")
+            (WARN, "Sign-in service unavailable")
         };
-        ui.horizontal(|ui| {
-            status_dot(ui, col, false);
-            ui.add_space(2.0);
-            ui.label(
-                RichText::new(label)
-                    .font(FontId::new(16.0, ff_bold()))
-                    .color(TEXT),
-            );
-        });
-        ui.add_space(10.0);
-        ui.label(RichText::new("proton-drive").color(DIM));
-        ui.label(RichText::new(&acc.version).size(12.5).color(DIM));
-        ui.add_space(16.0);
-        let waiting = self.login_poll_until.is_some();
-        let checking = acc.checking || waiting;
-        ui.horizontal(|ui| {
-            if button(
-                ui,
-                Some(Icon::User),
-                "Log in",
-                Btn::Primary,
-                false,
-                !waiting,
-            )
-            .clicked()
-            {
-                let ctx = ui.ctx().clone();
-                self.start_login(&ctx);
-            }
-            if button(ui, None, "Log out", Btn::Ghost, false, acc.signed_in).clicked() {
-                self.confirm_logout = true;
-            }
-            if button(
-                ui,
-                Some(Icon::Sync),
-                "Refresh",
-                Btn::Ghost,
-                false,
-                !checking,
-            )
-            .clicked()
-            {
-                self.last_account_poll = ui.ctx().input(|i| i.time);
-                self.ctrl.refresh_account(false);
-            }
-            if checking {
-                ui.add_space(4.0);
-                ui.spinner();
-                ui.label(
-                    RichText::new(if waiting {
-                        "Waiting for sign-in…"
+        let checking = acc.checking;
+        let name = if acc.account.is_empty() {
+            "No Proton account".to_string()
+        } else {
+            acc.account.clone()
+        };
+        let mut sign_out = false;
+        let mut refresh = false;
+
+        // identity card: avatar, account, status, actions
+        ui.scope(|ui| {
+            ui.set_max_width((ui.available_width() - 15.0).max(200.0));
+            card_frame().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let (ar, _) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::hover());
+                    let initial = acc
+                        .account
+                        .chars()
+                        .next()
+                        .map(|c| c.to_uppercase().to_string())
+                        .unwrap_or_default();
+                    let p = ui.painter();
+                    if acc.signed_in {
+                        p.circle_filled(ar.center(), 24.0, ACCENT);
+                        p.text(
+                            ar.center(),
+                            Align2::CENTER_CENTER,
+                            initial,
+                            FontId::new(20.0, ff_bold()),
+                            TEXT,
+                        );
                     } else {
-                        "Checking…"
-                    })
-                    .color(DIM),
-                );
-            }
+                        p.circle_filled(ar.center(), 24.0, SEL);
+                        draw_icon(p, ar.shrink(13.0), Icon::User, DIM);
+                    }
+                    ui.add_space(12.0);
+                    ui.vertical(|ui| {
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(&name)
+                                .font(FontId::new(16.0, ff_bold()))
+                                .color(if acc.signed_in { TEXT } else { DIM }),
+                        );
+                        ui.add_space(3.0);
+                        ui.horizontal(|ui| {
+                            status_dot_small(ui, col);
+                            ui.label(RichText::new(label).size(12.5).color(DIM));
+                            if checking {
+                                ui.add_space(2.0);
+                                ui.add(egui::Spinner::new().size(12.0).color(DIM));
+                            }
+                        });
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if acc.signed_in
+                            && button(ui, None, "Sign out", Btn::Secondary, true, true).clicked()
+                        {
+                            sign_out = true;
+                        }
+                        if button(ui, Some(Icon::Sync), "Refresh", Btn::Ghost, true, !checking)
+                            .clicked()
+                        {
+                            refresh = true;
+                        }
+                    });
+                });
+
+                if acc.signed_in || acc.keyring_locked {
+                    ui.add_space(14.0);
+                    ui.separator();
+                    ui.add_space(12.0);
+                    let (kcol, kicon, ktext) = if acc.keyring_locked {
+                        (
+                            WARN,
+                            Icon::Info,
+                            "Session saved in the system keyring, which is locked",
+                        )
+                    } else {
+                        (OK, Icon::Check, "Session saved in the system keyring")
+                    };
+                    ui.horizontal(|ui| {
+                        let (ir, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
+                        ui.painter().rect_filled(ir, 6.0, kcol.gamma_multiply(0.16));
+                        draw_icon(ui.painter(), ir.shrink(5.0), kicon, kcol);
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(ktext).size(13.0).color(TEXT));
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Your password went to Proton only. Signing out removes the \
+                             session from this computer; your files stay in Proton Drive.",
+                        )
+                        .size(12.0)
+                        .color(DIM),
+                    );
+                    if !acc.version.is_empty() {
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Helper").size(12.0).color(DIM2));
+                            ui.add_space(6.0);
+                            ui.label(RichText::new(&acc.version).size(12.0).color(DIM));
+                        });
+                    }
+                }
+            });
         });
+
+        if sign_out {
+            self.confirm_logout = true;
+        }
+        if refresh {
+            self.last_account_poll = ui.ctx().input(|i| i.time);
+            self.ctrl.refresh_account(false);
+        }
+
+        if acc.keyring_locked {
+            ui.add_space(16.0);
+            ui.label(
+                RichText::new(
+                    "Your Proton session is still saved. Unlock the system keyring and \
+                     NeutronSync will continue on its own.",
+                )
+                .size(12.5)
+                .color(DIM),
+            );
+        } else if acc.backend_ready && !acc.signed_in {
+            ui.add_space(20.0);
+            self.api_signin_form(ui);
+        }
     }
 
     fn page_about(&mut self, ui: &mut egui::Ui) {
@@ -2373,12 +2252,8 @@ impl App {
         );
         ui.add_space(6.0);
         ui.label(
-            RichText::new(if self.cfg.backend == neutronsync::config::Backend::Api {
-                "Bidirectional Proton Drive folder sync through the Proton Drive SDK."
-            } else {
-                "Bidirectional Proton Drive folder sync through the proton-drive CLI."
-            })
-            .color(DIM),
+            RichText::new("Bidirectional Proton Drive folder sync through the Proton Drive SDK.")
+                .color(DIM),
         );
         ui.add_space(12.0);
         ui.label(
@@ -2407,31 +2282,17 @@ impl App {
                 .color(ACCENT),
         );
         ui.add_space(8.0);
-        if self.cfg.backend == neutronsync::config::Backend::Api {
-            ui.label(
-                RichText::new(
-                    "NeutronSync is an independent, unofficial tool. It talks to Proton Drive \
-                     through neutronsync-drive, a helper built on Proton's official Drive SDK. \
-                     You sign in inside NeutronSync. Your password goes only to Proton. The \
-                     session is kept in your system keyring. Proton's SDK code does all \
-                     encryption and decryption, on this computer.",
-                )
-                .size(12.5)
-                .color(DIM),
-            );
-        } else {
-            ui.label(
-                RichText::new(
-                    "NeutronSync is an independent, unofficial tool with no access to your \
-                     Proton account. It simply drives Proton's official proton-drive CLI, which \
-                     you sign in yourself. Your password and Proton credentials are never seen, \
-                     stored, or sent by NeutronSync — the CLI keeps your session in your OS \
-                     keyring, and all encryption and decryption is done by Proton's own software.",
-                )
-                .size(12.5)
-                .color(DIM),
-            );
-        }
+        ui.label(
+            RichText::new(
+                "NeutronSync is an independent, unofficial tool. It talks to Proton Drive \
+                 through neutronsync-drive, a helper built on Proton's official Drive SDK. \
+                 You sign in inside NeutronSync. Your password goes only to Proton. The \
+                 session is kept in your system keyring. Proton's SDK code does all \
+                 encryption and decryption, on this computer.",
+            )
+            .size(12.5)
+            .color(DIM),
+        );
         ui.add_space(6.0);
         ui.label(
             RichText::new(
@@ -2449,34 +2310,16 @@ impl App {
                 .color(ACCENT),
         );
         ui.add_space(8.0);
-        if self.cfg.backend == neutronsync::config::Backend::Api {
-            ui.label(
-                RichText::new(
-                    "Local folders are watched live, and only the changed folder is reconciled. \
-                     Proton Drive changes arrive through Proton's change feed within seconds, \
-                     and only the affected folders are re-checked. A full walk runs on first \
-                     sync, when Proton asks for a refresh, and once a day as a safety net.",
-                )
-                .size(12.5)
-                .color(DIM),
-            );
-        } else {
-            ui.label(
-                RichText::new(
-                    "Proton's CLI has no \"recently changed\" feed, so NeutronSync watches your \
-                     local folders live and aims the work where the activity is. A local change \
-                     reconciles just the folder that changed (not the whole tree); deeper changes \
-                     arrive as their own events. On startup it syncs folders with fresh local \
-                     changes first, then recently active folders, then everything else. A full \
-                     walk of both sides is the safety net that catches edits made on your other \
-                     devices (the CLI only reveals those by re-walking); it is paced to how long \
-                     a walk takes, so a big tree is not re-walked constantly. Remote-side changes \
-                     therefore appear on the next pass, not instantly.",
-                )
-                .size(12.5)
-                .color(DIM),
-            );
-        }
+        ui.label(
+            RichText::new(
+                "Local folders are watched live, and only the changed folder is reconciled. \
+                 Proton Drive changes arrive through Proton's change feed within seconds, \
+                 and only the affected folders are re-checked. A full walk runs on first \
+                 sync, when Proton asks for a refresh, and once a day as a safety net.",
+            )
+            .size(12.5)
+            .color(DIM),
+        );
 
         ui.add_space(20.0);
         ui.label(
@@ -2666,138 +2509,17 @@ impl App {
     }
 
     fn page_signin(&mut self, ui: &mut egui::Ui, snap: &AppState) {
-        if self.cfg.backend == neutronsync::config::Backend::Api {
-            let ready = snap.account.backend_ready;
-            let locked = snap.account.keyring_locked;
-            let logo = self.logo_tex.clone();
-            let col_w: f32 = 470.0;
-            let est_h = if locked {
-                320.0
-            } else if ready {
-                420.0
-            } else {
-                360.0
-            };
-            ui.add_space(((ui.available_height() - est_h) / 2.0).max(24.0));
-            let side = ((ui.available_width() - col_w) / 2.0).max(0.0);
-            ui.horizontal(|ui| {
-                ui.add_space(side);
-                ui.vertical(|ui| {
-                    ui.set_width(col_w);
-                    ui.vertical_centered(|ui| {
-                        let (lr, _) = ui.allocate_exact_size(vec2(72.0, 72.0), Sense::hover());
-                        draw_logo(ui.painter(), lr, logo.as_ref());
-                        ui.add_space(20.0);
-                        let title = if locked {
-                            "Unlock your keyring"
-                        } else if ready {
-                            "Sign in to Proton Drive"
-                        } else {
-                            "Sign-in service didn't start"
-                        };
-                        ui.label(
-                            RichText::new(title)
-                                .font(FontId::new(24.0, ff_bold()))
-                                .color(TEXT),
-                        );
-                        ui.add_space(10.0);
-                        if locked {
-                            ui.label(
-                                RichText::new(
-                                    "Your Proton session is already saved. The system keyring \
-                                     is locked, so NeutronSync can't read it yet. Unlock the \
-                                     keyring and this screen goes away. You don't need to \
-                                     sign in to Proton again.",
-                                )
-                                .size(13.5)
-                                .color(TEXT),
-                            );
-                        } else if ready {
-                            ui.label(
-                                RichText::new(
-                                    "Your password goes only to Proton; NeutronSync keeps the \
-                                     session in the system keyring.",
-                                )
-                                .size(13.5)
-                                .color(TEXT),
-                            );
-                        }
-                    });
-                    if locked {
-                        ui.add_space(22.0);
-                        ui.vertical_centered(|ui| {
-                            ui.spinner();
-                            ui.add_space(8.0);
-                            ui.label(RichText::new("Waiting for the keyring…").color(DIM));
-                        });
-                    } else if ready {
-                        ui.add_space(20.0);
-                        self.api_signin_form(ui);
-                    } else {
-                        ui.add_space(20.0);
-                        card_frame().show(ui, |ui| {
-                            ui.set_width(col_w - 34.0);
-                            let err = if snap.account.version.is_empty() {
-                                "The sign-in service could not be reached."
-                            } else {
-                                snap.account.version.as_str()
-                            };
-                            ui.label(RichText::new(err).size(12.5).color(DANGER));
-                            ui.add_space(10.0);
-                            ui.label(
-                                RichText::new("Reinstall NeutronSync, or set [cli] sidecar.")
-                                    .size(12.5)
-                                    .color(DIM),
-                            );
-                        });
-                        ui.add_space(22.0);
-                        ui.vertical_centered(|ui| {
-                            if button(
-                                ui,
-                                Some(Icon::Sync),
-                                "Check again",
-                                Btn::Primary,
-                                false,
-                                true,
-                            )
-                            .clicked()
-                            {
-                                self.last_account_poll = ui.ctx().input(|i| i.time);
-                                self.ctrl.refresh_account(false);
-                            }
-                        });
-                    }
-                });
-            });
-            return;
-        }
-        let found = snap.account.backend_ready;
+        let ready = snap.account.backend_ready;
+        let locked = snap.account.keyring_locked;
         let logo = self.logo_tex.clone();
         let col_w: f32 = 470.0;
-
-        // A numbered step row: circled number, then a bold title.
-        let step = |ui: &mut egui::Ui, n: &str, title: &str| {
-            ui.horizontal(|ui| {
-                let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
-                ui.painter().circle_filled(r.center(), 10.0, SEL);
-                ui.painter().text(
-                    r.center(),
-                    Align2::CENTER_CENTER,
-                    n,
-                    FontId::new(11.5, ff_bold()),
-                    ACCENT_HI,
-                );
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(title)
-                        .font(FontId::new(13.5, ff_bold()))
-                        .color(TEXT),
-                );
-            });
+        let est_h = if locked {
+            320.0
+        } else if ready {
+            420.0
+        } else {
+            360.0
         };
-
-        // Center the whole block vertically as one unit.
-        let est_h = if found { 300.0 } else { 470.0 };
         ui.add_space(((ui.available_height() - est_h) / 2.0).max(24.0));
         let side = ((ui.available_width() - col_w) / 2.0).max(0.0);
         ui.horizontal(|ui| {
@@ -2808,10 +2530,12 @@ impl App {
                     let (lr, _) = ui.allocate_exact_size(vec2(72.0, 72.0), Sense::hover());
                     draw_logo(ui.painter(), lr, logo.as_ref());
                     ui.add_space(20.0);
-                    let title = if found {
+                    let title = if locked {
+                        "Unlock your keyring"
+                    } else if ready {
                         "Sign in to Proton Drive"
                     } else {
-                        "Get the proton-drive CLI"
+                        "Sign-in service didn't start"
                     };
                     ui.label(
                         RichText::new(title)
@@ -2819,115 +2543,72 @@ impl App {
                             .color(TEXT),
                     );
                     ui.add_space(10.0);
-                    let sub = if found {
-                        "Signing in opens Proton's own login in your browser and signs in \
-                         the official CLI. NeutronSync never sees your password or \
-                         credentials."
-                    } else {
-                        "NeutronSync drives Proton's official command-line client, which \
-                         isn't installed yet (or isn't on your PATH). Two steps and you're \
-                         syncing:"
-                    };
-                    ui.label(RichText::new(sub).size(13.5).color(TEXT));
+                    if locked {
+                        ui.label(
+                            RichText::new(
+                                "Your Proton session is already saved. The system keyring \
+                                 is locked, so NeutronSync can't read it yet. Unlock the \
+                                 keyring and this screen goes away. You don't need to \
+                                 sign in to Proton again.",
+                            )
+                            .size(13.5)
+                            .color(TEXT),
+                        );
+                    } else if ready {
+                        ui.label(
+                            RichText::new(
+                                "Your password goes only to Proton; NeutronSync keeps the \
+                                 session in the system keyring.",
+                            )
+                            .size(13.5)
+                            .color(TEXT),
+                        );
+                    }
                 });
-
-                if !found {
+                if locked {
+                    ui.add_space(22.0);
+                    ui.vertical_centered(|ui| {
+                        ui.spinner();
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Waiting for the keyring…").color(DIM));
+                    });
+                } else if ready {
+                    ui.add_space(20.0);
+                    self.api_signin_form(ui);
+                } else {
                     ui.add_space(20.0);
                     card_frame().show(ui, |ui| {
                         ui.set_width(col_w - 34.0);
-                        step(ui, "1", "Install the CLI");
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.add_space(28.0);
-                            ui.hyperlink_to(
-                                "proton.me/blog/proton-drive-cli",
-                                "https://proton.me/blog/proton-drive-cli",
-                            );
-                        });
-                        ui.add_space(16.0);
-                        step(ui, "2", "Confirm it works in a terminal");
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.add_space(28.0);
-                            egui::Frame::default()
-                                .fill(NAV_BG)
-                                .corner_radius(6.0)
-                                .inner_margin(egui::Margin::symmetric(10, 6))
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        RichText::new("proton-drive --version")
-                                            .font(FontId::new(12.5, egui::FontFamily::Monospace))
-                                            .color(TEXT),
-                                    );
-                                });
-                            ui.add_space(6.0);
-                            if button(ui, Some(Icon::Copy), "Copy", Btn::Ghost, true, true)
-                                .clicked()
-                            {
-                                ui.ctx().copy_text("proton-drive --version".to_owned());
-                                let ctx = ui.ctx().clone();
-                                self.toast(&ctx, "Command copied", false);
-                            }
-                        });
+                        let err = if snap.account.version.is_empty() {
+                            "The sign-in service could not be reached."
+                        } else {
+                            snap.account.version.as_str()
+                        };
+                        ui.label(RichText::new(err).size(12.5).color(DANGER));
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new("Reinstall NeutronSync, or set [cli] sidecar.")
+                                .size(12.5)
+                                .color(DIM),
+                        );
+                    });
+                    ui.add_space(22.0);
+                    ui.vertical_centered(|ui| {
+                        if button(
+                            ui,
+                            Some(Icon::Sync),
+                            "Check again",
+                            Btn::Primary,
+                            false,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            self.last_account_poll = ui.ctx().input(|i| i.time);
+                            self.ctrl.refresh_account(false);
+                        }
                     });
                 }
-
-                ui.add_space(22.0);
-                let waiting = self.login_poll_until.is_some();
-                ui.vertical_centered(|ui| {
-                    if found {
-                        ui.horizontal(|ui| {
-                            ui.add_space((ui.available_width() - 290.0).max(0.0) / 2.0);
-                            if button(
-                                ui,
-                                Some(Icon::User),
-                                "Sign in with Proton",
-                                Btn::Primary,
-                                false,
-                                !waiting,
-                            )
-                            .clicked()
-                            {
-                                let ctx = ui.ctx().clone();
-                                self.start_login(&ctx);
-                            }
-                            ui.add_space(8.0);
-                            if button(ui, Some(Icon::Sync), "Refresh", Btn::Secondary, false, true)
-                                .clicked()
-                            {
-                                self.last_account_poll = ui.ctx().input(|i| i.time);
-                                self.ctrl.refresh_account(false);
-                            }
-                        });
-                    } else if button(
-                        ui,
-                        Some(Icon::Sync),
-                        "Check again",
-                        Btn::Primary,
-                        false,
-                        true,
-                    )
-                    .clicked()
-                    {
-                        self.last_account_poll = ui.ctx().input(|i| i.time);
-                        self.ctrl.refresh_account(false);
-                    }
-                    if waiting {
-                        ui.add_space(14.0);
-                        ui.horizontal(|ui| {
-                            ui.add_space((ui.available_width() - 150.0).max(0.0) / 2.0);
-                            ui.spinner();
-                            ui.label(RichText::new("Waiting for sign-in…").color(DIM));
-                        });
-                    }
-                    ui.add_space(14.0);
-                    let caption = if found {
-                        snap.account.version.clone()
-                    } else {
-                        format!("Checked for \"{}\" on your PATH.", self.cfg.binary)
-                    };
-                    ui.label(RichText::new(caption).size(11.5).color(DIM2));
-                });
             });
         });
     }
@@ -3107,29 +2788,6 @@ impl App {
         }
     }
 
-    fn launch_login(&self) {
-        let bin = self.cfg.binary.clone();
-        thread::spawn(move || {
-            let mut cmd = std::process::Command::new(&bin);
-            cmd.args(["auth", "login"]);
-            inherit_session_env(&mut cmd);
-            let _ = cmd.status();
-        });
-    }
-
-    fn start_login(&mut self, ctx: &egui::Context) {
-        self.launch_login();
-        let now = ctx.input(|i| i.time);
-        self.login_poll_until = Some(now + 180.0);
-        self.last_account_poll = now;
-        self.ctrl.refresh_account(false);
-        self.toast(
-            ctx,
-            "Login opened in your browser — the app updates once you're signed in.",
-            false,
-        );
-    }
-
     fn logout_dialog(&mut self, ctx: &egui::Context) {
         if !self.confirm_logout {
             return;
@@ -3157,13 +2815,9 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if button(ui, None, "Log out", Btn::Danger, false, true).clicked() {
-                            let result = if self.cfg.backend == neutronsync::config::Backend::Api {
-                                neutronsync::driveapi::DriveApi::new(&self.cfg)
-                                    .and_then(|api| api.auth("auth.logout", serde_json::json!({})))
-                                    .map(|_| ())
-                            } else {
-                                ProtonCli::new(&self.cfg).logout()
-                            };
+                            let result = neutronsync::driveapi::DriveApi::new(&self.cfg)
+                                .and_then(|api| api.auth("auth.logout", serde_json::json!({})))
+                                .map(|_| ());
                             self.ctrl.refresh_account(false);
                             self.confirm_logout = false;
                             match result {
@@ -4061,23 +3715,7 @@ fn combo_full_walk(ui: &mut egui::Ui, v: &mut u64) -> bool {
 // -- starter config ----------------------------------------------------------
 fn starter_config(path: &PathBuf) -> Config {
     Config {
-        backend: neutronsync::config::Backend::Api,
         sidecar: None,
-        binary: "proton-drive".into(),
-        upload_flags: vec![
-            "--file-conflict-strategy".into(),
-            "replace".into(),
-            "--folder-conflict-strategy".into(),
-            "replace".into(),
-        ],
-        download_flags: vec![
-            "--file-conflict-strategy".into(),
-            "remove".into(),
-            "--folder-conflict-strategy".into(),
-            "remove".into(),
-        ],
-        credentials_store: None,
-        fresh_cache: true,
         scan_threads: 0,
         download_threads: 0,
         remote_root: config::DEFAULT_REMOTE_ROOT.into(),
@@ -4088,7 +3726,6 @@ fn starter_config(path: &PathBuf) -> Config {
         local_delete: LocalDelete::Trash,
         conflict: ConflictPolicy::KeepBoth,
         compare: Compare::SizeMtime,
-        poll_interval_secs: 900,
         full_walk_interval: 86400,
         scan_interval_secs: 120,
         debounce_secs: 2,
@@ -4752,7 +4389,6 @@ impl App {
             update: std::sync::Arc::new(std::sync::Mutex::new(UpdateState::Idle)),
             confirm_logout: false,
             confirm_reset: false,
-            login_poll_until: None,
             last_account_poll: 0.0,
             api_signin: ApiSignIn::default(),
             browser_open: false,

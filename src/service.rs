@@ -19,7 +19,6 @@ use crate::datefmt::now_epoch;
 use crate::engine::run_sync_with;
 use crate::events::{EventSink, SyncEvent};
 use crate::logger::Logger;
-use crate::protoncli::{ProtonCli, Remote};
 use crate::stats::Stats;
 use crate::watcher;
 
@@ -625,7 +624,7 @@ impl Controller {
         s.watching = false;
     }
 
-    /// Refresh the account panel (binary present? logged in? version) on a
+    /// Refresh the account panel (sidecar reachable? signed in? which helper) on a
     /// background thread. When `signal_watch` is true and the probe confirms a
     /// session, nudge the tray daemon's watcher to resume immediately.
     pub fn refresh_account(&self, signal_watch: bool) {
@@ -633,71 +632,34 @@ impl Controller {
         let state = self.state.clone();
         state.lock().unwrap().account.checking = true;
         thread::spawn(move || {
-            if cfg.backend == crate::config::Backend::Api {
-                let result = crate::driveapi::DriveApi::new(&cfg).and_then(|api| api.status());
-                let (usable, signed_in, keyring_locked, account, version) = match result {
-                    Ok(status) => (
-                        true,
-                        status["signed_in"] == true,
-                        status["keyring_locked"] == true,
-                        status["account"].as_str().unwrap_or("").to_string(),
-                        crate::driveapi::resolve_sidecar(&cfg)
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "neutronsync-drive".into()),
-                    ),
-                    Err(error) => (false, false, false, String::new(), error.to_string()),
-                };
-                let mut s = state.lock().unwrap();
-                s.account = AccountState {
-                    checked: true,
-                    backend_ready: usable,
-                    signed_in,
-                    keyring_locked,
-                    account,
-                    version,
-                    checking: false,
-                };
-                if usable {
-                    // A locked keyring is not a sign-out. Sync waits; the session stays put.
-                    s.signed_out = !signed_in && !keyring_locked;
-                }
-                drop(s);
-                if signal_watch && signed_in {
-                    crate::auth_signal::signal(&cfg.state_dir);
-                }
-                return;
-            }
-            let proton = ProtonCli::new(&cfg);
-            let signed_in = proton.list_dir(&cfg.remote_root).is_ok();
-            let account = match proton.resolve_binary() {
-                Some(p) => AccountState {
-                    checked: true,
-                    backend_ready: true,
-                    signed_in,
-                    keyring_locked: false,
-                    account: String::new(),
-                    version: format!("{} ({})", proton.version(), p.display()),
-                    checking: false,
-                },
-                None => AccountState {
-                    checked: true,
-                    backend_ready: false,
-                    signed_in: false,
-                    keyring_locked: false,
-                    account: String::new(),
-                    version: "proton-drive NOT FOUND on PATH".into(),
-                    checking: false,
-                },
+            let result = crate::driveapi::DriveApi::new(&cfg).and_then(|api| api.status());
+            let (usable, signed_in, keyring_locked, account, version) = match result {
+                Ok(status) => (
+                    true,
+                    status["signed_in"] == true,
+                    status["keyring_locked"] == true,
+                    status["account"].as_str().unwrap_or("").to_string(),
+                    crate::driveapi::resolve_sidecar(&cfg)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "neutronsync-drive".into()),
+                ),
+                Err(error) => (false, false, false, String::new(), error.to_string()),
             };
-            {
-                let mut s = state.lock().unwrap();
-                s.account = account;
-                if signed_in {
-                    s.signed_out = false;
-                } else if s.account.backend_ready {
-                    s.signed_out = true;
-                }
+            let mut s = state.lock().unwrap();
+            s.account = AccountState {
+                checked: true,
+                backend_ready: usable,
+                signed_in,
+                keyring_locked,
+                account,
+                version,
+                checking: false,
+            };
+            if usable {
+                // A locked keyring is not a sign-out. Sync waits; the session stays put.
+                s.signed_out = !signed_in && !keyring_locked;
             }
+            drop(s);
             if signal_watch && signed_in {
                 crate::auth_signal::signal(&cfg.state_dir);
             }

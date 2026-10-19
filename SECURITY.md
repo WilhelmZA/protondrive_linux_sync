@@ -2,7 +2,7 @@
 
 ## Session ownership and credentials
 
-The `neutronsync-drive` sidecar owns the Proton API session. It stores the account identifier, session UID, access token, refresh token, derived key passphrase and expiry in Secret Service. The item label is `NeutronSync Drive session`; its attributes are `application=neutronsync-drive` and `purpose=session-v1`. The old phase-labelled item migrates only after a successful write and verified readback. The CLI backend uses its own separate session.
+The `neutronsync-drive` sidecar owns the Proton API session. It stores the account identifier, session UID, access token, refresh token, derived key passphrase and expiry in Secret Service. The item label is `NeutronSync Drive session`; its attributes are `application=neutronsync-drive` and `purpose=session-v1`. The old phase-labelled item migrates only after a successful write and verified readback.
 
 One sidecar serves the user session and performs token refresh. A shared in-flight refresh prevents parallel API requests from rotating the same refresh token independently. The session-wide socket and advisory lock extend that ownership across GUI, tray, CLI and watch processes. This prevents competing refreshers from invalidating each other's session.
 

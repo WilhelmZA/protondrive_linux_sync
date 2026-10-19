@@ -6,12 +6,12 @@ use std::process::Command;
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
-use neutronsync::config::{self, Backend, Config};
+use neutronsync::config::{self, Config};
 use neutronsync::driveapi::DriveApi;
 use neutronsync::engine::Engine;
 use neutronsync::logger::Logger;
 use neutronsync::models::Entry;
-use neutronsync::protoncli::{is_not_logged_in, ListOutcome, Remote};
+use neutronsync::remote::{is_not_logged_in, ListOutcome, Remote};
 use neutronsync::stats::Stats;
 
 // The guard remains available to future read-only transports.
@@ -57,7 +57,6 @@ fn config_at(root: &Path) -> Config {
 [cli]
 backend = "api"
 sidecar = {:?}
-binary = "/does/not/exist/proton-drive"
 scan_threads = 3
 [options]
 state_dir = {:?}
@@ -311,20 +310,11 @@ fn scripted_sidecar_contract_and_read_only_guard() {
             "state bytes: worker count {workers}"
         );
     }
-    let mut cli_config = cfg.clone();
-    cli_config.backend = Backend::Cli;
-    fs::write(
-        cfg.source_path.as_ref().unwrap(),
-        config::to_toml(&cli_config).unwrap(),
-    )
-    .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_neutronsync"))
         .args([
             "--config",
             cfg.source_path.as_ref().unwrap().to_str().unwrap(),
             "sync",
-            "--backend",
-            "api",
             "--json",
             "--dry-run",
         ])
@@ -338,23 +328,6 @@ fn scripted_sidecar_contract_and_read_only_guard() {
     assert!(!String::from_utf8_lossy(&output.stderr).contains("forcing a dry run"));
     assert!(String::from_utf8_lossy(&output.stdout).contains("\"dry_run\": true"));
     assert_eq!(snapshot(&pair.local), before_local, "cmd_sync local bytes");
-    fs::write(
-        cfg.source_path.as_ref().unwrap(),
-        config::to_toml(&cfg).unwrap(),
-    )
-    .unwrap();
-    let cli_override = Command::new(env!("CARGO_BIN_EXE_neutronsync"))
-        .args([
-            "--config",
-            cfg.source_path.as_ref().unwrap().to_str().unwrap(),
-            "sync",
-            "--backend",
-            "cli",
-        ])
-        .output()
-        .unwrap();
-    assert!(!cli_override.status.success());
-    assert!(String::from_utf8_lossy(&cli_override.stderr).contains("cli.binary"));
 
     // Missing state and legacy JSON must not trigger database creation/import.
     let mut fresh = cfg.clone();
@@ -441,7 +414,6 @@ fn status_reports_missing_sidecar_repairs_and_remaining_config() {
         "neutronsync-drive",
         "Install the NeutronSync package",
         "build sidecar/",
-        "backend = \"cli\"",
         "state dir",
         "pairs:",
     ] {
@@ -450,53 +422,50 @@ fn status_reports_missing_sidecar_repairs_and_remaining_config() {
 }
 
 #[test]
-fn default_config_selects_api_and_explicit_cli_survives_settings_write() {
-    assert_eq!(Backend::default(), Backend::Api);
+fn cli_backend_is_refused_and_its_keys_are_ignored() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("config.toml");
     fs::write(&path, "").unwrap();
-    assert_eq!(config::load(path.to_str()).unwrap().backend, Backend::Api);
-    fs::write(&path, "[cli]\nbackend = 'cli'\n").unwrap();
+    assert!(config::load(path.to_str()).is_ok());
+    // Keys the removed backend used still load; they just do nothing.
+    fs::write(
+        &path,
+        "[cli]\nbackend = 'api'\nbinary = 'proton-drive'\nfresh_cache = true\n",
+    )
+    .unwrap();
     let cfg = config::load(path.to_str()).unwrap();
-    fs::write(&path, config::to_toml(&cfg).unwrap()).unwrap();
-    assert_eq!(config::load(path.to_str()).unwrap().backend, Backend::Cli);
-}
-
-#[test]
-fn backend_config_roundtrip_and_argument_validation() {
-    let temp = tempfile::tempdir().unwrap();
-    let mut cfg = config_at(temp.path());
-    let path = cfg.source_path.clone().unwrap();
-    for backend in [Backend::Cli, Backend::Api] {
-        cfg.backend = backend;
-        fs::write(&path, config::to_toml(&cfg).unwrap()).unwrap();
-        let loaded = config::load(path.to_str()).unwrap();
-        assert_eq!(loaded.backend, backend);
-        assert_eq!(loaded.sidecar, cfg.sidecar);
-    }
+    let written = config::to_toml(&cfg).unwrap();
+    assert!(!written.contains("binary"), "{written}");
+    assert!(!written.contains("backend"), "{written}");
+    // An explicit CLI selection fails loudly instead of silently switching.
+    fs::write(&path, "[cli]\nbackend = 'cli'\n").unwrap();
+    let err = config::load(path.to_str()).unwrap_err().to_string();
+    assert!(err.contains("removed in 0.6.0"), "{err}");
     fs::write(&path, "[cli]\nbackend = 'invalid'\n").unwrap();
     assert!(config::load(path.to_str())
         .unwrap_err()
         .to_string()
         .contains("cli.backend"));
-    fs::write(&path, "").unwrap();
-    assert_eq!(config::load(path.to_str()).unwrap().backend, Backend::Api);
+}
+
+#[test]
+fn sidecar_config_roundtrip_and_missing_sidecar_is_named() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut cfg = config_at(temp.path());
+    let path = cfg.source_path.clone().unwrap();
+    fs::write(&path, config::to_toml(&cfg).unwrap()).unwrap();
+    let loaded = config::load(path.to_str()).unwrap();
+    assert_eq!(loaded.sidecar, cfg.sidecar);
     let output = Command::new(env!("CARGO_BIN_EXE_neutronsync"))
-        .args(["sync", "--backend", "invalid"])
+        .args(["sync", "--backend", "cli"])
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid value"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
     cfg.sidecar = Some(temp.path().join("missing"));
     assert!(neutronsync::backend::select(&cfg)
         .err()
         .unwrap()
         .to_string()
         .contains("cli.sidecar"));
-    cfg.backend = Backend::Cli;
-    assert!(neutronsync::backend::select(&cfg)
-        .err()
-        .unwrap()
-        .to_string()
-        .contains("cli.binary"));
 }

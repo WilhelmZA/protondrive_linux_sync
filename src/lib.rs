@@ -1,11 +1,12 @@
 //! neutronsync core library.
 //!
-//! Bidirectional folder sync for Proton Drive built on Proton's official
-//! `proton-drive` CLI. The CLI has no sync engine of its own; this crate adds
-//! the three-way-merge engine on top of its one-shot primitives.
+//! Bidirectional folder sync for Proton Drive through the `neutronsync-drive`
+//! sidecar, a helper built on Proton's official Drive SDK. The sidecar offers
+//! one-shot primitives and a change feed; this crate adds the three-way-merge
+//! engine and the watch daemon on top.
 //!
-//! The library is deliberately separate from the CLI binary so a future GUI can
-//! depend on the same core (config, engine, adapter, state).
+//! The library is separate from the binaries so the CLI and the GUI share one
+//! core (config, engine, backend, state).
 
 pub mod auth_signal;
 pub mod backend;
@@ -19,7 +20,7 @@ pub mod ignore;
 pub mod logger;
 pub mod models;
 pub mod process_lock;
-pub mod protoncli;
+pub mod remote;
 pub mod service;
 pub mod state;
 pub mod stats;
@@ -34,27 +35,13 @@ pub mod watcher;
 pub const EXAMPLE_CONFIG: &str = r#"# neutronsync configuration. See README.md.
 
 [cli]
-# Backend defaults to "cli"; "api" is read-only until Phase 2.
-# backend = "cli"
 # Optional sidecar path; default: next to neutronsync, then on PATH.
 # sidecar = "/path/to/neutronsync-drive"
-# Path to the official proton-drive binary. Leave as-is to find it on $PATH.
-binary = "proton-drive"
-# Both upload and download prompt interactively without a conflict strategy,
-# which would hang a scheduled run - so we always pass one. cli-drive ≥ 0.8.0
-# splits file and folder strategies; upload overwrites with replace, download
-# with remove (the 0.8 name for the same overwrite).
-upload_flags = ["--file-conflict-strategy", "replace", "--folder-conflict-strategy", "replace"]
-download_flags = ["--file-conflict-strategy", "remove", "--folder-conflict-strategy", "remove"]
-# The CLI caches directory metadata and serves it stale; a throwaway cache per
-# run keeps listings honest. Set false to reuse the CLI's cache (faster, risky).
-fresh_cache = true
-# The CLI has no recursive listing, so the remote tree is walked one folder per
-# process. This many run concurrently (0 = auto from CPU count, capped at 8).
-# Higher is faster but Proton rate-limits; back off if you see errors.
+# Concurrent folder reconciles during a full walk (0 = auto from CPU count,
+# capped at 8). Higher is faster but Proton rate-limits; back off on errors.
 # scan_threads = 8
-# Optional: where the CLI stores your session ("keychain", "pass", "unsafe_file").
-# credentials_store = "keychain"
+# Concurrent file downloads (0 = auto, 4).
+# download_threads = 4
 
 [options]
 # Proton's per-user root. Remote paths in [[pair]] resolve under this unless
@@ -79,10 +66,10 @@ conflict = "keep-both"
 # How to detect a changed file: "size", "size+mtime", or "sha1".
 compare = "size+mtime"
 
-# Watch mode (`neutronsync watch`): seconds between periodic full rescans (the
-# safety net, and the only way remote-side changes are noticed), and the
-# debounce window that lets a burst of local file events settle.
-poll_interval = 300
+# Watch mode (`neutronsync watch`): seconds between safety-net full walks of
+# every folder (default one day), and the debounce window that lets a burst of
+# local file events settle.
+# full_walk_interval = 86400
 debounce = 2
 
 # In-app updater (GUI): which release channel to follow, and whether to check

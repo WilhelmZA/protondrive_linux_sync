@@ -13,14 +13,6 @@ use crate::models::Compare;
 
 pub const DEFAULT_REMOTE_ROOT: &str = "/my-files";
 
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, clap::ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub enum Backend {
-    Cli,
-    #[default]
-    Api,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LocalDelete {
     Trash,
@@ -59,13 +51,8 @@ pub struct Pair {
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub backend: Backend,
     pub sidecar: Option<PathBuf>,
-    pub binary: String,
-    pub upload_flags: Vec<String>,
-    pub download_flags: Vec<String>,
-    pub credentials_store: Option<String>,
-    pub fresh_cache: bool,
+    /// Concurrent folder reconciles during a full walk (0 = auto).
     pub scan_threads: usize,
     /// Concurrent file downloads during a sync (0 = auto). Bandwidth-bound, so
     /// the auto default is modest.
@@ -82,8 +69,7 @@ pub struct Config {
     pub local_delete: LocalDelete,
     pub conflict: ConflictPolicy,
     pub compare: Compare,
-    /// watch mode: seconds between periodic full rescans (the safety net).
-    pub poll_interval_secs: u64,
+    /// watch mode: seconds between safety-net full walks.
     pub full_walk_interval: u64,
     /// watch mode: seconds between short scans of "hot" (recently active) pairs.
     pub scan_interval_secs: u64,
@@ -143,13 +129,10 @@ struct RawConfig {
 
 #[derive(Deserialize, Default)]
 struct RawCli {
+    /// Only ever "api" now. The removed CLI backend is refused with a clear
+    /// message rather than silently switched.
     backend: Option<String>,
     sidecar: Option<String>,
-    binary: Option<String>,
-    upload_flags: Option<Vec<String>>,
-    download_flags: Option<Vec<String>>,
-    credentials_store: Option<String>,
-    fresh_cache: Option<bool>,
     scan_threads: Option<u64>,
     download_threads: Option<u64>,
 }
@@ -162,7 +145,6 @@ struct RawOptions {
     conflict: Option<String>,
     compare: Option<String>,
     state_dir: Option<String>,
-    poll_interval: Option<u64>,
     full_walk_interval: Option<u64>,
     scan_interval: Option<u64>,
     debounce: Option<u64>,
@@ -308,11 +290,14 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
 
     let cli = raw.cli.unwrap_or_default();
     let opts = raw.options.unwrap_or_default();
-    let backend = match cli.backend.as_deref().unwrap_or("api") {
-        "cli" => Backend::Cli,
-        "api" => Backend::Api,
-        other => bail!("cli.backend must be cli|api, got {other:?}"),
-    };
+    match cli.backend.as_deref().unwrap_or("api") {
+        "api" => {}
+        "cli" => bail!(
+            "cli.backend = \"cli\": the proton-drive backend was removed in 0.6.0. \
+             Remove `backend` from [cli]; NeutronSync syncs through neutronsync-drive."
+        ),
+        other => bail!("cli.backend must be api, got {other:?}"),
+    }
 
     let remote_root = {
         let r = opts
@@ -342,17 +327,6 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         "size+mtime" => Compare::SizeMtime,
         "sha1" => Compare::Sha1,
         other => bail!("options.compare must be size|size+mtime|sha1, got {other:?}"),
-    };
-
-    // The credential store is exported into the child CLI's environment, so it
-    // must be one of the values the CLI actually supports — never an arbitrary
-    // string from the config.
-    let credentials_store = match cli.credentials_store.as_deref() {
-        None => None,
-        Some(s @ ("keychain" | "pass" | "unsafe_file")) => Some(s.to_string()),
-        Some(other) => {
-            bail!("cli.credentials_store must be keychain|pass|unsafe_file, got {other:?}")
-        }
     };
 
     let update_channel = match opts.update_channel.as_deref().unwrap_or("stable") {
@@ -389,19 +363,7 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
     }
 
     Ok(Config {
-        backend,
         sidecar: cli.sidecar.map(|p| expand(&p)),
-        binary: cli.binary.unwrap_or_else(|| "proton-drive".to_string()),
-        upload_flags: migrate_transfer_flags(
-            cli.upload_flags.unwrap_or_else(default_upload_flags),
-            TransferKind::Upload,
-        ),
-        download_flags: migrate_transfer_flags(
-            cli.download_flags.unwrap_or_else(default_download_flags),
-            TransferKind::Download,
-        ),
-        credentials_store,
-        fresh_cache: cli.fresh_cache.unwrap_or(true),
         scan_threads: cli.scan_threads.map(|n| n as usize).unwrap_or(0),
         download_threads: cli.download_threads.map(|n| n as usize).unwrap_or(0),
         remote_root,
@@ -412,7 +374,6 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         local_delete,
         conflict,
         compare,
-        poll_interval_secs: opts.poll_interval.unwrap_or(900),
         full_walk_interval: opts.full_walk_interval.unwrap_or(86400),
         scan_interval_secs: opts.scan_interval.unwrap_or(120),
         debounce_secs: opts.debounce.unwrap_or(2),
@@ -422,92 +383,6 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         pairs,
         source_path: Some(path),
     })
-}
-
-/// Defaults for cli-drive ≥ 0.8.0: separate file/folder strategies. Upload
-/// `replace` trashes the remote and writes the local copy; download uses
-/// `remove` (the 0.8 name for the same overwrite behaviour — `replace` is gone).
-fn default_upload_flags() -> Vec<String> {
-    vec![
-        "--file-conflict-strategy".into(),
-        "replace".into(),
-        "--folder-conflict-strategy".into(),
-        "replace".into(),
-    ]
-}
-
-fn default_download_flags() -> Vec<String> {
-    vec![
-        "--file-conflict-strategy".into(),
-        "remove".into(),
-        "--folder-conflict-strategy".into(),
-        "remove".into(),
-    ]
-}
-
-enum TransferKind {
-    Upload,
-    Download,
-}
-
-/// Rewrite pre-0.8 `--conflict-strategy` / `-c` flags into the split
-/// `--file-conflict-strategy` / `--folder-conflict-strategy` form. Configs that
-/// already use the new flags (or omit the legacy ones) are left alone.
-fn migrate_transfer_flags(flags: Vec<String>, kind: TransferKind) -> Vec<String> {
-    let mut out = Vec::with_capacity(flags.len().max(4));
-    let mut legacy: Option<String> = None;
-    let mut i = 0;
-    while i < flags.len() {
-        let f = &flags[i];
-        if f == "--conflict-strategy" || f == "-c" {
-            if let Some(v) = flags.get(i + 1) {
-                legacy = Some(v.clone());
-                i += 2;
-                continue;
-            }
-        }
-        out.push(f.clone());
-        i += 1;
-    }
-    let Some(old) = legacy else {
-        return if out.is_empty() {
-            match kind {
-                TransferKind::Upload => default_upload_flags(),
-                TransferKind::Download => default_download_flags(),
-            }
-        } else {
-            out
-        };
-    };
-    // Already has explicit -f/-d: drop the obsolete -c only.
-    let has_split = out.iter().any(|f| {
-        f == "--file-conflict-strategy"
-            || f == "-f"
-            || f == "--folder-conflict-strategy"
-            || f == "-d"
-    });
-    if has_split {
-        return out;
-    }
-    let (file, folder) = match (&kind, old.as_str()) {
-        (TransferKind::Upload, "replace") => ("replace", "replace"),
-        (TransferKind::Upload, "keep-both") => ("rename", "rename"),
-        (TransferKind::Upload, "skip") => ("skip", "skip"),
-        (TransferKind::Upload, "merge") => ("create-new-revision", "merge"),
-        (TransferKind::Download, "replace") => ("remove", "remove"),
-        (TransferKind::Download, "keep-both") => ("rename", "rename"),
-        (TransferKind::Download, "skip") => ("skip", "skip"),
-        (TransferKind::Download, "merge") => ("rename", "merge"),
-        (TransferKind::Upload, _) => ("replace", "replace"),
-        (TransferKind::Download, _) => ("remove", "remove"),
-    };
-    out.extend([
-        "--file-conflict-strategy".into(),
-        file.into(),
-        "--folder-conflict-strategy".into(),
-        folder.into(),
-    ]);
-    out
 }
 
 /// Path helper used by the engine to build absolute remote paths.
@@ -530,17 +405,10 @@ pub fn strip_root<'a>(root: &str, p: &'a str) -> Option<&'a str> {
 // --- writing (used by the GUI) ---------------------------------------------
 #[derive(Serialize)]
 struct OutCli {
-    backend: Backend,
     #[serde(skip_serializing_if = "Option::is_none")]
     sidecar: Option<PathBuf>,
-    binary: String,
-    upload_flags: Vec<String>,
-    download_flags: Vec<String>,
-    fresh_cache: bool,
     scan_threads: usize,
     download_threads: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    credentials_store: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -553,7 +421,6 @@ struct OutOptions {
     local_delete: String,
     conflict: String,
     compare: String,
-    poll_interval: u64,
     full_walk_interval: u64,
     scan_interval: u64,
     debounce: u64,
@@ -613,15 +480,9 @@ fn update_channel_str(v: UpdateChannel) -> &'static str {
 pub fn to_toml(cfg: &Config) -> Result<String> {
     let out = OutConfig {
         cli: OutCli {
-            backend: cfg.backend,
             sidecar: cfg.sidecar.clone(),
-            binary: cfg.binary.clone(),
-            upload_flags: cfg.upload_flags.clone(),
-            download_flags: cfg.download_flags.clone(),
-            fresh_cache: cfg.fresh_cache,
             scan_threads: cfg.scan_threads,
             download_threads: cfg.download_threads,
-            credentials_store: cfg.credentials_store.clone(),
         },
         options: OutOptions {
             remote_root: cfg.remote_root.clone(),
@@ -632,7 +493,6 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
             local_delete: local_delete_str(cfg.local_delete).to_string(),
             conflict: conflict_str(cfg.conflict).to_string(),
             compare: compare_str(cfg.compare).to_string(),
-            poll_interval: cfg.poll_interval_secs,
             full_walk_interval: cfg.full_walk_interval,
             scan_interval: cfg.scan_interval_secs,
             debounce: cfg.debounce_secs,
@@ -669,7 +529,7 @@ pub fn save(cfg: &Config, path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load, migrate_transfer_flags, save, TransferKind};
+    use super::{load, save};
     use std::fs;
     use tempfile::TempDir;
 
@@ -715,51 +575,5 @@ remote = "Documents"
         )
         .unwrap();
         assert_eq!(load(path.to_str()).unwrap().full_walk_interval, 86400);
-    }
-
-    #[test]
-    fn migrates_legacy_conflict_strategy_upload() {
-        let got = migrate_transfer_flags(
-            vec!["--conflict-strategy".into(), "replace".into()],
-            TransferKind::Upload,
-        );
-        assert_eq!(
-            got,
-            vec![
-                "--file-conflict-strategy",
-                "replace",
-                "--folder-conflict-strategy",
-                "replace",
-            ]
-        );
-    }
-
-    #[test]
-    fn migrates_legacy_conflict_strategy_download() {
-        let got =
-            migrate_transfer_flags(vec!["-c".into(), "replace".into()], TransferKind::Download);
-        assert_eq!(
-            got,
-            vec![
-                "--file-conflict-strategy",
-                "remove",
-                "--folder-conflict-strategy",
-                "remove",
-            ]
-        );
-    }
-
-    #[test]
-    fn leaves_split_flags_alone() {
-        let flags = vec![
-            "--file-conflict-strategy".into(),
-            "replace".into(),
-            "--folder-conflict-strategy".into(),
-            "merge".into(),
-        ];
-        assert_eq!(
-            migrate_transfer_flags(flags.clone(), TransferKind::Upload),
-            flags
-        );
     }
 }

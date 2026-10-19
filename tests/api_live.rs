@@ -4,7 +4,7 @@ use std::path::Path;
 
 use neutronsync::config;
 use neutronsync::driveapi::DriveApi;
-use neutronsync::protoncli::Remote;
+use neutronsync::remote::Remote;
 
 #[test]
 #[ignore = "requires the signed-in sidecar and explicit scratch paths"]

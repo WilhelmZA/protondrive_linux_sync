@@ -370,10 +370,8 @@ pub(super) fn watch(
             next_full = now_epoch() + cfg.full_walk_interval as i64;
             refresh_failed = !walk_ok;
         }
-        while let Ok(msg) = rx.try_recv() {
-            if let Msg::Sub { pair, sub } = msg {
-                pending.insert((pair, sub));
-            }
+        while let Ok(Msg::Sub { pair, sub }) = rx.try_recv() {
+            pending.insert((pair, sub));
         }
         if now_epoch() >= next_hot {
             for (i, pair) in pairs.iter().enumerate() {

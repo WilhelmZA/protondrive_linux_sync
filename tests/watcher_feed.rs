@@ -32,7 +32,6 @@ impl Harness {
 [cli]
 backend = "api"
 sidecar = {sidecar:?}
-binary = "/no-cli-may-run"
 [options]
 state_dir = {:?}
 log_dir = {:?}
@@ -84,16 +83,6 @@ remote = "/my-files/test"
     }
     fn event(&self, kind: &str, parent: &str) {
         self.write("feed.json", json!([{"last_event_id":"1","events":[{"type":kind,"node_uid":"file","parent_uid":parent}]}]));
-    }
-    fn record_cli_calls(&self) {
-        let cli = self.dir.path().join("cli");
-        fs::write(&cli, "#!/usr/bin/env python3\nimport json, sys\nfrom pathlib import Path\nwith Path(__file__).with_name('cli-calls').open('a') as out:\n    out.write(json.dumps(sys.argv[1:]) + '\\n')\nprint('[]')\n").unwrap();
-        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
-        let path = self.dir.path().join("config.toml");
-        let config = fs::read_to_string(&path)
-            .unwrap()
-            .replace("\"/no-cli-may-run\"", &format!("{cli:?}"));
-        fs::write(path, config).unwrap();
     }
     fn start(&mut self) {
         let log = fs::OpenOptions::new()
@@ -305,9 +294,8 @@ fn crash_between_apply_and_save_replays_without_transfer_or_baseline_change() {
     assert_eq!(h.walks(), 1);
 }
 #[test]
-fn signed_out_pauses_and_auth_status_resumes_without_cli() {
+fn signed_out_pauses_and_auth_status_resumes() {
     let mut h = Harness::new();
-    h.record_cli_calls();
     h.ready();
     h.write("controls.json", json!({"signed_in":false}));
     h.write(
@@ -326,36 +314,7 @@ fn signed_out_pauses_and_auth_status_resumes_without_cli() {
     assert_eq!(h.walks(), 1);
     assert!(h.log().contains("signed back in"));
     h.stop();
-    assert!(
-        h.records("cli-calls").is_empty(),
-        "API watch invoked the CLI"
-    );
 }
-#[test]
-fn cli_has_no_feed_and_keeps_adaptive_pacing() {
-    use neutronsync::protoncli::{ProtonCli, Remote};
-    let mut h = Harness::new();
-    assert!(ProtonCli::new(&h.cfg).change_feed().is_none());
-    h.record_cli_calls();
-    let path = h.dir.path().join("config.toml");
-    let config = fs::read_to_string(&path)
-        .unwrap()
-        .replace("backend = \"api\"", "backend = \"cli\"")
-        .replace("full_walk_interval = 86400", "full_walk_interval = 1");
-    fs::write(path, config).unwrap();
-    h.start();
-    h.wait(|| h.log().contains("next full walk in ~900s"));
-    std::thread::sleep(Duration::from_secs(2));
-    h.stop();
-    assert_eq!(h.log().matches("watch: full walk done").count(), 1);
-    assert!(h.records("starts").is_empty());
-    assert!(h.records("calls").is_empty());
-    assert!(
-        !h.records("cli-calls").is_empty(),
-        "CLI recorder did not run"
-    );
-}
-
 fn folder_departure(destination: Option<(&str, &str)>, parent: &str) {
     let mut h = Harness::new();
     let path = h.dir.path().join("config.toml");

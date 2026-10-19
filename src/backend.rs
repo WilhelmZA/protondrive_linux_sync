@@ -1,28 +1,16 @@
 //! Backend construction shared by all sync entry points.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 
-use crate::config::{Backend, Config};
+use crate::config::Config;
 use crate::driveapi::DriveApi;
 use crate::logger::Logger;
 use crate::models::{DownloadJob, Entry, TreeScan, Uploaded};
-use crate::protoncli::{ListOutcome, ProtonCli, Remote};
+use crate::remote::{ListOutcome, Remote};
 use std::sync::atomic::AtomicBool;
 
 pub fn select(cfg: &Config) -> Result<Box<dyn Remote + Send + Sync>> {
-    match cfg.backend {
-        Backend::Api => Ok(Box::new(DriveApi::new(cfg)?)),
-        Backend::Cli => {
-            let remote = ProtonCli::new(cfg);
-            if remote.resolve_binary().is_none() {
-                bail!(
-                    "proton-drive not found (configured: {:?}). Install it or set cli.binary.",
-                    cfg.binary
-                );
-            }
-            Ok(Box::new(remote))
-        }
-    }
+    Ok(Box::new(DriveApi::new(cfg)?))
 }
 
 /// List a remote folder through the configured backend. Used by the GUI browser and folder picker.
@@ -39,7 +27,7 @@ pub fn effective_dry_run(remote: &dyn Remote, requested: bool, log: &Logger) -> 
     requested || remote.read_only()
 }
 
-// Forward every method, including the CLI's optimised tree scan and transfers.
+// Forward every method, including the backend's own tree scan and transfers.
 impl<R: Remote + ?Sized> Remote for Box<R> {
     fn change_feed(&self) -> Option<&dyn crate::changefeed::RemoteChangeFeed> {
         (**self).change_feed()

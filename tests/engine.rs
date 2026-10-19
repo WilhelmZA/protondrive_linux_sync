@@ -1,5 +1,5 @@
 //! Engine tests using an in-memory fake `Remote` - the real three-way-merge
-//! logic end to end without the actual proton-drive binary. Mirrors the Python
+//! logic end to end without a sidecar. Mirrors the Python
 //! tests/test_engine.py so the two ports can be diffed for behaviour parity.
 
 use std::cell::RefCell;
@@ -14,7 +14,7 @@ use neutronsync::engine::Engine;
 use neutronsync::events::{EventSink, SyncEvent};
 use neutronsync::logger::Logger;
 use neutronsync::models::{Compare, Entry, Uploaded};
-use neutronsync::protoncli::{ListOutcome, Remote};
+use neutronsync::remote::{ListOutcome, Remote};
 
 // --- in-memory fake remote --------------------------------------------------
 #[derive(Default)]
@@ -154,13 +154,7 @@ impl Remote for FakeRemote {
 // --- helpers ----------------------------------------------------------------
 fn cfg(root: &Path) -> Config {
     Config {
-        backend: neutronsync::config::Backend::Cli,
         sidecar: None,
-        binary: "proton-drive".into(),
-        upload_flags: vec![],
-        download_flags: vec![],
-        credentials_store: None,
-        fresh_cache: false,
         scan_threads: 0,
         download_threads: 0,
         remote_root: "/my-files".into(),
@@ -171,7 +165,6 @@ fn cfg(root: &Path) -> Config {
         local_delete: LocalDelete::Trash,
         conflict: ConflictPolicy::KeepBoth,
         compare: Compare::SizeMtime,
-        poll_interval_secs: 900,
         full_walk_interval: 86400,
         scan_interval_secs: 120,
         debounce_secs: 2,

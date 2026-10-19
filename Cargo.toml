@@ -77,7 +77,6 @@ required-features = ["gui"]
 # CLI, the GUI, the .desktop entry, and the systemd --user units. The GUI
 # binary is one of the assets, so packaging requires the `gui` feature:
 #   cargo deb --features gui         &&   cargo generate-rpm
-# proton-drive is optional, for the legacy CLI backend.
 [package.metadata.deb]
 maintainer = "Wilhelm Schonfeldt"
 copyright = "2026 Wilhelm Schonfeldt"
@@ -86,8 +85,7 @@ priority = "optional"
 depends = "$auto, libgl1, libxkbcommon0, libsecret-tools"
 extended-description = """\
 Bidirectional Proton Drive folder sync with a built-in API sidecar. \
-Ships a CLI (neutronsync), native GUI (neutronsync-gui) and neutronsync-drive. \
-The optional proton-drive CLI is needed only for the legacy backend = "cli" path."""
+Ships a CLI (neutronsync), native GUI (neutronsync-gui) and neutronsync-drive."""
 assets = [
     ["target/release/neutronsync", "usr/bin/", "755"],
     ["target/release/neutronsync-gui", "usr/bin/", "755"],

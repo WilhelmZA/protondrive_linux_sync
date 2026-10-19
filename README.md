@@ -42,25 +42,23 @@ The pictures use example folders and files. See [`docs/screenshots.md`](docs/scr
 
 ## Remote backend
 
-The default backend is `api`. One `neutronsync-drive` sidecar serves the GUI, tray daemon, CLI and watch processes in your user session. Uploads replace same-name files with new revisions and preserve whole-second modification times. Downloads appear atomically after size and SHA-1 verification. Deletes go to Proton trash. Use `--dry-run` to preview a plan. Existing baselines remain valid even when remote node identifiers differ.
+One `neutronsync-drive` sidecar, built on Proton's official Drive SDK, serves the GUI, tray daemon, CLI and watch processes in your user session. Uploads replace same-name files with new revisions and preserve whole-second modification times. Downloads appear atomically after size and SHA-1 verification. Deletes go to Proton trash. Use `--dry-run` to preview a plan. Existing baselines remain valid even when remote node identifiers differ.
 
 ```toml
 [cli]
-backend = "api"                       # default; this line may be omitted
 sidecar = "/path/to/neutronsync-drive" # optional
 ```
 
-Without `sidecar`, NeutronSync looks next to its executable, then on `PATH` for `neutronsync-drive`. The package includes it. Set `[cli] backend = "cli"` if the API backend fails and you need the legacy backend. That fallback remains available for one release and requires a separate `proton-drive` installation and sign-in. NeutronSync never silently switches backends. Saving GUI settings preserves an explicit `cli` selection.
+Without `sidecar`, NeutronSync looks next to its executable, then on `PATH` for `neutronsync-drive`. The package includes it. The `proton-drive` command-line backend was removed in 0.6.0; a config that still sets `[cli] backend = "cli"` is refused with a message saying so.
 
 The first client starts the session owner. Other clients connect to `$XDG_RUNTIME_DIR/neutronsync-drive/session.sock`. If `XDG_RUNTIME_DIR` is unset, the path is `$HOME/.cache/neutronsync-drive/session.sock`. The socket directory is private, mode `0700`; the owner checks peer UIDs. A lock beside the socket prevents competing owners. The sidecar survives its initiating client; after a sidecar crash, clients reconnect and watchers resume persisted event cursors.
 
-Use `neutronsync sync --dry-run --backend api` to override the config for one run. `--backend cli` selects the CLI instead. API excludes hide paths and their descendants from the plan, but the API backend still lists those folders remotely.
+Use `neutronsync sync --dry-run` to preview a run. Excludes hide paths and their descendants from the plan, but the sidecar still lists those folders remotely.
 
 ## Requirements
 
 - Linux with a recent Rust toolchain (edition 2021) if building from source.
 - An unlocked Secret Service keyring in your desktop session and `secret-tool` (`libsecret-tools` on Debian/Ubuntu; `libsecret` on Fedora/RHEL).
-- The official `proton-drive` CLI only for `backend = "cli"` (<https://proton.me/blog/proton-drive-cli>).
 - `gio` (from glib, present on most desktops) for recoverable local deletes; a manual XDG-trash fallback is used if it is missing.
 
 ## Install
@@ -126,12 +124,11 @@ neutronsync watch                       # live sync: FS events + periodic rescan
 
 For each folder pair, NeutronSync keeps a baseline snapshot of the last state the two sides agreed on. On every run it scans the current local and remote trees and classifies each path against the baseline (created, modified, or deleted) independently per side. Combining the two verdicts decides the action and which side wins.
 
-**Detecting changes.** Both backends watch local folders through inotify. The API backend also receives remote changes from the sidecar's five-second event poll:
+**Detecting changes.** NeutronSync watches local folders through inotify and receives remote changes from the sidecar's five-second event poll:
 
 - A local change reconciles only the folder whose direct contents changed (one shallow folder listing), not the whole tree. Because the watch is recursive, a change deeper down arrives as its own event and reconciles its own folder, so editing one file never re-walks a subtree.
-- With `backend = "api"`, remote events enter the same folder queue as local changes. The watcher maps node UIDs through the baseline or sidecar and reconciles both parents for moves and trash. Events are hints; the three-way merge still decides every change. The watcher saves and acknowledges each cursor after successful reconcile, so restart replays changes made while stopped without a full walk.
-- The API watcher subscribes before its first full walk. Later full walks handle refresh notices, unresolved events and the daily safety net. Set `[options] full_walk_interval = 86400` to change that interval in seconds. Sign-out pauses sync; sidecar authentication recovery resumes from the saved cursor.
-- With `backend = "cli"`, startup syncs fresh local changes, recently active ("hot") folders, then everything else. Remote changes arrive on the next hot pass or full walk. Full walks stream folder-by-folder and keep their adaptive pacing: six times the walk duration, floored at `poll_interval` and capped at six hours. `full_walk_interval` does not affect this backend.
+- Remote events enter the same folder queue as local changes. The watcher maps node UIDs through the baseline or sidecar and reconciles both parents for moves and trash. Events are hints; the three-way merge still decides every change. The watcher saves and acknowledges each cursor after successful reconcile, so restart replays changes made while stopped without a full walk.
+- The watcher subscribes before its first full walk. Later full walks handle refresh notices, unresolved events and the daily safety net. Set `[options] full_walk_interval = 86400` to change that interval in seconds. Sign-out pauses sync; sidecar authentication recovery resumes from the saved cursor.
 
 When the background tray is doing the work, an open window mirrors its live state, so scanning and per-file transfers show up in Activity in real time. If that tray exits unexpectedly, NeutronSync starts it again. Quitting from the tray menu stops it. An open window notices within a few seconds and shows when background sync has stopped and is restarting, when it is not responding, or when it could not start. The sync model and its reasoning are written up in [docs/SYNC_MODEL.md](docs/SYNC_MODEL.md).
 
@@ -153,7 +150,6 @@ TOML at `~/.config/neutronsync/neutronsync.toml` (override with `-c PATH` or `$N
 
 ```toml
 [cli]
-backend = "api"                       # default; this line may be omitted
 # sidecar = "/path/to/neutronsync-drive"  # optional; else next to neutronsync, then PATH
 
 [options]
@@ -162,7 +158,7 @@ propagate_deletes = false     # deletes cross over (recoverably); false = never 
 local_delete = "trash"        # trash | remove
 conflict = "keep-both"        # keep-both | newer | skip
 compare = "size+mtime"        # size | size+mtime | sha1
-full_walk_interval = 86400    # API: seconds between safety-net full checks (default 1 day)
+full_walk_interval = 86400    # seconds between safety-net full checks (default 1 day)
 update_channel = "stable"     # stable | prerelease
 # check_on_launch = false     # GUI: check for updates on start (notify only)
 
@@ -171,23 +167,6 @@ name = "documents"
 local = "~/Documents"
 remote = "Documents"          # -> /my-files/Documents
 # exclude = ["APPS"]          # sub-paths never synced; the Proton copy is untouched
-```
-
-#### Legacy CLI backend
-
-Set `[cli] backend = "cli"` only as a fallback. It goes away in 0.5.0 and needs a separate `proton-drive` install and sign-in. Keys used only on that backend:
-
-```toml
-[cli]
-backend = "cli"
-binary = "proton-drive"
-upload_flags = ["--file-conflict-strategy", "replace", "--folder-conflict-strategy", "replace"]
-download_flags = ["--file-conflict-strategy", "remove", "--folder-conflict-strategy", "remove"]
-fresh_cache = true            # throwaway metadata cache per run (avoids stale listings)
-# credentials_store = "keychain"
-
-[options]
-poll_interval = 900           # CLI watch: floor for adaptive full rescans (seconds)
 ```
 
 ## Running in the background (systemd --user)
@@ -214,7 +193,7 @@ The API sign-in form passes credentials over the private local socket to the sid
 
 ## Troubleshooting
 
-- **Sign-in service didn't start:** the GUI shows this when `neutronsync-drive` cannot be started or reached. Reinstall the package, or build `sidecar/` and place `neutronsync-drive` beside the Rust binaries or on `PATH`, or set `cli.sidecar`. Check the socket under `$XDG_RUNTIME_DIR/neutronsync-drive/` (or `$HOME/.cache/neutronsync-drive/` when `XDG_RUNTIME_DIR` is unset). The legacy fallback is `[cli] backend = "cli"`.
+- **Sign-in service didn't start:** the GUI shows this when `neutronsync-drive` cannot be started or reached. Reinstall the package, or build `sidecar/` and place `neutronsync-drive` beside the Rust binaries or on `PATH`, or set `cli.sidecar`. Check the socket under `$XDG_RUNTIME_DIR/neutronsync-drive/` (or `$HOME/.cache/neutronsync-drive/` when `XDG_RUNTIME_DIR` is unset).
 - **`secret-tool` missing:** install `libsecret-tools` on Debian/Ubuntu or `libsecret` on Fedora/RHEL.
 - **Keyring locked / no Secret Service:** start and unlock your desktop keyring. Run NeutronSync in the same user D-Bus session. A headless service needs that session too.
 - **Human verification:** complete the shown Proton verification link, then retry sign-in. The CLI `login` command waits for Enter before retrying.
@@ -224,7 +203,7 @@ The API sign-in form passes credentials over the private local socket to the sid
 
 ## Known limitations
 
-- The legacy CLI backend notices remote changes on a hot or full pass. The default API backend polls remote events every five seconds.
+- Remote changes arrive through the sidecar's event poll, every five seconds, not instantly.
 - Default `compare = "size+mtime"` can miss an in-place edit that keeps the same size and mtime; use `compare = "sha1"` to compare content exactly.
 - Renames look like a delete + create.
 

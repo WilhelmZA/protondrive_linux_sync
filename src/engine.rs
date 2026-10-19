@@ -26,7 +26,7 @@ use crate::logger::Logger;
 use crate::models::{
     same_content, Action, Change, Compare, DownloadJob, Entry, Op, Plan, Uploaded,
 };
-use crate::protoncli::{ListOutcome, Remote};
+use crate::remote::{ListOutcome, Remote};
 use crate::trash::trash_local;
 
 pub struct SyncResult {
