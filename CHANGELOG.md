@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-19
+
 ### Added
 - The About page shows what changed before you install an update: the release notes of every version between the one you run and the one on offer, newest first, under "What's new".
 
