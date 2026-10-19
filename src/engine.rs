@@ -27,6 +27,7 @@ use crate::models::{
     same_content, Action, Change, Compare, ConflictOutcome, DownloadJob, Entry, Op, Plan, Uploaded,
 };
 use crate::remote::{ListOutcome, Remote};
+use crate::retry;
 use crate::trash::trash_local;
 
 /// What [`Engine::plan`] returns.
@@ -985,6 +986,10 @@ pub struct Engine<'a, R: Remote> {
     allowance: Option<Arc<DeleteAllowance>>,
     /// The deletion guard is off for this run only ("Delete them").
     allow_mass_delete: bool,
+    /// Timing of in-run transfer retries; tests shorten it.
+    retry: retry::Policy,
+    /// Stops retrying once a few transfers in a row have used up their retries.
+    breaker: retry::Breaker,
 }
 
 impl<'a, R: Remote> Engine<'a, R> {
@@ -1006,6 +1011,41 @@ impl<'a, R: Remote> Engine<'a, R> {
             cancel: None,
             allowance: None,
             allow_mass_delete: false,
+            retry: retry::Policy::default(),
+            breaker: retry::Breaker::new(),
+        }
+    }
+
+    /// Shorten (or otherwise change) the retry schedule; tests use this so a
+    /// run with retries finishes in milliseconds.
+    pub fn set_retry_policy(&mut self, policy: retry::Policy) {
+        self.retry = policy;
+    }
+
+    /// Decide what to do with a transfer that failed on attempt `attempt`
+    /// (1-based): `Some(delay)` to wait and try again, `None` to give up now.
+    /// Records an exhausted transfer on the breaker.
+    fn retry_delay(&self, attempt: u32, error: &anyhow::Error) -> Option<Duration> {
+        let class = retry::classify(error);
+        if !class.is_retryable() {
+            return None;
+        }
+        if attempt >= retry::MAX_ATTEMPTS {
+            self.breaker.exhausted();
+            return None;
+        }
+        if self.breaker.open() {
+            return None;
+        }
+        self.retry.delay(attempt, class)
+    }
+
+    /// Error text for a transfer that was retried and still failed.
+    fn gave_up(error: anyhow::Error, attempts: u32) -> anyhow::Error {
+        if attempts > 1 {
+            anyhow::anyhow!("{error} (gave up after {attempts} attempts)")
+        } else {
+            error
         }
     }
 
@@ -2061,19 +2101,9 @@ impl<'a, R: Remote> Engine<'a, R> {
             .filter_map(|o| o.conflict.map(|c| (o.path.as_str(), c)))
             .collect();
 
-        let on_start = |j: &DownloadJob| {
-            log.info(&format!("download    file {} (new remote)", j.rel));
-            if let Some(s) = events {
-                s.emit(&SyncEvent::OpStarted {
-                    pair: pair_name.to_string(),
-                    action: "download".into(),
-                    path: j.rel.clone(),
-                });
-            }
-        };
-        let on_done = |j: &DownloadJob, r: std::result::Result<(), String>| {
+        let finished = |j: &DownloadJob, r: Result<()>| {
             let ok = r.is_ok();
-            let err_text = r.as_ref().err().cloned();
+            let err_text = r.as_ref().err().map(|e| e.to_string());
             match r {
                 Ok(()) => {
                     applied.fetch_add(1, Ordering::Relaxed);
@@ -2105,13 +2135,174 @@ impl<'a, R: Remote> Engine<'a, R> {
             }
         };
 
-        self.remote.download_many(
-            &jobs,
-            self.cfg.download_threads,
-            cancel_ref,
-            &on_start,
-            &on_done,
-        );
+        // Rounds: every job runs through the pool once; the ones that failed
+        // for a temporary reason are held back and run again together after
+        // one delay, each up to three more times. After a round in which
+        // nothing succeeded the network may be dead, so only the first
+        // BREAKER_TRIP held jobs (in job order) probe it; the rest wait, and
+        // once those probes have used up their retries the breaker trips and
+        // the waiting jobs are left for the next run with their one attempt.
+        // `OpStarted` fires on the first attempt only and `OpFinished` once,
+        // with the final result.
+        let breaker = &self.breaker;
+        let order: HashMap<&str, usize> = downloads
+            .iter()
+            .enumerate()
+            .map(|(i, o)| (o.path.as_str(), i))
+            .collect();
+        // Held jobs with their attempts so far and the error of the last one.
+        let mut round: Vec<(DownloadJob, u32, Option<anyhow::Error>)> =
+            jobs.into_iter().map(|j| (j, 0, None)).collect();
+        let mut first_round = true;
+        let mut probing = false;
+        while !round.is_empty() {
+            let (attempted, waiting): (Vec<_>, Vec<_>) = if probing && !breaker.open() {
+                let mut attempted = Vec::new();
+                let mut waiting = Vec::new();
+                for entry in round {
+                    if attempted.len() < retry::BREAKER_TRIP {
+                        attempted.push(entry);
+                    } else {
+                        waiting.push(entry);
+                    }
+                }
+                (attempted, waiting)
+            } else {
+                (round, Vec::new())
+            };
+            let attempt_of: HashMap<&str, (usize, u32)> = attempted
+                .iter()
+                .enumerate()
+                .map(|(i, (j, attempts, _))| (j.rel.as_str(), (i, attempts + 1)))
+                .collect();
+            let pool: Vec<DownloadJob> = attempted.iter().map(|(j, _, _)| j.clone()).collect();
+            // Per attempted job: finished in this round (any outcome), held
+            // with its error, or exhausted on a temporary error.
+            let seen: Mutex<Vec<bool>> = Mutex::new(vec![false; pool.len()]);
+            let held: Mutex<Vec<(usize, anyhow::Error)>> = Mutex::new(Vec::new());
+            let exhausted: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+            let succeeded = AtomicBool::new(false);
+            let on_start = |j: &DownloadJob| {
+                if !first_round {
+                    return;
+                }
+                log.info(&format!("download    file {} (new remote)", j.rel));
+                if let Some(s) = events {
+                    s.emit(&SyncEvent::OpStarted {
+                        pair: pair_name.to_string(),
+                        action: "download".into(),
+                        path: j.rel.clone(),
+                    });
+                }
+            };
+            let on_done = |j: &DownloadJob, r: Result<()>| {
+                let (i, attempt) = attempt_of[j.rel.as_str()];
+                seen.lock().unwrap()[i] = true;
+                match r {
+                    Ok(()) => {
+                        succeeded.store(true, Ordering::SeqCst);
+                        breaker.success();
+                        finished(j, Ok(()));
+                    }
+                    Err(e) => {
+                        let temporary = retry::classify(&e).is_retryable();
+                        if temporary && attempt < retry::MAX_ATTEMPTS && !breaker.open() {
+                            held.lock().unwrap().push((i, e));
+                        } else {
+                            if temporary && attempt >= retry::MAX_ATTEMPTS {
+                                exhausted.lock().unwrap().push(i);
+                            }
+                            finished(j, Err(Self::gave_up(e, attempt)));
+                        }
+                    }
+                }
+            };
+            self.remote.download_many(
+                &pool,
+                self.cfg.download_threads,
+                cancel_ref,
+                &on_start,
+                &on_done,
+            );
+            // A cancelled pool stops before dequeuing the rest. On the first
+            // round those jobs never started; on a retry round they did, so
+            // their once-per-file `OpFinished` is owed.
+            let seen = seen.into_inner().unwrap();
+            if !first_round {
+                for (i, job) in pool.iter().enumerate() {
+                    if !seen[i] {
+                        finished(
+                            job,
+                            Err(anyhow::anyhow!("cancelled before the retry could run")),
+                        );
+                    }
+                }
+            }
+            // Each job that used up its retries counts against the breaker, in
+            // job order, when its last round ends.
+            let mut exhausted = exhausted.into_inner().unwrap();
+            exhausted.sort_unstable();
+            for _ in exhausted {
+                breaker.exhausted();
+            }
+            let mut held = held.into_inner().unwrap();
+            held.sort_by_key(|(i, _)| *i);
+            probing = !succeeded.load(Ordering::SeqCst);
+            let stop = breaker.open() || self.cancelled();
+            let mut next: Vec<(DownloadJob, u32, Option<anyhow::Error>)> = Vec::new();
+            let mut delay: Option<Duration> = None;
+            for (i, e) in held {
+                let (job, _, _) = &attempted[i];
+                let attempt = attempt_of[job.rel.as_str()].1;
+                let wait = if stop {
+                    None
+                } else {
+                    self.retry.delay(attempt, retry::classify(&e))
+                };
+                match wait {
+                    Some(d) => {
+                        log.warn(&format!(
+                            "retry {attempt} of {} in {}: download {}: {e}",
+                            retry::MAX_ATTEMPTS - 1,
+                            retry::describe(d),
+                            job.rel
+                        ));
+                        delay = Some(delay.map_or(d, |current: Duration| current.max(d)));
+                        next.push((job.clone(), attempt, Some(e)));
+                    }
+                    None => finished(job, Err(Self::gave_up(e, attempt))),
+                }
+            }
+            // Jobs that waited out this round keep their count and their error.
+            for (job, attempts, error) in waiting {
+                if stop {
+                    finished(
+                        &job,
+                        Err(Self::gave_up(
+                            error.unwrap_or_else(|| anyhow::anyhow!("not retried")),
+                            attempts,
+                        )),
+                    );
+                } else {
+                    next.push((job, attempts, error));
+                }
+            }
+            if let Some(delay) = delay {
+                if !retry::sleep(delay, self.retry.slice, cancel_ref) {
+                    for (job, _, _) in &next {
+                        finished(
+                            job,
+                            Err(anyhow::anyhow!("cancelled while waiting to retry")),
+                        );
+                    }
+                    break;
+                }
+            }
+            // Order the next round by the original job order.
+            next.sort_by_key(|(job, _, _)| order.get(job.rel.as_str()).copied().unwrap_or(0));
+            round = next;
+            first_round = false;
+        }
 
         result.applied += applied.load(Ordering::Relaxed);
         result.errors.extend(errs.into_inner().unwrap());
@@ -2143,10 +2334,36 @@ impl<'a, R: Remote> Engine<'a, R> {
                 // Prefer what the backend reports it sent (a snapshot); fall back
                 // to a stat taken just before the upload.
                 let stat = std::fs::metadata(&local_full).ok();
-                let sent = self.remote.upload(
-                    &local_full.to_string_lossy(),
-                    &remote_join(&pair.remote, parent),
-                )?;
+                let remote_parent = remote_join(&pair.remote, parent);
+                let fallback = AtomicBool::new(false);
+                let cancel: &AtomicBool = self.cancel.unwrap_or(&fallback);
+                let mut attempt = 1;
+                let sent = loop {
+                    match self
+                        .remote
+                        .upload(&local_full.to_string_lossy(), &remote_parent)
+                    {
+                        Ok(sent) => {
+                            self.breaker.success();
+                            break sent;
+                        }
+                        Err(e) => {
+                            let Some(delay) = self.retry_delay(attempt, &e) else {
+                                return Err(Self::gave_up(e, attempt));
+                            };
+                            self.log.warn(&format!(
+                                "retry {attempt} of {} in {}: upload {}: {e}",
+                                retry::MAX_ATTEMPTS - 1,
+                                retry::describe(delay),
+                                op.path
+                            ));
+                            if !retry::sleep(delay, self.retry.slice, cancel) {
+                                anyhow::bail!("{e} (cancelled while waiting to retry)");
+                            }
+                            attempt += 1;
+                        }
+                    }
+                };
                 let sent = sent.or_else(|| {
                     stat.map(|meta| Uploaded {
                         size: meta.len(),

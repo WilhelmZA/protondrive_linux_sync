@@ -1,4 +1,8 @@
+import { createHash } from 'node:crypto';
 import { appVersion } from '../src/auth';
+import { BIG_SIZE, bigChunk } from './binary-backend';
+
+const bigSha1 = createHash('sha1').update(bigChunk(0, BIG_SIZE)).digest('hex');
 
 export function fixture() {
   let account = 'normal';
@@ -11,6 +15,7 @@ export function fixture() {
   const folder = { uid: 'documents', type: 'folder', parentUid: 'root', name: { ok: true, value: 'Documents' }, treeEventScopeId: 'sdk-scope-id' };
   const file = { uid: 'file', type: 'file', parentUid: 'documents', name: { ok: true, value: 'sample.txt' }, treeEventScopeId: 'sdk-scope-id', activeRevision: { claimedSize: 42, claimedModificationTime: '2026-01-02T03:04:05Z', claimedDigests: { sha1: 'abc123', sha1Verified: true } } };
   const missingMetadata = { uid: 'no-metadata', type: 'file', parentUid: 'documents', name: { ok: true, value: 'unknown.txt' }, treeEventScopeId: 'sdk-scope-id' };
+  const big = { uid: 'big', type: 'file', parentUid: 'documents', name: { ok: true, value: 'big.bin' }, treeEventScopeId: 'sdk-scope-id', activeRevision: { claimedSize: BIG_SIZE, claimedModificationTime: '2026-01-02T03:04:05Z', claimedDigests: { sha1: bigSha1, sha1Verified: true } } };
   const reply = (data: unknown, status = 200, headers?: Record<string, string>) => Response.json(data, { status, headers });
   const handle = async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
@@ -44,7 +49,7 @@ export function fixture() {
       const errors: Record<string, number> = { missing: 404, denied: 403, conflict: 409, limited: 429, transient: 503, fatal: 422 };
       if (uid === 'expired') { rejectRefresh = true; return reply({}, 401); }
       if (errors[uid]) return reply({ Error: 'password-secret access-secret refresh-secret' }, errors[uid], { 'retry-after': '7' });
-      const node = [root, folder, file, missingMetadata].find(node => node.uid === uid);
+      const node = [root, folder, file, missingMetadata, big].find(node => node.uid === uid);
       return node ? reply(node) : reply({}, 404);
     }
     if (path.startsWith('/fixture/children/')) {

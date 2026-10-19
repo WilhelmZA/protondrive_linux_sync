@@ -190,6 +190,8 @@ compare = "size+mtime"        # size | size+mtime | sha1
 full_walk_interval = 86400    # seconds between safety-net full checks (default 1 day)
 update_channel = "stable"     # stable | prerelease
 # check_on_launch = false     # GUI: check for updates on start (notify only)
+# upload_limit_kbps = 0       # upload speed limit in KB/s for all folders (0 = no limit)
+# download_limit_kbps = 0     # download speed limit in KB/s for all folders (0 = no limit)
 
 [[pair]]
 name = "documents"

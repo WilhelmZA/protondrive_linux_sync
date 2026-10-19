@@ -29,6 +29,52 @@ struct Store {
     fail_download: Option<String>,              // absolute file path whose download should error
     fail_upload: Option<String>,                // absolute file path whose upload should error
     edit_on_upload: Option<(PathBuf, Vec<u8>)>, // write this file when the next upload starts
+    // Typed sidecar-style failures, per absolute path: the codes to fail with
+    // on successive attempts ("transient", "rate_limited:2", "conflict", ...).
+    // An exhausted script succeeds.
+    fail_script: BTreeMap<String, Vec<String>>,
+    // Every transfer fails with this code (the dead-network case).
+    fail_all: Option<String>,
+    // Transfer attempts per absolute path, with when each started.
+    attempts: BTreeMap<String, Vec<std::time::Instant>>,
+    // Set this flag when the given path reaches the given attempt.
+    cancel_on_attempt: Option<(String, usize, std::sync::Arc<AtomicBool>)>,
+}
+
+/// A failure as `DriveApi` would return it: "code" or "code:retry_after".
+fn rpc_failure(spec: &str) -> anyhow::Error {
+    let (code, retry_after) = spec.split_once(':').unwrap_or((spec, ""));
+    neutronsync::driveapi::RpcError {
+        code: code.to_string(),
+        retry_after: retry_after.parse().ok(),
+    }
+    .into()
+}
+
+impl Store {
+    /// Count an attempt on `key` and return the scripted failure for it, if any.
+    fn attempt(&mut self, key: &str) -> Option<anyhow::Error> {
+        self.attempts
+            .entry(key.to_string())
+            .or_default()
+            .push(std::time::Instant::now());
+        if let Some((path, n, flag)) = &self.cancel_on_attempt {
+            if path == key && self.attempts[key].len() == *n {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        if let Some(code) = &self.fail_all {
+            return Some(rpc_failure(code));
+        }
+        let script = self.fail_script.get_mut(key)?;
+        if script.is_empty() {
+            return None;
+        }
+        Some(rpc_failure(&script.remove(0)))
+    }
+    fn attempts_on(&self, key: &str) -> usize {
+        self.attempts.get(key).map_or(0, Vec::len)
+    }
 }
 
 struct FakeRemote {
@@ -111,6 +157,9 @@ impl Remote for FakeRemote {
         if self.store.borrow().fail_upload.as_deref() == Some(key.as_str()) {
             anyhow::bail!("simulated upload failure for {key}");
         }
+        if let Some(error) = self.store.borrow_mut().attempt(&key) {
+            return Err(error);
+        }
         let mtime = std::fs::metadata(local_path)
             .ok()
             .and_then(|m| m.modified().ok())
@@ -127,6 +176,9 @@ impl Remote for FakeRemote {
     fn download(&self, remote_path: &str, local_dest: &str) -> anyhow::Result<()> {
         if self.store.borrow().fail_download.as_deref() == Some(remote_path) {
             anyhow::bail!("simulated download failure for {remote_path}");
+        }
+        if let Some(error) = self.store.borrow_mut().attempt(remote_path) {
+            return Err(error);
         }
         let data = self
             .store
@@ -186,6 +238,8 @@ fn cfg(root: &Path) -> Config {
         debounce_secs: 2,
         update_channel: UpdateChannel::Stable,
         check_on_launch: false,
+        upload_limit_kbps: 0,
+        download_limit_kbps: 0,
         state_dir: root.join("state"),
         pairs: vec![Pair {
             name: "docs".into(),
@@ -2170,4 +2224,494 @@ fn skipped_conflict_shows_once_until_dismissed() {
         rows[0].seen, 1,
         "after a dismissal the conflict is news again"
     );
+}
+
+// ---- in-run retry ------------------------------------------------------------
+
+use neutronsync::retry::Policy;
+use std::time::{Duration, Instant};
+
+/// One pair sync with a shortened retry schedule (`unit` per scheduled
+/// second), an optional cancel flag, and every event it emitted.
+fn run_retrying(
+    cfg: &Config,
+    remote: FakeRemote,
+    unit: Duration,
+    cancel: Option<&AtomicBool>,
+) -> Run {
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = EventLog(events.clone());
+    let log = Logger::silent();
+    let mut eng = Engine::new(cfg, remote, &log, false);
+    eng.set_observer(Some(&sink), cancel);
+    eng.set_retry_policy(Policy::scaled(unit));
+    let result = eng.sync_pair(&cfg.pairs[0], false).unwrap();
+    let events = events.lock().unwrap().clone();
+    Run { result, events }
+}
+
+fn op_events(events: &[SyncEvent], path: &str) -> (usize, Vec<(bool, Option<String>)>) {
+    let started = events
+        .iter()
+        .filter(|e| matches!(e, SyncEvent::OpStarted { path: p, .. } if p == path))
+        .count();
+    let finished = events
+        .iter()
+        .filter_map(|e| match e {
+            SyncEvent::OpFinished {
+                path: p, ok, error, ..
+            } if p == path => Some((*ok, error.clone())),
+            _ => None,
+        })
+        .collect();
+    (started, finished)
+}
+
+fn script(store: &Rc<RefCell<Store>>, key: &str, codes: &[&str]) {
+    store.borrow_mut().fail_script.insert(
+        key.to_string(),
+        codes.iter().map(|c| c.to_string()).collect(),
+    );
+}
+
+const FAST: Duration = Duration::from_millis(10);
+
+#[test]
+fn upload_that_fails_twice_then_succeeds_lands_in_the_same_run() {
+    let t = Tmp::new("retry-up");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/a.txt"), "payload");
+    script(&store, "/my-files/docs/a.txt", &["transient", "transient"]);
+    let run = run_retrying(&c, fake, FAST, None);
+    assert!(run.result.errors.is_empty(), "{:?}", run.result.errors);
+    assert_eq!(store.borrow().attempts_on("/my-files/docs/a.txt"), 3);
+    assert_eq!(
+        remote_files(&store).get("/my-files/docs/a.txt").unwrap(),
+        "payload"
+    );
+    assert!(baseline(&c).contains_key("a.txt"));
+    assert_eq!(op_events(&run.events, "a.txt"), (1, vec![(true, None)]));
+}
+
+#[test]
+fn download_that_fails_twice_then_succeeds_does_not_repeat_the_rest_of_the_batch() {
+    let t = Tmp::new("retry-down");
+    let c = cfg(t.path());
+    std::fs::create_dir_all(t.path().join("local")).unwrap();
+    let (fake, store) = FakeRemote::new();
+    seed_remote_file(&store, "a.txt", "alpha");
+    seed_remote_file(&store, "b.txt", "bravo");
+    seed_remote_file(&store, "c.txt", "charlie");
+    script(&store, "/my-files/docs/b.txt", &["transient", "transient"]);
+    let run = run_retrying(&c, fake, FAST, None);
+    assert!(run.result.errors.is_empty(), "{:?}", run.result.errors);
+    let s = store.borrow();
+    assert_eq!(s.attempts_on("/my-files/docs/a.txt"), 1);
+    assert_eq!(s.attempts_on("/my-files/docs/b.txt"), 3);
+    assert_eq!(s.attempts_on("/my-files/docs/c.txt"), 1);
+    drop(s);
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        assert!(t.path().join("local").join(name).exists(), "{name}");
+        assert!(baseline(&c).contains_key(name), "{name}");
+        assert_eq!(
+            op_events(&run.events, name),
+            (1, vec![(true, None)]),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("local/b.txt")).unwrap(),
+        "bravo"
+    );
+}
+
+#[test]
+fn permanent_failures_are_attempted_once_in_both_directions() {
+    for code in [
+        "not_found",
+        "conflict",
+        "auth",
+        "fatal",
+        "keyring_locked",
+        "unknown_code",
+    ] {
+        let t = Tmp::new("retry-perm");
+        let c = cfg(t.path());
+        let (fake, store) = FakeRemote::new();
+        write(&t.path().join("local/up.txt"), "local");
+        seed_remote_file(&store, "down.txt", "remote");
+        script(&store, "/my-files/docs/up.txt", &[code; 4]);
+        script(&store, "/my-files/docs/down.txt", &[code; 4]);
+        let run = run_retrying(&c, fake, FAST, None);
+        assert_eq!(
+            run.result.errors.len(),
+            2,
+            "{code}: {:?}",
+            run.result.errors
+        );
+        assert!(
+            run.result.errors.iter().all(|e| !e.contains("gave up")),
+            "{code}: {:?}",
+            run.result.errors
+        );
+        let s = store.borrow();
+        assert_eq!(s.attempts_on("/my-files/docs/up.txt"), 1, "{code}");
+        assert_eq!(s.attempts_on("/my-files/docs/down.txt"), 1, "{code}");
+        drop(s);
+        let base = baseline(&c);
+        assert!(!base.contains_key("up.txt"), "{code}");
+        assert!(!base.contains_key("down.txt"), "{code}");
+        assert!(!t.path().join("local/down.txt").exists(), "{code}");
+        assert_eq!(op_events(&run.events, "up.txt").0, 1, "{code}");
+        assert_eq!(op_events(&run.events, "down.txt").0, 1, "{code}");
+    }
+}
+
+#[test]
+fn transient_on_every_attempt_gives_up_after_four() {
+    let t = Tmp::new("retry-exhaust");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/up.txt"), "local");
+    seed_remote_file(&store, "down.txt", "remote");
+    script(&store, "/my-files/docs/up.txt", &["transient"; 10]);
+    script(&store, "/my-files/docs/down.txt", &["transient"; 10]);
+    let run = run_retrying(&c, fake, FAST, None);
+    assert_eq!(run.result.errors.len(), 2, "{:?}", run.result.errors);
+    for (action, key, rel) in [
+        ("upload", "/my-files/docs/up.txt", "up.txt"),
+        ("download", "/my-files/docs/down.txt", "down.txt"),
+    ] {
+        assert_eq!(store.borrow().attempts_on(key), 4, "{rel}");
+        let line = run
+            .result
+            .errors
+            .iter()
+            .find(|e| e.starts_with(&format!("{action} {rel}: ")))
+            .unwrap_or_else(|| panic!("{rel}: {:?}", run.result.errors));
+        assert!(line.contains("api backend: transient"), "{line}");
+        assert!(line.ends_with("(gave up after 4 attempts)"), "{line}");
+        assert!(!baseline(&c).contains_key(rel), "{rel}");
+        let (started, finished) = op_events(&run.events, rel);
+        assert_eq!(started, 1, "{rel}");
+        assert_eq!(finished.len(), 1, "{rel}");
+        assert!(!finished[0].0, "{rel}");
+        assert!(
+            finished[0]
+                .1
+                .as_deref()
+                .unwrap()
+                .contains("gave up after 4 attempts"),
+            "{rel}: {:?}",
+            finished[0]
+        );
+    }
+}
+
+#[test]
+fn breaker_stops_upload_retries_after_three_exhausted_files_and_a_success_resets_it() {
+    let t = Tmp::new("retry-breaker-up");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    for i in 1..=7 {
+        write(&t.path().join(format!("local/f{i}.txt")), "payload");
+        if i != 6 {
+            script(
+                &store,
+                &format!("/my-files/docs/f{i}.txt"),
+                &["transient"; 10],
+            );
+        }
+    }
+    let run = run_retrying(&c, fake, FAST, None);
+    let s = store.borrow();
+    // First three: every attempt. Then the breaker is open: one attempt each.
+    assert_eq!(s.attempts_on("/my-files/docs/f1.txt"), 4);
+    assert_eq!(s.attempts_on("/my-files/docs/f2.txt"), 4);
+    assert_eq!(s.attempts_on("/my-files/docs/f3.txt"), 4);
+    assert_eq!(s.attempts_on("/my-files/docs/f4.txt"), 1);
+    assert_eq!(s.attempts_on("/my-files/docs/f5.txt"), 1);
+    // f6 succeeds, which closes the breaker: f7 is retried in full again.
+    assert_eq!(s.attempts_on("/my-files/docs/f6.txt"), 1);
+    assert_eq!(s.attempts_on("/my-files/docs/f7.txt"), 4);
+    drop(s);
+    assert_eq!(run.result.errors.len(), 6, "{:?}", run.result.errors);
+    assert!(run
+        .result
+        .errors
+        .iter()
+        .any(|e| e.starts_with("upload f4.txt: ") && !e.contains("gave up")));
+    let base = baseline(&c);
+    assert!(base.contains_key("f6.txt"));
+    assert!(!base.contains_key("f1.txt") && !base.contains_key("f7.txt"));
+}
+
+#[test]
+fn breaker_tripped_by_uploads_leaves_downloads_one_attempt() {
+    let t = Tmp::new("retry-breaker-down");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    for i in 1..=3 {
+        write(&t.path().join(format!("local/up{i}.txt")), "payload");
+    }
+    for i in 1..=5 {
+        seed_remote_file(&store, &format!("down{i}.txt"), "payload");
+    }
+    store.borrow_mut().fail_all = Some("transient".into());
+    let run = run_retrying(&c, fake, FAST, None);
+    let s = store.borrow();
+    // Three uploads in a row use up their retries and trip the breaker; the
+    // downloads that follow run once each and are left for the next run.
+    for i in 1..=3 {
+        assert_eq!(
+            s.attempts_on(&format!("/my-files/docs/up{i}.txt")),
+            4,
+            "up{i}"
+        );
+    }
+    for i in 1..=5 {
+        assert_eq!(
+            s.attempts_on(&format!("/my-files/docs/down{i}.txt")),
+            1,
+            "down{i}"
+        );
+        assert_eq!(op_events(&run.events, &format!("down{i}.txt")).0, 1);
+    }
+    drop(s);
+    assert_eq!(run.result.errors.len(), 8, "{:?}", run.result.errors);
+    assert!(
+        run.result
+            .errors
+            .iter()
+            .filter(|e| e.starts_with("download "))
+            .all(|e| !e.contains("gave up")),
+        "{:?}",
+        run.result.errors
+    );
+    assert!(baseline(&c).is_empty());
+}
+
+#[test]
+fn downloads_on_a_dead_network_probe_with_three_files_and_leave_the_rest() {
+    let t = Tmp::new("retry-dead-down");
+    let c = cfg(t.path());
+    std::fs::create_dir_all(t.path().join("local")).unwrap();
+    let (fake, store) = FakeRemote::new();
+    for i in 1..=5 {
+        seed_remote_file(&store, &format!("f{i}.txt"), "payload");
+    }
+    store.borrow_mut().fail_all = Some("transient".into());
+    let started = Instant::now();
+    let run = run_retrying(&c, fake, Duration::from_millis(50), None);
+    let elapsed = started.elapsed();
+    // AC-14: the first three files use all four attempts, every later file
+    // exactly one. The three probes wait together: three delays of at most
+    // 2, 4 and 8 units, not one schedule per file.
+    let attempts: Vec<usize> = (1..=5)
+        .map(|i| {
+            store
+                .borrow()
+                .attempts_on(&format!("/my-files/docs/f{i}.txt"))
+        })
+        .collect();
+    assert_eq!(attempts, [4, 4, 4, 1, 1]);
+    assert!(
+        elapsed < Duration::from_millis(50 * 14 + 500),
+        "{elapsed:?}"
+    );
+    assert_eq!(run.result.errors.len(), 5, "{:?}", run.result.errors);
+    for i in 1..=5 {
+        let line = run
+            .result
+            .errors
+            .iter()
+            .find(|e| e.starts_with(&format!("download f{i}.txt: ")))
+            .unwrap();
+        assert_eq!(
+            line.contains("(gave up after 4 attempts)"),
+            i <= 3,
+            "{line}"
+        );
+        assert_eq!(op_events(&run.events, &format!("f{i}.txt")).0, 1);
+        assert_eq!(op_events(&run.events, &format!("f{i}.txt")).1.len(), 1);
+    }
+    assert!(baseline(&c).is_empty());
+}
+
+#[test]
+fn download_retry_rounds_resume_for_everyone_once_a_probe_succeeds() {
+    let t = Tmp::new("retry-rounds");
+    let c = cfg(t.path());
+    std::fs::create_dir_all(t.path().join("local")).unwrap();
+    let (fake, store) = FakeRemote::new();
+    for i in 1..=4 {
+        seed_remote_file(&store, &format!("f{i}.txt"), "payload");
+    }
+    script(&store, "/my-files/docs/f1.txt", &["transient"]);
+    script(&store, "/my-files/docs/f2.txt", &["transient"; 10]);
+    script(&store, "/my-files/docs/f3.txt", &["transient"; 10]);
+    script(
+        &store,
+        "/my-files/docs/f4.txt",
+        &["transient", "transient", "transient"],
+    );
+    let run = run_retrying(&c, fake, FAST, None);
+    // Round 1: all four fail, so round 2 probes f1 to f3 while f4 waits. f1
+    // succeeds, so every held job is retried again from round 3 on: f2 and
+    // f3 use up their attempts, f4 gets its full schedule and lands.
+    let attempts: Vec<usize> = (1..=4)
+        .map(|i| {
+            store
+                .borrow()
+                .attempts_on(&format!("/my-files/docs/f{i}.txt"))
+        })
+        .collect();
+    assert_eq!(attempts, [2, 4, 4, 4]);
+    assert_eq!(run.result.errors.len(), 2, "{:?}", run.result.errors);
+    let base = baseline(&c);
+    assert!(base.contains_key("f1.txt") && base.contains_key("f4.txt"));
+    assert!(!base.contains_key("f2.txt") && !base.contains_key("f3.txt"));
+    assert_eq!(op_events(&run.events, "f4.txt"), (1, vec![(true, None)]));
+    assert_eq!(op_events(&run.events, "f1.txt"), (1, vec![(true, None)]));
+}
+
+#[test]
+fn cancel_during_a_retry_round_finishes_the_jobs_the_pool_skipped() {
+    let t = Tmp::new("retry-cancel-round");
+    let c = cfg(t.path());
+    std::fs::create_dir_all(t.path().join("local")).unwrap();
+    let (fake, store) = FakeRemote::new();
+    seed_remote_file(&store, "a.txt", "payload");
+    seed_remote_file(&store, "b.txt", "payload");
+    script(&store, "/my-files/docs/a.txt", &["transient"; 10]);
+    script(&store, "/my-files/docs/b.txt", &["transient"; 10]);
+    let cancel = std::sync::Arc::new(AtomicBool::new(false));
+    // Both fail in round 1. In round 2 a.txt's attempt sets the cancel flag,
+    // so the (sequential) pool never dequeues b.txt again.
+    store.borrow_mut().cancel_on_attempt = Some(("/my-files/docs/a.txt".into(), 2, cancel.clone()));
+    let run = run_retrying(&c, fake, FAST, Some(&cancel));
+    let s = store.borrow();
+    assert_eq!(s.attempts_on("/my-files/docs/a.txt"), 2);
+    assert_eq!(s.attempts_on("/my-files/docs/b.txt"), 1);
+    drop(s);
+    // Once per file, both ways: started in round 1, finished with the final result.
+    let (a_started, a_finished) = op_events(&run.events, "a.txt");
+    let (b_started, b_finished) = op_events(&run.events, "b.txt");
+    assert_eq!((a_started, b_started), (1, 1));
+    assert_eq!(a_finished.len(), 1);
+    assert_eq!(
+        b_finished,
+        vec![(
+            false,
+            Some("cancelled before the retry could run".to_string())
+        )]
+    );
+    assert!(!a_finished[0].0);
+    assert_eq!(run.result.errors.len(), 2, "{:?}", run.result.errors);
+    assert!(baseline(&c).is_empty());
+}
+
+#[test]
+fn cancel_during_a_retry_wait_ends_the_run_within_a_second() {
+    let t = Tmp::new("retry-cancel");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/a.txt"), "payload");
+    script(&store, "/my-files/docs/a.txt", &["transient"; 10]);
+    let cancel = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
+    let setter = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    let started = Instant::now();
+    // Full-length schedule: the first wait alone is at least 1 s.
+    let run = run_retrying(&c, fake, Duration::from_secs(1), Some(&cancel));
+    let elapsed = started.elapsed();
+    setter.join().unwrap();
+    assert!(elapsed < Duration::from_millis(1300), "{elapsed:?}");
+    assert_eq!(store.borrow().attempts_on("/my-files/docs/a.txt"), 1);
+    assert!(!baseline(&c).contains_key("a.txt"));
+    let (started_events, finished) = op_events(&run.events, "a.txt");
+    assert_eq!(started_events, 1);
+    assert_eq!(finished.len(), 1);
+    assert!(!finished[0].0);
+    assert!(
+        run.result
+            .errors
+            .iter()
+            .any(|e| e.starts_with("upload a.txt: ") && e.contains("cancelled")),
+        "{:?}",
+        run.result.errors
+    );
+}
+
+#[test]
+fn cancel_during_a_download_retry_wait_ends_the_run_within_a_second() {
+    let t = Tmp::new("retry-cancel-down");
+    let c = cfg(t.path());
+    std::fs::create_dir_all(t.path().join("local")).unwrap();
+    let (fake, store) = FakeRemote::new();
+    seed_remote_file(&store, "a.txt", "payload");
+    script(&store, "/my-files/docs/a.txt", &["transient"; 10]);
+    let cancel = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
+    let setter = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    let started = Instant::now();
+    let run = run_retrying(&c, fake, Duration::from_secs(1), Some(&cancel));
+    let elapsed = started.elapsed();
+    setter.join().unwrap();
+    assert!(elapsed < Duration::from_millis(1300), "{elapsed:?}");
+    assert_eq!(store.borrow().attempts_on("/my-files/docs/a.txt"), 1);
+    assert!(!baseline(&c).contains_key("a.txt"));
+    assert!(!t.path().join("local/a.txt").exists());
+    let (started_events, finished) = op_events(&run.events, "a.txt");
+    assert_eq!(started_events, 1);
+    assert_eq!(
+        finished,
+        vec![(false, Some("cancelled while waiting to retry".to_string()))]
+    );
+}
+
+#[test]
+fn rate_limited_retry_after_raises_the_wait() {
+    let t = Tmp::new("retry-after");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/a.txt"), "payload");
+    // retry_after = 2 at a 100 ms unit: at least 200 ms before the next
+    // attempt, where plain backoff for the first retry would allow 100 ms.
+    script(&store, "/my-files/docs/a.txt", &["rate_limited:2"]);
+    let run = run_retrying(&c, fake, Duration::from_millis(100), None);
+    assert!(run.result.errors.is_empty(), "{:?}", run.result.errors);
+    let s = store.borrow();
+    let times = &s.attempts["/my-files/docs/a.txt"];
+    assert_eq!(times.len(), 2);
+    let gap = times[1].duration_since(times[0]);
+    assert!(gap >= Duration::from_millis(200), "{gap:?}");
+    assert!(gap < Duration::from_millis(1000), "{gap:?}");
+    drop(s);
+    assert!(baseline(&c).contains_key("a.txt"));
+}
+
+#[test]
+fn rate_limited_pause_above_five_minutes_is_left_for_the_next_run() {
+    let t = Tmp::new("retry-after-long");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/a.txt"), "payload");
+    script(&store, "/my-files/docs/a.txt", &["rate_limited:301"]);
+    let run = run_retrying(&c, fake, FAST, None);
+    assert_eq!(store.borrow().attempts_on("/my-files/docs/a.txt"), 1);
+    assert_eq!(run.result.errors.len(), 1);
+    assert!(
+        !run.result.errors[0].contains("gave up"),
+        "{:?}",
+        run.result.errors
+    );
+    assert!(!baseline(&c).contains_key("a.txt"));
 }

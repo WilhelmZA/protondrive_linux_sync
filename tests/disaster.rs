@@ -439,8 +439,22 @@ fn e_sidecar_exits_during_a_mixed_run() {
         expected.insert(format!("down{i}.txt"), body.into_bytes());
     }
     lab.controls(json!({"exit_after_writes": 5}));
+    let starts_before = lab.lines("starts").len();
     let (code, out, err) = lab.run(&["sync"]);
-    assert_ne!(code, 0, "a run whose sidecar died must fail:\n{out}\n{err}");
+    // The fifth write dies with the sidecar. The client reports it as
+    // transient, the engine retries it in the same run, and the retry starts
+    // a replacement sidecar, so the run itself completes.
+    assert_eq!(code, 0, "the retried run must complete:\n{out}\n{err}");
+    assert!(
+        err.contains("retry 1 of 3 in "),
+        "the retry is logged:\n{err}"
+    );
+    assert_eq!(
+        lab.lines("starts").len(),
+        starts_before + 2,
+        "the run's own sidecar and one replacement"
+    );
+    assert_eq!(lab.remote_files().len(), 20, "{out}\n{err}");
     lab.converge(&expected);
 }
 

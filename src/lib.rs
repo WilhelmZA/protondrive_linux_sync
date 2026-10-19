@@ -21,6 +21,7 @@ pub mod logger;
 pub mod models;
 pub mod process_lock;
 pub mod remote;
+pub mod retry;
 pub mod service;
 pub mod state;
 pub mod stats;
@@ -84,6 +85,12 @@ debounce = 2
 # for a new version on launch (notify only - it never installs anything).
 # update_channel = "stable"    # or "prerelease"
 # check_on_launch = false
+
+# Speed limits in KB/s (1 KB = 1024 bytes), 0 = no limit. They apply to all
+# folders together and take effect on the next sync. The GUI offers presets
+# from 256 KB/s to 10 MB/s under Settings > Network.
+# upload_limit_kbps = 0
+# download_limit_kbps = 0
 
 # Add one [[pair]] per folder you want kept in sync. None are created for you;
 # add them here or from the GUI. Example (uncomment and edit):

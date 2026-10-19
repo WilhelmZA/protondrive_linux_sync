@@ -185,7 +185,20 @@ def mutable(request):
                 try:
                     data = bytes.fromhex(n['data'])
                     temp.write_bytes(data[:1])
-                    time.sleep(controls.get('download_delay', 0))
+                    # `download_progress_every` sends transfer.progress for this
+                    # request at that interval while the delay runs, so a test
+                    # can prove a moving transfer outlives the idle timeout.
+                    delay = controls.get('download_delay', 0)
+                    every = controls.get('download_progress_every')
+                    if every:
+                        waited = 0
+                        while waited < delay:
+                            step = min(every, delay - waited)
+                            time.sleep(step)
+                            waited += step
+                            send(dict(method='transfer.progress', params=dict(id=rid, bytes=1, total=len(data))))
+                    else:
+                        time.sleep(delay)
                     if controls.get('download_error'):
                         raise Failure(controls['download_error'])
                     temp.write_bytes(data)
@@ -299,6 +312,13 @@ for line in sys.stdin:
         with feed_lock:
             subscription = dict(cursor=cursor, ack_required=params.get('ack_required', False), delivered={cursor}, notices=set())
         send(dict(id=rid, result=dict(scope_id='scope', last_event_id=cursor)))
+        continue
+    if method == 'transfer.set_limits':
+        controls = read_json('controls.json', {})
+        if controls.get('set_limits_error'):
+            send(dict(id=rid, error=dict(code=-32000, message='scripted', data=dict(code=controls['set_limits_error']))))
+        else:
+            send(dict(id=rid, result=dict(ok=True)))
         continue
     if method == 'events.ack':
         with feed_lock:

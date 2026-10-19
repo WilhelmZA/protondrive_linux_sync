@@ -15,11 +15,32 @@ use serde_json::{json, Value};
 
 use crate::changefeed::{FeedMessage, RemoteChangeFeed, Subscription};
 use crate::config::{remote_join, Config};
+use crate::logger::Logger;
 use crate::models::{DownloadJob, Entry, TreeScan, Uploaded};
 use crate::remote::{is_safe_component, ListOutcome, Remote};
 
 pub const SIDECAR_NAME: &str = "neutronsync-drive";
+/// A call fails after this long with no reply. For `file.upload` and
+/// `file.download` it is an idle timeout: every `transfer.progress`
+/// notification for the call starts it again, so a slow but moving transfer
+/// is never cut off.
 const CALL_TIMEOUT: Duration = Duration::from_secs(900);
+/// Longest single wait before progress is checked.
+const WAIT_SLICE: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+pub(crate) static TEST_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
+
+fn call_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = TEST_TIMEOUT_MS.load(Ordering::Relaxed);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    CALL_TIMEOUT
+}
 
 #[derive(Debug)]
 pub struct RpcError {
@@ -72,6 +93,8 @@ struct Client {
     socket: Option<UnixStream>,
     next: AtomicU64,
     pending: Mutex<HashMap<u64, mpsc::Sender<Reply>>>,
+    /// When the sidecar last reported progress for a pending transfer.
+    progress: Mutex<HashMap<u64, Instant>>,
     walk_sink: Mutex<Option<mpsc::Sender<Value>>>,
     feed: Mutex<VecDeque<FeedMessage>>,
     // Notifications have no request id, so only one walk can be in flight.
@@ -132,6 +155,7 @@ impl Client {
             socket,
             next: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
+            progress: Mutex::new(HashMap::new()),
             walk_sink: Mutex::new(None),
             feed: Mutex::new(VecDeque::new()),
             walk_lock: Mutex::new(()),
@@ -165,6 +189,7 @@ impl Client {
                 let _ = tx.send(Err(RpcError::new("transient")));
             }
         }
+        self.progress.lock().unwrap().clear();
         *self.walk_sink.lock().unwrap() = None;
         self.stop();
     }
@@ -203,6 +228,13 @@ impl Client {
         } else if msg.get("method").and_then(Value::as_str) == Some("walk.entry") {
             if let Some(tx) = &*self.walk_sink.lock().unwrap() {
                 let _ = tx.send(msg.get("params").cloned().unwrap_or(Value::Null));
+            }
+        } else if msg.get("method").and_then(Value::as_str) == Some("transfer.progress") {
+            // Only the timeout reads this; progress is not forwarded anywhere.
+            if let Some(id) = msg["params"]["id"].as_u64() {
+                if self.pending.lock().unwrap().contains_key(&id) {
+                    self.progress.lock().unwrap().insert(id, Instant::now());
+                }
             }
         } else if msg.get("method").and_then(Value::as_str) == Some("auth.signed_out") {
             self.feed.lock().unwrap().push_back(FeedMessage::SignedOut);
@@ -248,14 +280,32 @@ impl Client {
         if sent.is_err() {
             self.fail();
         }
-        match rx.recv_timeout(CALL_TIMEOUT) {
-            Ok(reply) => Ok(reply?),
-            Err(_) => {
-                // A timed-out walk must not leak notifications into the next walk.
-                self.fail();
-                Err(RpcError::new("transient").into())
+        let timeout = call_timeout();
+        let idle = matches!(method, "file.upload" | "file.download");
+        let mut deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match rx.recv_timeout((deadline - now).min(WAIT_SLICE)) {
+                Ok(reply) => {
+                    self.progress.lock().unwrap().remove(&id);
+                    return Ok(reply?);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if idle {
+                        if let Some(at) = self.progress.lock().unwrap().get(&id) {
+                            deadline = deadline.max(*at + timeout);
+                        }
+                    }
+                }
             }
         }
+        // A timed-out walk must not leak notifications into the next walk.
+        self.fail();
+        Err(RpcError::new("transient").into())
     }
 }
 
@@ -452,6 +502,11 @@ fn to_entry(raw: &Value) -> Option<Entry> {
 pub struct DriveApi {
     binary: PathBuf,
     download_threads: usize,
+    /// Upload and download limits in bytes per second (0 = no limit).
+    limits: (u64, u64),
+    /// Set once `transfer.set_limits` has been sent from this instance. The
+    /// lock also holds a second transfer back until the first has sent it.
+    limits_sent: Mutex<bool>,
     feed_client: Mutex<Option<Arc<Client>>>,
 }
 
@@ -465,8 +520,40 @@ impl DriveApi {
         Ok(Self {
             binary,
             download_threads: cfg.download_threads,
+            limits: (
+                cfg.upload_limit_kbps.saturating_mul(1024),
+                cfg.download_limit_kbps.saturating_mul(1024),
+            ),
+            limits_sent: Mutex::new(false),
             feed_client: Mutex::new(None),
         }) // Lazy session and process.
+    }
+
+    /// Send the configured speed limits once, before this instance's first
+    /// transfer. The engine builds a backend per run from a reloaded config, so
+    /// a change in Settings reaches the sidecar on the next run. A limit must
+    /// never block syncing: on any failure but `auth` the transfer goes ahead
+    /// unthrottled after one warning.
+    fn ensure_limits(&self, client: &Client) -> Result<()> {
+        let mut sent = self.limits_sent.lock().unwrap();
+        if *sent {
+            return Ok(());
+        }
+        *sent = true;
+        let (upload, download) = self.limits;
+        match client.call(
+            "transfer.set_limits",
+            json!({"upload_bytes_per_sec": upload, "download_bytes_per_sec": download}),
+        ) {
+            Ok(_) => Ok(()),
+            Err(e) if is_code(&e, "auth") => Err(e),
+            Err(e) => {
+                Logger::console(false, false).warn(&format!(
+                    "speed limits not applied, syncing without them: {e}"
+                ));
+                Ok(())
+            }
+        }
     }
 
     pub fn status(&self) -> Result<Value> {
@@ -570,6 +657,7 @@ impl Remote for DriveApi {
             bail!("api backend: unsafe name");
         }
         let client = shared(&self.binary)?;
+        self.ensure_limits(&client)?;
         let uid = Self::resolve(&client, parent)?;
         let result = client.call(
             "file.upload",
@@ -592,6 +680,7 @@ impl Remote for DriveApi {
     fn download(&self, remote: &str, dest: &str) -> Result<()> {
         let (_, name) = split_remote(remote)?;
         let client = shared(&self.binary)?;
+        self.ensure_limits(&client)?;
         let uid = Self::node(&client, remote)?;
         client.call(
             "file.download",
@@ -626,7 +715,7 @@ impl Remote for DriveApi {
         threads: usize,
         cancel: &AtomicBool,
         on_start: &(dyn Fn(&DownloadJob) + Sync),
-        on_done: &(dyn Fn(&DownloadJob, std::result::Result<(), String>) + Sync),
+        on_done: &(dyn Fn(&DownloadJob, Result<()>) + Sync),
     ) {
         let workers = if threads > 0 {
             threads
@@ -649,10 +738,7 @@ impl Remote for DriveApi {
                     };
                     let Some(job) = job else { break };
                     on_start(job);
-                    let result = self
-                        .download(&job.remote_path, &job.dest_dir)
-                        .map_err(|e| e.to_string());
-                    on_done(job, result);
+                    on_done(job, self.download(&job.remote_path, &job.dest_dir));
                 });
             }
         });
@@ -832,5 +918,95 @@ mod tests {
     fn auth_error_uses_existing_signout_classifier() {
         let error = RpcError::from_value(&json!({"data":{"code":"auth"}}));
         assert!(crate::remote::is_not_logged_in(&error.to_string()));
+    }
+
+    /// AC-6: a transfer that keeps reporting progress outlives the call
+    /// timeout; one that goes quiet fails as `transient` once the timeout has
+    /// passed with no progress. The fixture sidecar runs over stdio with a
+    /// 1 s timeout injected under test.
+    #[test]
+    fn transfer_progress_restarts_the_call_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+        std::env::set_var("NEUTRONSYNC_DRIVE_STDIO", "1");
+        TEST_TIMEOUT_MS.store(1000, Ordering::Relaxed);
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = temp.path().join("sidecar");
+        std::fs::write(&sidecar, include_str!("../tests/fixtures/drive_sidecar.py")).unwrap();
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            temp.path().join("tree.json"),
+            json!({
+                "root": {"name":"my-files","type":"folder","parent_uid":null},
+                "test": {"name":"test","type":"folder","parent_uid":"root"},
+                "file": {"name":"file","type":"file","parent_uid":"test","data":"6869","size":2,"sha1":"x","mtime":1700000000}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let local = temp.path().join("local");
+        std::fs::create_dir(&local).unwrap();
+        let cfg_path = temp.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[cli]\nsidecar = {:?}\n[options]\nstate_dir = {:?}\n",
+                sidecar,
+                temp.path().join("state")
+            ),
+        )
+        .unwrap();
+        let cfg = crate::config::load(cfg_path.to_str()).unwrap();
+        let api = DriveApi::new(&cfg).unwrap();
+        let controls = |value: Value| {
+            std::fs::write(temp.path().join("controls.json"), value.to_string()).unwrap();
+        };
+
+        // Progress every 300 ms through a 3 s transfer: three times the timeout.
+        controls(json!({"download_delay": 3, "download_progress_every": 0.3}));
+        let started = Instant::now();
+        api.download("/my-files/test/file", local.to_str().unwrap())
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(3));
+        assert_eq!(std::fs::read(local.join("file")).unwrap(), b"hi");
+
+        // Silence for longer than the timeout fails as transient, promptly.
+        controls(json!({"download_delay": 4}));
+        let started = Instant::now();
+        let error = api
+            .download("/my-files/test/file", local.to_str().unwrap())
+            .unwrap_err();
+        assert_eq!(error.downcast_ref::<RpcError>().unwrap().code, "transient");
+        assert!(
+            started.elapsed() >= Duration::from_secs(1)
+                && started.elapsed() < Duration::from_millis(2500),
+            "{:?}",
+            started.elapsed()
+        );
+        // Every request the fixture saw, in order: the limits call precedes
+        // the first transfer and is sent once for this instance.
+        let calls: Vec<String> = std::fs::read_to_string(temp.path().join("calls"))
+            .unwrap()
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["method"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            calls.iter().filter(|m| *m == "transfer.set_limits").count(),
+            1
+        );
+        assert!(
+            calls
+                .iter()
+                .position(|m| m == "transfer.set_limits")
+                .unwrap()
+                < calls.iter().position(|m| m == "file.download").unwrap()
+        );
+        TEST_TIMEOUT_MS.store(0, Ordering::Relaxed);
+        // The timed-out client was torn down; the sidecar is gone with it.
+        let _ = api.status();
     }
 }

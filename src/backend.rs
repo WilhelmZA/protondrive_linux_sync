@@ -70,7 +70,7 @@ impl<R: Remote + ?Sized> Remote for Box<R> {
         threads: usize,
         cancel: &AtomicBool,
         on_start: &(dyn Fn(&DownloadJob) + Sync),
-        on_done: &(dyn Fn(&DownloadJob, std::result::Result<(), String>) + Sync),
+        on_done: &(dyn Fn(&DownloadJob, Result<()>) + Sync),
     ) {
         (**self).download_many(jobs, threads, cancel, on_start, on_done)
     }

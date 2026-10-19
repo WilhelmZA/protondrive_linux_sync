@@ -711,7 +711,7 @@ fn transfer_thread_overrides_fallback_clamp_and_error_callbacks() {
     let failed = AtomicUsize::new(0);
     h.api
         .download_many(&jobs, 2, &AtomicBool::new(false), &|_| {}, &|_, result| {
-            assert!(is_not_logged_in(&result.unwrap_err()));
+            assert!(is_not_logged_in(&result.unwrap_err().to_string()));
             failed.fetch_add(1, Ordering::SeqCst);
         });
     assert_eq!(failed.load(Ordering::SeqCst), jobs.len());
@@ -879,4 +879,124 @@ fn shallow_batch_shares_one_allowance_across_its_folders() {
     assert_eq!(held_events(&events), vec![(0, 120, 1_000)]);
     let row = h.held_row().expect("held_deletes row");
     assert_eq!((row.local, row.remote, row.tracked), (0, 120, 1_000));
+}
+
+// ---- speed limits reach the sidecar once per instance ------------------------
+
+#[test]
+fn speed_limits_are_sent_once_per_instance_before_the_first_transfer() {
+    let mut h = Harness::new();
+    h.cfg.upload_limit_kbps = 512;
+    h.cfg.download_limit_kbps = 256;
+    h.remote("down.txt", "test", Some("remote bytes"));
+    h.local("up.txt", "local bytes");
+    let calls = |h: &Harness| -> Vec<Value> {
+        fs::read_to_string(h.dir.path().join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    // One instance, two directions, three transfers: one limits call, first.
+    let api = DriveApi::new(&h.cfg).unwrap();
+    api.upload(
+        h.cfg.pairs[0].local.join("up.txt").to_str().unwrap(),
+        "/my-files/test",
+    )
+    .unwrap();
+    api.download(
+        "/my-files/test/down.txt",
+        h.cfg.pairs[0].local.to_str().unwrap(),
+    )
+    .unwrap();
+    api.upload(
+        h.cfg.pairs[0].local.join("up.txt").to_str().unwrap(),
+        "/my-files/test",
+    )
+    .unwrap();
+    let seen = calls(&h);
+    let limits: Vec<&Value> = seen
+        .iter()
+        .filter(|c| c["method"] == "transfer.set_limits")
+        .collect();
+    assert_eq!(limits.len(), 1, "{seen:?}");
+    assert_eq!(
+        limits[0]["params"],
+        json!({"upload_bytes_per_sec": 512 * 1024, "download_bytes_per_sec": 256 * 1024})
+    );
+    let position = |method: &str| seen.iter().position(|c| c["method"] == method).unwrap();
+    assert!(position("transfer.set_limits") < position("file.upload"));
+    assert!(position("transfer.set_limits") < position("file.download"));
+    // A second instance sends its own limits, again before its first transfer.
+    let before = seen.len();
+    let other = DriveApi::new(&h.cfg).unwrap();
+    other
+        .download(
+            "/my-files/test/down.txt",
+            h.cfg.pairs[0].local.to_str().unwrap(),
+        )
+        .unwrap();
+    let seen = calls(&h);
+    let later: Vec<&str> = seen[before..]
+        .iter()
+        .map(|c| c["method"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        later
+            .iter()
+            .filter(|m| **m == "transfer.set_limits")
+            .count(),
+        1
+    );
+    assert!(
+        later
+            .iter()
+            .position(|m| *m == "transfer.set_limits")
+            .unwrap()
+            < later.iter().position(|m| *m == "file.download").unwrap()
+    );
+    // A failed limits call is a warning, not a failed transfer, and is not retried.
+    h.controls(json!({"set_limits_error": "fatal"}));
+    let before = seen.len();
+    let third = DriveApi::new(&h.cfg).unwrap();
+    third
+        .download(
+            "/my-files/test/down.txt",
+            h.cfg.pairs[0].local.to_str().unwrap(),
+        )
+        .unwrap();
+    third
+        .download(
+            "/my-files/test/down.txt",
+            h.cfg.pairs[0].local.to_str().unwrap(),
+        )
+        .unwrap();
+    let seen = calls(&h);
+    let later: Vec<&str> = seen[before..]
+        .iter()
+        .map(|c| c["method"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        later
+            .iter()
+            .filter(|m| **m == "transfer.set_limits")
+            .count(),
+        1
+    );
+    assert_eq!(later.iter().filter(|m| **m == "file.download").count(), 2);
+    assert_eq!(
+        fs::read_to_string(h.cfg.pairs[0].local.join("down.txt")).unwrap(),
+        "remote bytes"
+    );
+    // An auth failure on the limits call is the transfer's failure too.
+    h.controls(json!({"set_limits_error": "auth"}));
+    let fourth = DriveApi::new(&h.cfg).unwrap();
+    let error = fourth
+        .download(
+            "/my-files/test/down.txt",
+            h.cfg.pairs[0].local.to_str().unwrap(),
+        )
+        .unwrap_err();
+    assert!(is_not_logged_in(&error.to_string()));
+    h.controls(json!({}));
 }

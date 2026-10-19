@@ -92,6 +92,7 @@ Requests:
 - `node.trash { uids }` (never `delete`)
 - `events.subscribe { scope_id, since_event_id? }`
 - `events.ack { event_id }`
+- `transfer.set_limits { upload_bytes_per_sec, download_bytes_per_sec }` → `{ ok }`. Both values are non-negative integers; 0 means no limit, and anything else (missing, negative, fractional, non-numeric) is refused as `fatal`. The call replaces both limits for the whole sidecar process, so the last call wins for every client of the session, and a restarted sidecar has no limit until the next call. The sidecar enforces the limits itself: one token bucket per direction, shared by every connection and every concurrent transfer, with about one second of burst. The Rust client sends the call once per `DriveApi` instance, before that instance's first `file.upload` or `file.download`, from the `upload_limit_kbps` and `download_limit_kbps` keys in `[options]` (KiB/s, converted to bytes per second). A failed call other than `auth` is logged as one warning and the transfer goes ahead without a limit.
 
 Notifications:
 
@@ -100,6 +101,8 @@ Notifications:
 - `auth.signed_out`, `transfer.progress { id, bytes, total }`, `log { level, msg }`
 
 `Entry` keeps today's shape (name, type, size from `claimedSize`, mtime from `claimedModificationTime`, `sha1` from `claimedDigests`) and adds `uid` and `parent_uid`.
+
+Timeouts: every call fails as `transient` after 900 s with no reply, and the client tears the connection down. For `file.upload` and `file.download` that is an idle timeout, not a total one: the client records the time of every `transfer.progress` notification carrying the call's request id and only gives up once 900 s have passed with neither a reply nor progress, so a transfer slowed by a speed limit runs as long as it keeps moving. The SDK reports progress per block (an upload reads a whole block before it reports, a download reports network progress before it flushes the block into the file), so while the speed limiter is holding a transfer back the sidecar itself sends one `transfer.progress` for that request every second, with the bytes that have passed the limiter so far; it stops as soon as the limiter is not holding the transfer, so a stalled network still times out. Progress notifications are not forwarded beyond that timer.
 
 Errors carry a typed `code`: `not_found`, `auth`, `conflict`, `rate_limited { retry_after }`, `transient`, `fatal`. The Rust side must never read `not_found` from a failed listing as "empty"; it keeps the `ListOutcome` rule from today.
 

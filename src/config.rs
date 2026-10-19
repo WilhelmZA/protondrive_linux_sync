@@ -85,6 +85,10 @@ pub struct Config {
     pub update_channel: UpdateChannel,
     /// Check for updates when the GUI launches (notify only; never installs).
     pub check_on_launch: bool,
+    /// Upload speed limit in KiB/s for the whole machine (0 = no limit).
+    pub upload_limit_kbps: u64,
+    /// Download speed limit in KiB/s for the whole machine (0 = no limit).
+    pub download_limit_kbps: u64,
     pub state_dir: PathBuf,
     pub pairs: Vec<Pair>,
     pub source_path: Option<PathBuf>,
@@ -161,6 +165,8 @@ struct RawOptions {
     x11_compat: Option<bool>,
     update_channel: Option<String>,
     check_on_launch: Option<bool>,
+    upload_limit_kbps: Option<u64>,
+    download_limit_kbps: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -353,6 +359,9 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         bail!("options.max_delete_percent must be 0..=100, got {max_delete_percent}");
     }
 
+    let upload_limit_kbps = speed_limit("upload_limit_kbps", opts.upload_limit_kbps)?;
+    let download_limit_kbps = speed_limit("download_limit_kbps", opts.download_limit_kbps)?;
+
     // Zero pairs is allowed: the app can come up clean and folders get added
     // from the GUI. The engine/watcher simply have nothing to do until then.
     let raw_pairs = raw.pair.unwrap_or_default();
@@ -394,10 +403,23 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         debounce_secs: opts.debounce.unwrap_or(2),
         update_channel,
         check_on_launch: opts.check_on_launch.unwrap_or(false),
+        upload_limit_kbps,
+        download_limit_kbps,
         state_dir,
         pairs,
         source_path: Some(path),
     })
+}
+
+/// Highest speed limit accepted, in KiB/s: 1 GiB/s. Anything above it is a typo.
+pub const MAX_LIMIT_KBPS: u64 = 1_048_576;
+
+fn speed_limit(key: &str, value: Option<u64>) -> Result<u64> {
+    let value = value.unwrap_or(0);
+    if value > MAX_LIMIT_KBPS {
+        bail!("options.{key} must be 0..={MAX_LIMIT_KBPS} (KB/s, 0 = no limit), got {value}");
+    }
+    Ok(value)
 }
 
 /// Path helper used by the engine to build absolute remote paths.
@@ -443,6 +465,8 @@ struct OutOptions {
     debounce: u64,
     update_channel: String,
     check_on_launch: bool,
+    upload_limit_kbps: u64,
+    download_limit_kbps: u64,
     state_dir: String,
 }
 
@@ -517,6 +541,8 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
             debounce: cfg.debounce_secs,
             update_channel: update_channel_str(cfg.update_channel).to_string(),
             check_on_launch: cfg.check_on_launch,
+            upload_limit_kbps: cfg.upload_limit_kbps,
+            download_limit_kbps: cfg.download_limit_kbps,
             state_dir: cfg.state_dir.to_string_lossy().into_owned(),
         },
         pair: cfg
@@ -624,5 +650,63 @@ state_dir = "/tmp/ns-test-state"
         fs::write(&path, format!("{base}max_delete_percent = 101\n")).unwrap();
         let err = load(path.to_str()).unwrap_err().to_string();
         assert!(err.contains("max_delete_percent"), "{err}");
+    }
+
+    #[test]
+    fn speed_limits_default_round_trip_and_refuse_absurd_values() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("cfg.toml");
+        let base = r#"
+[cli]
+backend = "api"
+[options]
+state_dir = "/tmp/ns-test-state"
+"#;
+        fs::write(&path, base).unwrap();
+        let mut cfg = load(path.to_str()).unwrap();
+        assert_eq!((cfg.upload_limit_kbps, cfg.download_limit_kbps), (0, 0));
+        for (up, down) in [
+            (256u64, 0u64),
+            (0, 1024),
+            (750, 10240),
+            (1_048_576, 1_048_576),
+        ] {
+            cfg.upload_limit_kbps = up;
+            cfg.download_limit_kbps = down;
+            save(&cfg, &path).unwrap();
+            let text = fs::read_to_string(&path).unwrap();
+            assert!(
+                text.contains(&format!("upload_limit_kbps = {up}")),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!("download_limit_kbps = {down}")),
+                "{text}"
+            );
+            let loaded = load(path.to_str()).unwrap();
+            assert_eq!(
+                (loaded.upload_limit_kbps, loaded.download_limit_kbps),
+                (up, down)
+            );
+        }
+        for key in ["upload_limit_kbps", "download_limit_kbps"] {
+            fs::write(&path, format!("{base}{key} = 1048577\n")).unwrap();
+            let err = load(path.to_str()).unwrap_err().to_string();
+            assert!(err.contains(key), "{err}");
+            assert!(err.contains("1048576"), "{err}");
+        }
+        for example in [
+            crate::EXAMPLE_CONFIG,
+            include_str!("../neutronsync.example.toml"),
+        ] {
+            assert!(example.contains("# upload_limit_kbps = 0"));
+            assert!(example.contains("# download_limit_kbps = 0"));
+            fs::write(&path, example).unwrap();
+            let loaded = load(path.to_str()).unwrap();
+            assert_eq!(
+                (loaded.upload_limit_kbps, loaded.download_limit_kbps),
+                (0, 0)
+            );
+        }
     }
 }

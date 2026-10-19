@@ -77,6 +77,13 @@ compare = "size+mtime"
 # update_channel = "stable"
 # check_on_launch = false
 
+# Speed limits in KB/s (1 KB = 1024 bytes), 0 = no limit. They apply to all
+# folders together, uploads and downloads separately, and take effect on the
+# next sync. The GUI offers presets from 256 KB/s to 10 MB/s under
+# Settings > Network. Values above 1048576 (1 GB/s) are refused.
+# upload_limit_kbps = 0
+# download_limit_kbps = 0
+
 # Add one [[pair]] per folder you want kept in sync. None exist by default;
 # uncomment and edit. `auto` (default true) includes the pair when "Auto sync"
 # (the watch daemon) is on; set it false to keep a pair manual-only.

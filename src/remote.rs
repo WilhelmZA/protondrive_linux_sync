@@ -105,7 +105,8 @@ pub trait Remote {
     /// Download many files. Default = sequential; `DriveApi` overrides with a
     /// bounded worker pool. `on_start`/`on_done` fire per job (their
     /// sinks must be thread-safe). Stops early if `cancel` is set. `on_done`
-    /// receives Ok or the error string.
+    /// receives Ok or the typed error, so the engine can tell a temporary
+    /// failure from a permanent one.
     #[allow(clippy::type_complexity)]
     fn download_many(
         &self,
@@ -113,16 +114,14 @@ pub trait Remote {
         _threads: usize,
         cancel: &AtomicBool,
         on_start: &(dyn Fn(&DownloadJob) + Sync),
-        on_done: &(dyn Fn(&DownloadJob, std::result::Result<(), String>) + Sync),
+        on_done: &(dyn Fn(&DownloadJob, Result<()>) + Sync),
     ) {
         for j in jobs {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
             on_start(j);
-            let r = self
-                .download(&j.remote_path, &j.dest_dir)
-                .map_err(|e| e.to_string());
+            let r = self.download(&j.remote_path, &j.dest_dir);
             on_done(j, r);
         }
     }

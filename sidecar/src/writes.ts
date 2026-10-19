@@ -8,6 +8,7 @@ import type { ProtonDriveClient, NodeResult } from '@protontech/drive-sdk';
 import type { ReadClient } from './drive';
 import { Fault, classify } from './errors';
 import type { Notify, SafeLog } from './log';
+import * as throttle from './throttle';
 
 export type WriteClient = Pick<ProtonDriveClient, 'createFolder' | 'renameNode' | 'moveNodes' | 'trashNodes' | 'getFileUploader' | 'getFileRevisionUploader' | 'getFileDownloader'>;
 export function safeName(name: string) {
@@ -66,11 +67,14 @@ export class Writes {
       const uid = replace ?? existing?.uid;
       const uploader = uid ? await this.client.getFileRevisionUploader(uid, metadata) : await this.client.getFileUploader(parent, name, metadata);
       const input = createReadStream(source);
+      // The upload limit sits between the snapshot and the SDK; the SHA-1 pass above is local disk and runs at full speed.
+      const keepalive = new throttle.Keepalive(() => this.notify('transfer.progress', { id, bytes: limited.passed, total: size }));
+      const limited = input.pipe(throttle.throttled(throttle.upload, keepalive));
       try {
-        const controller = await uploader.uploadFromStream(Readable.toWeb(input) as unknown as ReadableStream, [], bytes => this.notify('transfer.progress', { id, bytes, total: size }));
+        const controller = await uploader.uploadFromStream(Readable.toWeb(limited) as unknown as ReadableStream, [], bytes => this.notify('transfer.progress', { id, bytes, total: size }));
         const result = await controller.completion();
         return { uid: result.nodeUid, revision_uid: result.nodeRevisionUid, sha1, size, mtime };
-      } finally { input.destroy(); }
+      } finally { keepalive.end(); limited.destroy(); input.destroy(); }
     } finally { await rm(snapshot, { recursive: true, force: true }); }
   }
 
@@ -82,12 +86,15 @@ export class Writes {
     const claimedSha1 = revision?.claimedDigests?.sha1?.toLowerCase() || null;
     const temp = join(dirname(path), `.neutronsync-${randomUUID()}.tmp`);
     const file = await open(temp, 'wx', 0o600);
+    const hash = createHash('sha1');
+    let size = 0;
+    const progress = (bytes: number) => this.notify('transfer.progress', { id, bytes, total: claimedSize });
+    const keepalive = new throttle.Keepalive(() => progress(size));
     try {
-      const hash = createHash('sha1');
-      let size = 0;
       const stream = new WritableStream<Uint8Array>({
         async write(chunk) {
           signal?.throwIfAborted();
+          await throttle.download.take(chunk.length, signal, keepalive);
           let offset = 0;
           while (offset < chunk.length) {
             const { bytesWritten } = await file.write(chunk, offset, chunk.length - offset);
@@ -98,7 +105,7 @@ export class Writes {
         },
       });
       const downloader = await this.client.getFileDownloader(uid, signal);
-      const controller = downloader.downloadToStream(stream, bytes => this.notify('transfer.progress', { id, bytes, total: claimedSize }));
+      const controller = downloader.downloadToStream(stream, progress);
       try { await controller.completion(); }
       catch (error) { if (!controller.isDownloadCompleteWithSignatureIssues()) throw error; }
       signal?.throwIfAborted();
@@ -119,6 +126,7 @@ export class Writes {
       await rename(temp, path);
       return { sha1, size, claimed_sha1: claimedSha1, claimed_size: claimedSize };
     } finally {
+      keepalive.end();
       try { await file.close(); }
       finally { await rm(temp, { force: true }); }
     }

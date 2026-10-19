@@ -2345,6 +2345,31 @@ impl App {
                     }
                 });
 
+                settings_group(ui, "NETWORK", |ui| {
+                    if setting_row(
+                        ui,
+                        "Upload limit",
+                        "Applies to all folders. Takes effect on the next sync.",
+                        |ui| combo_speed_limit(ui, "upload_limit", &mut self.cfg.upload_limit_kbps),
+                    ) {
+                        self.dirty = true;
+                    }
+                    if setting_row(
+                        ui,
+                        "Download limit",
+                        "Applies to all folders. Takes effect on the next sync.",
+                        |ui| {
+                            combo_speed_limit(
+                                ui,
+                                "download_limit",
+                                &mut self.cfg.download_limit_kbps,
+                            )
+                        },
+                    ) {
+                        self.dirty = true;
+                    }
+                });
+
                 settings_group(ui, "ADVANCED", |ui| {
                     if setting_row(ui, "Backend", "", |ui| {
                         ui.label(
@@ -4225,6 +4250,44 @@ fn combo_full_walk(ui: &mut egui::Ui, v: &mut u64) -> bool {
     changed
 }
 
+/// A speed limit in KB/s as the Settings page shows it: "No limit", a preset,
+/// or the configured value spelled out.
+fn speed_limit_label(kbps: u64) -> String {
+    if kbps == 0 {
+        "No limit".to_string()
+    } else if kbps.is_multiple_of(1024) {
+        format!("{} MB/s", kbps / 1024)
+    } else {
+        format!("{kbps} KB/s")
+    }
+}
+
+/// Upload or download limit. A value from the config file that is not a
+/// preset is listed as its own entry and kept until the user picks another.
+fn combo_speed_limit(ui: &mut egui::Ui, id: &str, v: &mut u64) -> bool {
+    const PRESETS: [u64; 7] = [0, 256, 512, 1024, 2048, 5120, 10240];
+    let mut choices: Vec<u64> = PRESETS.to_vec();
+    if !choices.contains(v) {
+        let pos = choices
+            .iter()
+            .position(|c| *c > *v)
+            .unwrap_or(choices.len());
+        choices.insert(pos, *v);
+    }
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(speed_limit_label(*v))
+        .height(320.0)
+        .show_ui(ui, |ui| {
+            for kbps in choices {
+                changed |= ui
+                    .selectable_value(v, kbps, speed_limit_label(kbps))
+                    .clicked();
+            }
+        });
+    changed
+}
+
 // -- starter config ----------------------------------------------------------
 fn starter_config(path: &Path) -> Config {
     Config {
@@ -4246,6 +4309,8 @@ fn starter_config(path: &Path) -> Config {
         debounce_secs: 2,
         update_channel: UpdateChannel::Stable,
         check_on_launch: false,
+        upload_limit_kbps: 0,
+        download_limit_kbps: 0,
         state_dir: {
             let base = std::env::var("XDG_STATE_HOME")
                 .map(PathBuf::from)
@@ -5058,7 +5123,16 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::plain_markdown;
+    use super::{plain_markdown, speed_limit_label};
+
+    #[test]
+    fn speed_limit_labels_are_plain_words() {
+        assert_eq!(speed_limit_label(0), "No limit");
+        assert_eq!(speed_limit_label(256), "256 KB/s");
+        assert_eq!(speed_limit_label(750), "750 KB/s");
+        assert_eq!(speed_limit_label(1024), "1 MB/s");
+        assert_eq!(speed_limit_label(10240), "10 MB/s");
+    }
 
     #[test]
     fn plain_markdown_strips_inline_marks() {

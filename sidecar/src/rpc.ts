@@ -4,6 +4,7 @@ import { hvTypes, type Auth, type HvType } from './auth';
 import type { Drive } from './drive';
 import { Fault, classify } from './errors';
 import type { Notify } from './log';
+import { setLimits } from './throttle';
 
 const codes = { not_found: -32004, auth: -32001, conflict: -32009, rate_limited: -32029, transient: -32050, fatal: -32603 };
 let connectionNumber = 0;
@@ -15,6 +16,7 @@ const traceFields: Record<string, string[]> = {
   'node.move': ['uid', 'new_parent_uid'], 'node.trash': ['uids'],
   'events.subscribe': ['scope_id', 'since_event_id', 'ack_required'],
   'events.ack': ['scope_id', 'event_id'],
+  'transfer.set_limits': ['upload_bytes_per_sec', 'download_bytes_per_sec'],
 };
 // Opt-in diagnostics retain routing and filesystem operations, never auth
 // parameters or auth results (including human-verification tokens).
@@ -24,6 +26,12 @@ export function rpcTrace(connection: number, direction: string, value: unknown) 
 function text(params: Record<string, unknown>, field: string): string {
   const value = params[field];
   if (typeof value !== 'string' || !value.length) throw new Fault('fatal');
+  return value;
+}
+// A missing, negative, fractional or non-numeric value is a caller bug, not a limit.
+function count(params: Record<string, unknown>, field: string): number {
+  const value = params[field];
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new Fault('fatal');
   return value;
 }
 
@@ -90,6 +98,7 @@ export async function serve(auth: Auth, getDrive: () => Promise<Drive>, close: (
           if (!Array.isArray(p.exclude_globs) || !p.exclude_globs.every((g: unknown) => typeof g === 'string')) throw new Fault('fatal');
           return (await getDrive()).walk(text(p, 'uid'), p.exclude_globs);
         }
+        case 'transfer.set_limits': return setLimits(count(p, 'upload_bytes_per_sec'), count(p, 'download_bytes_per_sec'));
         case 'events.subscribe': {
           if (p.since_event_id !== undefined && typeof p.since_event_id !== 'string') throw new Fault('fatal');
           if (p.ack_required !== undefined && typeof p.ack_required !== 'boolean') throw new Fault('fatal');

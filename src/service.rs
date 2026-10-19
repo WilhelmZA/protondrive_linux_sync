@@ -932,6 +932,8 @@ mod tests {
             debounce_secs: 2,
             update_channel: crate::config::UpdateChannel::Stable,
             check_on_launch: false,
+            upload_limit_kbps: 0,
+            download_limit_kbps: 0,
             state_dir: dir.path().to_path_buf(),
             pairs: vec![],
             source_path: None,
