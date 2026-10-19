@@ -1210,6 +1210,12 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
 
+        // advance page-fade animation
+        if self.nav_t < 1.0 {
+            let dt = ctx.input(|i| i.stable_dt).min(0.05);
+            self.nav_t = (self.nav_t + dt / 0.26).min(1.0);
+        }
+
         // The startup account probe lands on a background thread and egui only
         // repaints on input, so an idle window would show a stale pre-probe
         // frame forever (and never flip to the sign-in gate below). Keep
