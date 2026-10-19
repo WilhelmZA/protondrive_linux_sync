@@ -1,0 +1,171 @@
+name: AUR
+
+# Publishes neutronsync-bin to the AUR when a release becomes stable. The
+# `released` type fires for a release published as stable and for a
+# pre-release promoted to stable (scripts/promote.sh), never for a
+# pre-release as such.
+on:
+  release:
+    types: [released]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    # Say so rather than rely on the runner finding bash in the image.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # The AUR is optional: no key means a notice, not a failed promotion. A
+      # pre-release version number never reaches the AUR either.
+      - name: Decide whether this release goes to the AUR
+        id: gate
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          ver="${TAG#v}"
+          if [ -z "$AUR_SSH_KEY" ]; then
+            echo "::notice::AUR_SSH_KEY is not set, so ${TAG} is not published to the AUR."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          case "$ver" in
+            *-*)
+              echo "::notice::${TAG} is a pre-release version, which the AUR package never carries."
+              echo "go=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+          # Only digits and dots reach the sed that writes the PKGBUILD.
+          if ! [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::${TAG} is not a version like v0.7.0, so no PKGBUILD can be written for it."
+            exit 1
+          fi
+          echo "go=true" >> "$GITHUB_OUTPUT"
+          echo "ver=${ver}" >> "$GITHUB_OUTPUT"
+
+      - name: Install tools and the package's runtime dependencies
+        if: steps.gate.outputs.go == 'true'
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git openssh gnupg curl namcap \
+            glibc gtk3 libxkbcommon libglvnd libsecret libayatana-appindicator
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.go == 'true'
+
+      - name: Download the release files and verify the signature
+        if: steps.gate.outputs.go == 'true'
+        env:
+          VER: ${{ steps.gate.outputs.ver }}
+        run: |
+          set -euo pipefail
+          tag="v${VER}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
+          mkdir -p release
+          cd release
+          curl -fsSL --retry 3 -O "${base}/neutronsync-${tag}-x86_64-linux.tar.gz"
+          curl -fsSL --retry 3 -O "${base}/SHA256SUMS"
+          curl -fsSL --retry 3 -O "${base}/SHA256SUMS.asc"
+          export GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+          gpg --batch --quiet --import ../packaging/release-signing-key.asc
+          gpg --batch --verify SHA256SUMS.asc SHA256SUMS
+          sha256sum -c --ignore-missing SHA256SUMS
+          rm -rf "$GNUPGHOME"
+
+      # pkgver, the tarball's hash from the signed list, and the fingerprints
+      # of the committed keys are the only lines that change between releases.
+      - name: Fill in the PKGBUILD
+        if: steps.gate.outputs.go == 'true'
+        env:
+          VER: ${{ steps.gate.outputs.ver }}
+        run: |
+          set -euo pipefail
+          tag="v${VER}"
+          sum="$(awk -v f="neutronsync-${tag}-x86_64-linux.tar.gz" '$2 == f { print $1 }' release/SHA256SUMS)"
+          [ -n "$sum" ] || { echo "::error::SHA256SUMS has no line for the binary tarball"; exit 1; }
+          # Every committed key, as 'F1' 'F2' ..., so makepkg accepts a
+          # signature by either key during rotation.
+          fprs="$(gpg --batch --with-colons --show-keys packaging/release-signing-key.asc | awk -F: '$1 == "fpr" { printf "%s\047%s\047", (n++ ? " " : ""), $10 }')"
+          [ -n "$fprs" ] || { echo "::error::packaging/release-signing-key.asc holds no key"; exit 1; }
+          sed -i \
+            -e "s/^pkgver=.*/pkgver=${VER}/" \
+            -e "s/^pkgrel=.*/pkgrel=1/" \
+            -e "s/^sha256sums=.*/sha256sums=('${sum}' 'SKIP' 'SKIP')/" \
+            -e "s/^validpgpkeys=.*/validpgpkeys=(${fprs})/" \
+            packaging/aur/PKGBUILD
+          grep -E '^(pkgver|pkgrel|sha256sums|validpgpkeys)=' packaging/aur/PKGBUILD
+
+      # makepkg refuses to run as root, so the build happens as a plain user
+      # whose keyring holds the release key for makepkg's own signature check.
+      # namcap exits 0 whatever it finds, so its output is read for error
+      # lines; one error blocks the push.
+      - name: Build the package and run namcap
+        if: steps.gate.outputs.go == 'true'
+        run: |
+          set -euo pipefail
+          useradd -m builder
+          cp -r packaging/aur /home/builder/aur
+          chown -R builder:builder /home/builder/aur
+          runuser -u builder -- gpg --batch --quiet --import packaging/release-signing-key.asc
+          runuser -u builder -- bash -euo pipefail -c '
+            cd ~/aur
+            makepkg --printsrcinfo > .SRCINFO
+            makepkg -f --noconfirm
+            namcap PKGBUILD ./*.pkg.tar.zst | tee namcap.out
+            if grep -q " E: " namcap.out; then
+              echo "::error::namcap reported an error; the package is not pushed."
+              exit 1
+            fi
+            # namcap only warns about a library nothing provides; the loader
+            # is the real test, with the declared dependencies installed.
+            for bin in neutronsync neutronsync-gui neutronsync-drive; do
+              if ldd "./pkg/neutronsync-bin/usr/bin/$bin" | grep -q "not found"; then
+                echo "::error::$bin needs a library no dependency provides; the package is not pushed."
+                ldd "./pkg/neutronsync-bin/usr/bin/$bin" | grep "not found"
+                exit 1
+              fi
+            done
+            ./pkg/neutronsync-bin/usr/bin/neutronsync --version
+          '
+          cp /home/builder/aur/.SRCINFO packaging/aur/.SRCINFO
+
+      - name: Push to the AUR
+        if: steps.gate.outputs.go == 'true'
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+          VER: ${{ steps.gate.outputs.ver }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          # Pin the AUR host key: the fingerprint published at
+          # https://aur.archlinux.org (Ed25519).
+          ssh-keyscan -t ed25519 aur.archlinux.org > ~/.ssh/aur_known_hosts 2>/dev/null
+          got="$(ssh-keygen -lf ~/.ssh/aur_known_hosts | awk '{ print $2 }')"
+          want="SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4"
+          if [ "$got" != "$want" ]; then
+            echo "::error::aur.archlinux.org presented host key ${got}, expected ${want}"
+            exit 1
+          fi
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o UserKnownHostsFile=~/.ssh/aur_known_hosts -o IdentitiesOnly=yes"
+          git clone ssh://aur@aur.archlinux.org/neutronsync-bin.git aur-repo
+          cp packaging/aur/PKGBUILD packaging/aur/.SRCINFO aur-repo/
+          cd aur-repo
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "::notice::the AUR package is already at ${VER}; nothing to push."
+            exit 0
+          fi
+          git -c user.name="Wilhelm Schonfeldt" \
+              -c user.email="82225237+WilhelmZA@users.noreply.github.com" \
+              commit -q -m "Update to ${VER}"
+          git push origin HEAD:master

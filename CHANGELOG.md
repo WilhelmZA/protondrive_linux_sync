@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+- Releases are signed. Each one ships `SHA256SUMS` and `SHA256SUMS.asc`, signed with a dedicated release key whose public half is built into the app. From 0.7.0 on the updater checks that signature before it installs anything and discards a download that fails it; the release workflow refuses to publish an unsigned release.
+- `neutronsync --version` and the About page show the commit the build was made from.
+- An Arch Linux package, `neutronsync-bin`, on the AUR. It is published when a release is promoted to stable.
+
+### Fixed
+- The packages run on Ubuntu 22.04 and Debian 12 again. Releases are now built on Ubuntu 22.04, so the binaries need glibc 2.35 rather than 2.39, and the release job checks every shipped binary against that floor.
+- The RPM declares its dependencies by name instead of relying on a scan that produced requirements no repository could satisfy.
+
+### Changed
+- CI now fails on clippy warnings, formatting, a known advisory or an unapproved licence, and audits the sidecar's dependencies.
+
 ## [0.6.1] - 2026-10-19
 
 ### Fixed

@@ -50,7 +50,7 @@ impl EventSink for DbSink {
 #[derive(Parser)]
 #[command(
     name = "neutronsync",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("NEUTRONSYNC_BUILD_SHA"), ")"),
     about = "Bidirectional Proton Drive folder sync with a built-in API sidecar"
 )]
 struct Cli {

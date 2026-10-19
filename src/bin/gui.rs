@@ -167,7 +167,7 @@ fn thousands(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -1147,7 +1147,7 @@ impl eframe::App for App {
                     Ok(entries) => {
                         let mut dirs: Vec<Entry> =
                             entries.into_iter().filter(|e| e.is_dir).collect();
-                        dirs.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+                        dirs.sort_by_key(|d| d.path.to_lowercase());
                         self.browser_entries = dirs;
                     }
                     Err(e) => self.browser_error = Some(e),
@@ -1821,7 +1821,7 @@ impl App {
                                     {
                                         remove = Some(i);
                                     }
-                                    let syncing = ps.as_ref().map_or(false, |p| {
+                                    let syncing = ps.as_ref().is_some_and(|p| {
                                         matches!(p.phase, Phase::Scanning | Phase::Syncing)
                                     });
                                     if button(
@@ -2255,6 +2255,16 @@ impl App {
             RichText::new(format!("NeutronSync {}", env!("CARGO_PKG_VERSION")))
                 .font(FontId::new(16.0, ff_bold()))
                 .color(TEXT),
+        );
+        // The commit this binary was built from, selectable so a bug report
+        // can carry it. Never part of the version comparison.
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!("Build {}", env!("NEUTRONSYNC_BUILD_SHA")))
+                    .size(12.0)
+                    .color(DIM),
+            )
+            .selectable(true),
         );
         ui.add_space(6.0);
         ui.label(
@@ -3059,11 +3069,14 @@ fn spawn_update_install(
             }
         };
 
-        // Verify against the checksum the release API published before anything
-        // is handed to a root process. A mismatch discards the file.
+        // Verify before anything is handed to a root process: the release's
+        // signed checksum list (required from 0.7.0 on) and the checksum the
+        // release API published. Any failure discards the file.
         *slot.lock().unwrap() = UpdateState::Verifying;
         ctx.request_repaint();
-        if let Err(e) = updater::verify(&downloaded, &asset) {
+        let checked = updater::fetch_proof(&info)
+            .and_then(|proof| updater::verify_signed(&downloaded, &asset, &info, &proof));
+        if let Err(e) = checked {
             let _ = std::fs::remove_file(&downloaded);
             *slot.lock().unwrap() = UpdateState::Failed(format!("{e}"));
             ctx.request_repaint();
@@ -3422,7 +3435,7 @@ fn activity_row(ui: &mut egui::Ui, op: &ActivityOp, ts: i64, line: &str) -> Opti
 }
 
 fn pair_status(ui: &mut egui::Ui, ps: Option<&PairState>, watching: bool) {
-    let first_run = ps.map_or(false, |p| p.last_synced.is_none());
+    let first_run = ps.is_some_and(|p| p.last_synced.is_none());
     let (col, mut text) = match ps.map(|p| p.phase) {
         Some(Phase::Scanning) => (
             ACCENT,
@@ -3818,7 +3831,7 @@ fn combo_full_walk(ui: &mut egui::Ui, v: &mut u64) -> bool {
 }
 
 // -- starter config ----------------------------------------------------------
-fn starter_config(path: &PathBuf) -> Config {
+fn starter_config(path: &Path) -> Config {
     Config {
         sidecar: None,
         scan_threads: 0,
@@ -3845,7 +3858,7 @@ fn starter_config(path: &PathBuf) -> Config {
             base.join("neutronsync")
         },
         pairs: vec![],
-        source_path: Some(path.clone()),
+        source_path: Some(path.to_path_buf()),
     }
 }
 
@@ -4462,6 +4475,11 @@ fn demo_scenes() -> Vec<Scene> {
             file: "keyring-locked.png",
             nav: Nav::Activity,
             state: demo_state_keyring_locked,
+        },
+        Scene {
+            file: "about.png",
+            nav: Nav::About,
+            state: demo_state_synced,
         },
     ]
 }

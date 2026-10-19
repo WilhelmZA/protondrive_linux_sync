@@ -148,6 +148,44 @@ impl Logger {
     }
 }
 
+/// Open (creating if needed) the log file 0600, recording its current size so
+/// rotation can be decided without stat-ing on every line.
+fn open_log(path: &Path) -> Option<LogFile> {
+    let fh = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .ok()?;
+    let size = fh.metadata().map(|m| m.len()).unwrap_or(0);
+    Some(LogFile {
+        fh,
+        path: path.to_path_buf(),
+        size,
+    })
+}
+
+/// Move the current log aside to `<name>.1` and start a fresh one. One previous
+/// generation is kept, so the logs cost at most twice [`MAX_LOG_BYTES`]. A
+/// failure to rotate is not fatal: keep writing to the file already open.
+fn rotate(lf: &mut LogFile) {
+    let mut prev = lf.path.clone().into_os_string();
+    prev.push(".1");
+    let prev = PathBuf::from(prev);
+    let _ = std::fs::remove_file(&prev);
+    if std::fs::rename(&lf.path, &prev).is_err() {
+        // Couldn't roll it over: reset the counter so we don't spin on this
+        // check for every subsequent line.
+        lf.size = 0;
+        return;
+    }
+    if let Some(fresh) = open_log(&lf.path) {
+        *lf = fresh;
+    } else {
+        lf.size = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,43 +255,5 @@ mod tests {
             "expected a readable date, got {stamp:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-/// Open (creating if needed) the log file 0600, recording its current size so
-/// rotation can be decided without stat-ing on every line.
-fn open_log(path: &Path) -> Option<LogFile> {
-    let fh = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)
-        .ok()?;
-    let size = fh.metadata().map(|m| m.len()).unwrap_or(0);
-    Some(LogFile {
-        fh,
-        path: path.to_path_buf(),
-        size,
-    })
-}
-
-/// Move the current log aside to `<name>.1` and start a fresh one. One previous
-/// generation is kept, so the logs cost at most twice [`MAX_LOG_BYTES`]. A
-/// failure to rotate is not fatal: keep writing to the file already open.
-fn rotate(lf: &mut LogFile) {
-    let mut prev = lf.path.clone().into_os_string();
-    prev.push(".1");
-    let prev = PathBuf::from(prev);
-    let _ = std::fs::remove_file(&prev);
-    if std::fs::rename(&lf.path, &prev).is_err() {
-        // Couldn't roll it over: reset the counter so we don't spin on this
-        // check for every subsequent line.
-        lf.size = 0;
-        return;
-    }
-    if let Some(fresh) = open_log(&lf.path) {
-        *lf = fresh;
-    } else {
-        lf.size = 0;
     }
 }

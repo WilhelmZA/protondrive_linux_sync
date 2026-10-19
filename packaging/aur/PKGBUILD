@@ -1,0 +1,50 @@
+# Maintainer: Wilhelm Schonfeldt <82225237+WilhelmZA@users.noreply.github.com>
+#
+# Built from the release's binary tarball, not from source: the sidecar is a
+# Bun-compiled binary whose build needs Bun and network access inside makepkg.
+# .github/workflows/aur.yml fills in pkgver, sha256sums and validpgpkeys from
+# the signed release and pushes this file to the AUR when a release is
+# promoted to stable.
+
+pkgname=neutronsync-bin
+pkgver=0.7.0
+pkgrel=1
+pkgdesc="Bidirectional Proton Drive folder sync with a built-in API sidecar"
+arch=('x86_64')
+url="https://github.com/WilhelmZA/protondrive_linux_sync"
+license=('MIT')
+depends=('glibc' 'gtk3' 'libxkbcommon' 'libglvnd' 'libsecret' 'libayatana-appindicator')
+provides=('neutronsync')
+conflicts=('neutronsync')
+# The binaries are already stripped, and the sidecar is a Bun-compiled
+# executable that carries its program image inside the ELF; strip would
+# damage it.
+options=('!strip')
+
+_tag="v${pkgver}"
+_base="${url}/releases/download/${_tag}"
+source=("neutronsync-${_tag}-${CARCH}-linux.tar.gz::${_base}/neutronsync-${_tag}-${CARCH}-linux.tar.gz"
+        "SHA256SUMS-${pkgver}::${_base}/SHA256SUMS"
+        "SHA256SUMS-${pkgver}.asc::${_base}/SHA256SUMS.asc")
+# The tarball's hash comes from the signed SHA256SUMS; makepkg checks the
+# signature on SHA256SUMS itself against validpgpkeys. One line each: the
+# workflow rewrites these with sed.
+sha256sums=('0000000000000000000000000000000000000000000000000000000000000000' 'SKIP' 'SKIP')
+validpgpkeys=('0000000000000000000000000000000000000000')
+
+prepare() {
+  # Belt and braces: the signed list must also name the tarball we unpacked.
+  sha256sum -c --ignore-missing "SHA256SUMS-${pkgver}"
+}
+
+package() {
+  cd "neutronsync-${_tag}"
+  install -Dm755 neutronsync neutronsync-gui neutronsync-drive -t "${pkgdir}/usr/bin"
+  install -Dm644 packaging/neutronsync-gui.desktop -t "${pkgdir}/usr/share/applications"
+  install -Dm644 assets/logo.png "${pkgdir}/usr/share/icons/hicolor/256x256/apps/neutronsync.png"
+  install -Dm644 assets/neutron-logo.svg "${pkgdir}/usr/share/icons/hicolor/scalable/apps/neutronsync.svg"
+  install -Dm644 systemd/neutronsync-watch.service systemd/neutronsync.service systemd/neutronsync.timer \
+    -t "${pkgdir}/usr/lib/systemd/user"
+  install -Dm644 README.md -t "${pkgdir}/usr/share/doc/${pkgname}"
+  install -Dm644 LICENSE -t "${pkgdir}/usr/share/licenses/${pkgname}"
+}

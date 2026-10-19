@@ -63,6 +63,8 @@ Use `neutronsync sync --dry-run` to preview a run. Excludes hide paths and their
 
 ## Install
 
+Release packages are built on Ubuntu 22.04 and need glibc 2.35 or newer. They run on Ubuntu 22.04 and later, Debian 12 and later, Linux Mint 21 and later, Fedora 36 and later, and openSUSE Tumbleweed. RHEL 9 and its rebuilds (Rocky, Alma) ship glibc 2.34 and are not supported; build from source there.
+
 ### From a release (Debian/Ubuntu)
 
 ```sh
@@ -76,7 +78,30 @@ sudo apt install ./neutronsync_<version>_amd64.deb
 sudo dnf install ./neutronsync-<version>.x86_64.rpm
 ```
 
-Both packages install `neutronsync`, `neutronsync-gui` and `neutronsync-drive` to `/usr/bin`, plus a desktop launcher and systemd user units. They depend on the package providing `secret-tool`. The binary tarball contains all three binaries; keep them together and provide `secret-tool` and a Secret Service session yourself.
+Both packages install `neutronsync`, `neutronsync-gui` and `neutronsync-drive` to `/usr/bin`, plus a desktop launcher and systemd user units. They depend on the package providing `secret-tool`. The binary tarball contains all three binaries plus the desktop entry, icons and systemd units; keep the binaries together and provide `secret-tool` and a Secret Service session yourself.
+
+### From the AUR (Arch Linux)
+
+The `neutronsync-bin` package is built from the release tarball and verifies the release signature during the build:
+
+```sh
+git clone https://aur.archlinux.org/neutronsync-bin.git
+cd neutronsync-bin && makepkg -si
+```
+
+Import the release signing key first (`gpg --import packaging/release-signing-key.asc` from this repository), as `makepkg` checks the signature against it.
+
+### Verifying a release
+
+Every release from 0.7.0 on ships `SHA256SUMS` and a signature `SHA256SUMS.asc` made with the project's release signing key (fingerprint: not yet issued, see [docs/RELEASE_SIGNING.md](docs/RELEASE_SIGNING.md); during a key rotation two fingerprints are listed here and either may sign). To check a download by hand:
+
+```sh
+gpg --import release-signing-key.asc      # packaging/release-signing-key.asc in this repository
+gpg --verify SHA256SUMS.asc SHA256SUMS    # must say "Good signature"
+sha256sum -c --ignore-missing SHA256SUMS  # "OK" for each file you downloaded
+```
+
+The in-app updater makes the same check on its own before installing.
 
 ### From source
 
@@ -98,7 +123,7 @@ The GUI build needs a few system libraries (Debian/Ubuntu):
 
 ```sh
 sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
-  libx11-dev libxcb1-dev libgl1-mesa-dev libxdo-dev libayatana-appindicator3-dev
+  libx11-dev libxcb1-dev libgl1-mesa-dev libayatana-appindicator3-dev
 ```
 
 ## Quick start
@@ -185,7 +210,7 @@ The packaged units target `/usr/bin/neutronsync`. If you installed with `cargo i
 
 ## Updates
 
-Releases come from GitHub. Every tag ships as a pre-release; a stable release is one that has been promoted after the build has proven itself, and its title says `(stable)`. The newest promoted release is the one GitHub marks "Latest". Point the updater at the `stable` or `prerelease` channel in Settings (or `update_channel` in the config): `stable` offers only promoted releases, `prerelease` offers every build as it lands. Checking never installs anything. When an update is available, "Download and install" verifies the download against the checksum GitHub publishes and installs it through your package manager (one `pkexec` prompt), then offers to restart.
+Releases come from GitHub. Every tag ships as a pre-release; a stable release is one that has been promoted after the build has proven itself, and its title says `(stable)`. The newest promoted release is the one GitHub marks "Latest". Point the updater at the `stable` or `prerelease` channel in Settings (or `update_channel` in the config): `stable` offers only promoted releases, `prerelease` offers every build as it lands. Checking never installs anything. When an update is available, "Download and install" verifies the download against the release's signed checksum list (every release from 0.7.0 on) and the checksum GitHub publishes, then installs it through your package manager (one `pkexec` prompt) and offers to restart. A download that fails either check is discarded. `neutronsync --version` and the About page show the commit a build was made from, so a bug report can name it.
 
 ## Privacy and trust
 

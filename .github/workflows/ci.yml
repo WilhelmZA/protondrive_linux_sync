@@ -4,12 +4,17 @@ on:
   push:
     branches: [rust]
   pull_request:
+  # Weekly, Monday 05:00 UTC: an advisory published against an unchanged tree
+  # still surfaces. Only the deny job runs on this trigger.
+  schedule:
+    - cron: '0 5 * * 1'
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build-test:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,12 +31,16 @@ jobs:
         with:
           bun-version: "1.4.0"
 
-      - name: Sidecar tests and typecheck
+      - name: Sidecar tests, typecheck and audit
         working-directory: sidecar
         run: |
           bun install --frozen-lockfile
           bun test
           bun tests/typecheck.ts
+          bun audit --audit-level=high
+
+      - name: Build sidecar
+        run: sidecar/build.sh
 
       # System libraries needed to build the egui/eframe GUI (glow/winit) and
       # the rfd native file dialog.
@@ -41,7 +50,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libgtk-3-dev libxkbcommon-dev libwayland-dev \
             libx11-dev libxcb1-dev libgl1-mesa-dev \
-            libxdo-dev libayatana-appindicator3-dev
+            libayatana-appindicator3-dev
+
+      - name: Format
+        run: cargo fmt --all --check
 
       - name: Build (lib + CLI)
         run: cargo build --workspace --all-targets
@@ -52,6 +64,24 @@ jobs:
       - name: Test
         run: cargo test --all-features
 
-      # Informational: clippy shouldn't block a merge on style nits for now.
       - name: Clippy
-        run: cargo clippy --all-targets --all-features || true
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # Informational here: CI builds on the runner's newer glibc, so the Rust
+      # binaries exceed the floor by design. The release job, which builds
+      # inside ubuntu:22.04, enforces it. What this catches early is a Bun or
+      # sidecar change that raises neutronsync-drive above 2.35.
+      - name: glibc floor of every binary (informational)
+        run: |
+          scripts/check-glibc.sh 2.35 \
+            target/debug/neutronsync \
+            target/debug/neutronsync-gui \
+            sidecar/dist/neutronsync-drive || true
+
+  # Advisories, licences, bans and sources from deny.toml. Its own job so a new
+  # advisory does not hide a test failure, and the only job on the weekly run.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

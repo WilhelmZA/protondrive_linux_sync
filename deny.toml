@@ -1,0 +1,69 @@
+# cargo-deny policy: advisories, licences, bans and sources in one place.
+# CI runs it on every push and weekly (see .github/workflows/ci.yml); locally:
+#   cargo deny check
+
+[graph]
+all-features = true
+
+[advisories]
+# A new RustSec entry fails the build: vulnerabilities and unsound code are
+# errors, an unmaintained direct dependency is a warning to act on.
+version = 2
+yanked = "deny"
+unmaintained = "workspace"
+# Each ignored advisory needs: its ID, the crate path that pulls it in, and
+# one line on why it does not apply to NeutronSync.
+ignore = [
+    # neutronsync -> pgp -> rsa. The updater only verifies ed25519 signatures
+    # with an embedded public key; no RSA private-key operation ever runs, so
+    # the timing side channel on RSA decryption cannot leak anything. No fixed
+    # rsa release exists.
+    { id = "RUSTSEC-2023-0071", reason = "pgp pulls in rsa, but NeutronSync never performs an RSA private-key operation" },
+    # neutronsync -> eframe -> winit -> smithay-client-toolkit -> wayland-scanner
+    # (proc-macro) -> quick-xml. Runs at compile time over the Wayland protocol
+    # XML files bundled in the crate, never over input from outside the build.
+    # wayland-scanner pins quick-xml 0.39, so no compatible update exists.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml is only used at compile time by wayland-scanner on bundled protocol XML" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml is only used at compile time by wayland-scanner on bundled protocol XML" },
+]
+
+[licenses]
+version = 2
+# Anything not in this list fails until it is added here by hand, with a
+# comment saying which crate needs it.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    "BSL-1.0",
+]
+confidence-threshold = 0.8
+# Crate-specific allowances, each for one crate only.
+exceptions = [
+    # egui's bundled UI fonts: SIL Open Font License and the Ubuntu font
+    # licence. They only cover the font files inside the GUI binary.
+    { crate = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
+    # Mozilla's root certificate store, used by rustls for the update check.
+    { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+]
+
+[bans]
+# The egui and GTK trees carry known duplicate versions; a duplicate is worth
+# knowing about, not worth blocking a release over.
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

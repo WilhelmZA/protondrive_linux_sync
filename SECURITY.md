@@ -20,6 +20,14 @@ The sidecar sends recoverable trash operations. It has no `deleteNodes`, `emptyT
 
 Requests identify NeutronSync with `x-pm-appversion: external-drive-neutronsync@<version>-dev`. NeutronSync never spoofs a first-party client identifier.
 
+## Release signing
+
+Every release from 0.7.0 on carries `SHA256SUMS`, a checksum list over its four files, and `SHA256SUMS.asc`, a signature over that list made with a dedicated release signing key. The public half of that key is committed as `packaging/release-signing-key.asc` and compiled into every build; during a key rotation the file holds the old and the new key, and a signature by either is accepted. Before the in-app updater installs a release at or above 0.7.0 it verifies the signature with the embedded keys, checks the downloaded file against the signed list, and still checks it against the checksum the GitHub API publishes. Any failure discards the download. A build whose embedded key is the placeholder refuses to install any release from 0.7.0 on rather than skipping the check. Older releases keep the API checksum check only. [docs/RELEASE_SIGNING.md](docs/RELEASE_SIGNING.md) covers creating, using, rotating and verifying the key.
+
+What the signature protects against: a release file replaced on GitHub, whether through a compromised account, a leaked token with write access to releases, or a tampered release workflow, cannot be installed by the updater or built by the AUR package unless the attacker also holds the private signing key, which never enters the repository or the build and lives only in a GitHub secret and an offline backup. It also lets a user confirm by hand that a download is what was published.
+
+What it does not protect against: a compromised signing key, or a compromise of the machine that cuts the release before signing. It does not vouch for the code itself, only that the files are the ones the project signed. Copies older than 0.7.0 do not know about the signature and keep trusting the API checksum alone, and a copy can only verify releases signed with a key it was built with, which is why key rotation ships one bridging release that embeds both keys and is signed by the old one. The release workflow refuses to sign with a key whose public half is not committed.
+
 ## Reporting a vulnerability
 
 Use the repository's private vulnerability reporting page: <https://github.com/WilhelmZA/protondrive_linux_sync/security/advisories/new>. Include the affected version, reproduction steps and expected behavior. Exclude passwords, session tokens and keyring contents. If private reporting is unavailable, open an issue requesting a private contact without publishing exploit details or credentials.

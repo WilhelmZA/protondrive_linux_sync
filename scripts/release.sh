@@ -11,6 +11,10 @@
 # The changelog section is written by hand, before running this. That is the
 # point: the release body on GitHub is that section verbatim, and a generated
 # list of commit subjects is not worth reading.
+#
+# It also refuses to tag a release the workflow could not sign, or one whose
+# version is below SIGNED_SINCE in src/updater.rs (such a build would accept
+# unsigned updates). See docs/RELEASE_SIGNING.md.
 
 set -euo pipefail
 
@@ -84,19 +88,60 @@ notes="$(awk '
 [ -n "$notes" ] ||
 	die "[Unreleased] is empty. Write the section for $ver first: what changed and why."
 
+# ---------------------------------------------------------------- signing
+
+# The public half of the release key ships inside every build; the private
+# half lives only in the RELEASE_GPG_KEY secret. This script never reads a
+# secret, it only checks that the committed public key is real.
+key_file='packaging/release-signing-key.asc'
+if grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$key_file"; then
+	signing="key present ($key_file)"
+	signing_ok=1
+else
+	signing="PLACEHOLDER in $key_file, the release workflow would refuse to sign; see docs/RELEASE_SIGNING.md"
+	signing_ok=0
+fi
+
+# The updater demands a signature from SIGNED_SINCE on. A build shipped under
+# a lower version would accept unsigned updates until then, so refuse it.
+since="$(sed -n 's/^pub const SIGNED_SINCE: &str = "\([^"]*\)";/\1/p' src/updater.rs | head -1)"
+[ -n "$since" ] || die "could not read SIGNED_SINCE from src/updater.rs"
+core="${ver%%-*}"
+if [ "$core" = "$since" ] && [ "$core" != "$ver" ]; then
+	# A pre-release of SIGNED_SINCE itself sorts below it under semver.
+	since_ok=0
+elif [ "$(printf '%s\n%s\n' "$core" "$since" | sort -V | head -1)" = "$core" ] && [ "$core" != "$since" ]; then
+	since_ok=0
+else
+	since_ok=1
+fi
+
 today="$(date -u +%F)"
 
 echo "Release v$ver  (was $current)"
 echo "  date       $today"
 echo "  changelog  $(printf '%s\n' "$notes" | grep -c '^- ') bullet(s), $(printf '%s\n' "$notes" | wc -l) lines"
+echo "  signing    $signing"
 echo
 
 if [ "$dry_run" -eq 1 ]; then
 	echo "--- release body ---"
 	printf '%s\n' "$notes"
+	if [ "$signing_ok" -eq 0 ]; then
+		echo "--- would refuse: the release signing key is still the placeholder ---"
+	fi
+	if [ "$since_ok" -eq 0 ]; then
+		echo "--- would refuse: $ver is below SIGNED_SINCE ($since) ---"
+	fi
 	echo "--- (dry run, nothing changed) ---"
 	exit 0
 fi
+
+[ "$signing_ok" -eq 1 ] ||
+	die "$key_file is still the placeholder, so the release workflow cannot sign v$ver. docs/RELEASE_SIGNING.md says how to create the key."
+
+[ "$since_ok" -eq 1 ] ||
+	die "v$ver is below SIGNED_SINCE ($since in src/updater.rs); a build under this number would accept unsigned updates. Tag $since or later, or lower SIGNED_SINCE deliberately."
 
 # ---------------------------------------------------------------- bump
 

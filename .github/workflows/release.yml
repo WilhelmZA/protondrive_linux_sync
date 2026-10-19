@@ -15,7 +15,31 @@ env:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # Built inside Ubuntu 22.04 so the binaries need glibc 2.35 at most and
+    # start on Ubuntu 22.04, Debian 12 and anything newer. A container, not
+    # the ubuntu-22.04 runner image, so the floor stays put when GitHub
+    # retires that image.
+    container: ubuntu:22.04
+    # The steps use bash syntax; say so rather than rely on the runner
+    # finding bash in the image.
+    defaults:
+      run:
+        shell: bash
     steps:
+      # Before checkout: without git in the container, actions/checkout
+      # downloads a tarball with no .git, and the source tarball and release
+      # notes steps below need the history.
+      - name: Install build tools and GUI build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            curl git build-essential pkg-config ca-certificates xz-utils unzip gnupg \
+            libgtk-3-dev libxkbcommon-dev libwayland-dev \
+            libx11-dev libxcb1-dev libgl1-mesa-dev \
+            libayatana-appindicator3-dev
+
       - uses: actions/checkout@v4
 
       # Fail before spending 8 minutes on a build that would ship a release
@@ -38,19 +62,26 @@ jobs:
             exit 1
           fi
 
+      # An unsigned release is not a release. The secret reaches the shell
+      # only through env, never interpolated into the script.
+      - name: Refuse to build a release that cannot be signed
+        env:
+          RELEASE_GPG_KEY: ${{ secrets.RELEASE_GPG_KEY }}
+        run: |
+          if [ -z "$RELEASE_GPG_KEY" ]; then
+            echo "::error::the RELEASE_GPG_KEY secret is empty, so this release cannot be signed. docs/RELEASE_SIGNING.md says how to create the key and set the secret."
+            exit 1
+          fi
+          if ! grep -q 'BEGIN PGP PUBLIC KEY BLOCK' packaging/release-signing-key.asc; then
+            echo "::error::packaging/release-signing-key.asc is still the placeholder, so no build can verify this release. docs/RELEASE_SIGNING.md says how to commit the public key."
+            exit 1
+          fi
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-
-      - name: Install GUI build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libgtk-3-dev libxkbcommon-dev libwayland-dev \
-            libx11-dev libxcb1-dev libgl1-mesa-dev \
-            libxdo-dev libayatana-appindicator3-dev
 
       - name: Install packagers
         run: cargo install cargo-deb cargo-generate-rpm
@@ -68,11 +99,23 @@ jobs:
       - name: Build sidecar
         run: sidecar/build.sh
 
+      # build.rs reads this first, so a container checkout that git refuses to
+      # read can never ship a binary that says "unknown".
+      - name: Record the commit being built
+        run: echo "NEUTRONSYNC_BUILD_SHA=${GITHUB_SHA:0:12}" >> "$GITHUB_ENV"
+
       - name: Build release binaries (CLI + GUI)
         run: cargo build --release --features gui --bins
 
       - name: Strip binaries
         run: strip target/release/neutronsync target/release/neutronsync-gui || true
+
+      - name: Check the glibc floor of every shipped binary
+        run: |
+          scripts/check-glibc.sh 2.35 \
+            target/release/neutronsync \
+            target/release/neutronsync-gui \
+            sidecar/dist/neutronsync-drive
 
       - name: Package .deb
         run: cargo deb --no-build --features gui
@@ -88,15 +131,22 @@ jobs:
             --prefix="neutronsync-${ref}/" \
             -o "dist/neutronsync-${ref}-src.tar.gz" HEAD
 
-      - name: Binary tarball (portable, for the in-app updater)
+      # Complete enough to package from: the AUR package is built from this
+      # tarball, so it carries the desktop entry, icons and systemd units in
+      # the same layout as the repository.
+      - name: Binary tarball (portable, for the in-app updater and the AUR)
         run: |
           mkdir -p dist
           ref="${GITHUB_REF_NAME}"
           stage="stage/neutronsync-${ref}"
-          mkdir -p "$stage"
+          mkdir -p "$stage/packaging" "$stage/assets" "$stage/systemd"
           cp target/release/neutronsync target/release/neutronsync-gui \
              sidecar/dist/neutronsync-drive \
              README.md LICENSE "$stage/"
+          cp packaging/neutronsync-gui.desktop "$stage/packaging/"
+          cp assets/logo.png assets/neutron-logo.svg "$stage/assets/"
+          cp systemd/neutronsync-watch.service systemd/neutronsync.service \
+             systemd/neutronsync.timer "$stage/systemd/"
           tar -C stage -czf "dist/neutronsync-${ref}-x86_64-linux.tar.gz" "neutronsync-${ref}"
 
       - name: Collect artifacts
@@ -105,6 +155,59 @@ jobs:
           cp target/debian/*.deb dist/ 2>/dev/null || true
           cp target/generate-rpm/*.rpm dist/ 2>/dev/null || true
           ls -l dist/
+
+      # One checksum list over exactly the four shipped files, signed with the
+      # release key. The updater and the AUR package both check this signature
+      # against the public keys committed in packaging/, so the secret must be
+      # one of those keys; during rotation the file holds the old and the new.
+      - name: Write and sign SHA256SUMS
+        env:
+          RELEASE_GPG_KEY: ${{ secrets.RELEASE_GPG_KEY }}
+          RELEASE_GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.deb *.rpm *-x86_64-linux.tar.gz *-src.tar.gz > SHA256SUMS
+          if [ "$(wc -l < SHA256SUMS)" -ne 4 ]; then
+            echo "::error::SHA256SUMS should list exactly four files:"
+            cat SHA256SUMS
+            exit 1
+          fi
+          export GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+          printf '%s\n' "$RELEASE_GPG_KEY" | gpg --batch --quiet --import
+          # The secret's key must be one of the committed public keys, or no
+          # installed copy could verify this release.
+          secret_fpr="$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')"
+          committed="$(gpg --batch --with-colons --show-keys ../packaging/release-signing-key.asc | awk -F: '$1 == "fpr" { print $10 }')"
+          if [ -z "$secret_fpr" ]; then
+            echo "::error::RELEASE_GPG_KEY holds no secret key."
+            exit 1
+          fi
+          if ! printf '%s\n' "$committed" | grep -qx "$secret_fpr"; then
+            echo "::error::the key in RELEASE_GPG_KEY (${secret_fpr}) is not one of the public keys committed in packaging/release-signing-key.asc, so no installed copy could verify this release. docs/RELEASE_SIGNING.md describes rotation."
+            exit 1
+          fi
+          printf '%s' "$RELEASE_GPG_PASSPHRASE" | gpg --batch --yes --quiet \
+            --pinentry-mode loopback --passphrase-fd 0 \
+            --local-user "$secret_fpr" --armor --detach-sign \
+            --output SHA256SUMS.asc SHA256SUMS
+          rm -rf "$GNUPGHOME"
+          echo "signed with ${secret_fpr}"
+          cat SHA256SUMS
+
+      # A secret that does not match a committed public key would ship a
+      # release no installed copy can verify. Check it here, with a fresh
+      # keyring holding only the committed keys (gpg imports every key in
+      # the file).
+      - name: Verify the signature against the committed public keys
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+          gpg --batch --quiet --import packaging/release-signing-key.asc
+          gpg --batch --verify dist/SHA256SUMS.asc dist/SHA256SUMS
+          rm -rf "$GNUPGHOME"
 
       # Release notes come from CHANGELOG.md, not GitHub's generated commit list:
       # the changelog says what changed and why, the commit list just repeats the
@@ -155,3 +258,5 @@ jobs:
             dist/*.rpm
             dist/*-x86_64-linux.tar.gz
             dist/*-src.tar.gz
+            dist/SHA256SUMS
+            dist/SHA256SUMS.asc

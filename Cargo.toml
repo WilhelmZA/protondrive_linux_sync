@@ -34,13 +34,20 @@ rfd = { version = "0.17.2", optional = true }
 notify-debouncer-full = "0.7.0"
 rusqlite = { version = "0.32", features = ["bundled"] }
 winit = { version = "0.30", optional = true }
-tray-icon = { version = "0.24", optional = true }
+# Without the default `libxdo` feature: it only serves muda's predefined
+# copy/paste items, which the tray menu does not use, and it ties the GUI to
+# libxdo.so.3, which Arch no longer ships.
+tray-icon = { version = "0.24", optional = true, default-features = false, features = ["gtk"] }
 gtk = { version = "0.18", optional = true }
 # In-app updates (GUI-only): tiny HTTP client, semver compare, and SHA-256 to
 # verify a downloaded package against the digest the release API publishes.
 ureq = { version = "2", optional = true }
 semver = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
+# Verifies the release's signed checksum list in-process, so an update is
+# checked against NeutronSync's release key without depending on the user's
+# gpg or keyring. Pure Rust; bzip2 (the only default feature) is not needed.
+pgp = { version = "0.21", optional = true, default-features = false }
 # PNG encoder for `neutronsync-gui --screenshots <dir>` (documentation captures).
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 
@@ -64,6 +71,7 @@ gui = [
     "dep:ureq",
     "dep:semver",
     "dep:sha2",
+    "dep:pgp",
     "dep:image",
 ]
 
@@ -101,6 +109,10 @@ assets = [
 ]
 
 [package.metadata.generate-rpm]
+# Dependencies are declared below, not scanned: without rpm-build's
+# find-requires on the build host, cargo-generate-rpm's own scan emits
+# requires no repository satisfies (libc.so.6(GLIBC_2.18)[WEAK](64bit)).
+auto-req = "no"
 assets = [
     { source = "target/release/neutronsync", dest = "/usr/bin/neutronsync", mode = "755" },
     { source = "target/release/neutronsync-gui", dest = "/usr/bin/neutronsync-gui", mode = "755" },
@@ -115,5 +127,13 @@ assets = [
     { source = "LICENSE", dest = "/usr/share/doc/neutronsync/LICENSE", mode = "644" },
 ]
 
+# Fedora package names. glibc >= 2.35 is the floor the release build has
+# (built inside ubuntu:22.04), so the package refuses to install where it
+# could not start.
 [package.metadata.generate-rpm.requires]
+glibc = ">= 2.35"
+gtk3 = "*"
+libxkbcommon = "*"
+mesa-libGL = "*"
 libsecret = "*"
+libayatana-appindicator-gtk3 = "*"

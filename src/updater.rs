@@ -22,10 +22,33 @@ use crate::config::UpdateChannel;
 /// owner/repo the releases are published under.
 const REPO: &str = "WilhelmZA/protondrive_linux_sync";
 
-/// The running build's version (from Cargo).
+/// The running build's version (from Cargo). Bare semver, never the build
+/// commit: this is what version comparison runs on.
 pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
+
+/// The first version whose release ships a signed checksum list. A target at or
+/// above it must carry `SHA256SUMS` and `SHA256SUMS.asc`, signed by the release
+/// key below, or it is refused. Older targets keep the digest-only check.
+/// `scripts/release.sh` reads this constant and refuses to tag a lower version.
+pub const SIGNED_SINCE: &str = "0.7.0";
+
+/// Name of the checksum list a signed release carries.
+pub const SUMS_NAME: &str = "SHA256SUMS";
+/// Name of the detached signature over [`SUMS_NAME`].
+pub const SIG_NAME: &str = "SHA256SUMS.asc";
+
+/// The release signing public keys, embedded at build time. The file may hold
+/// more than one key (during rotation it holds the old and the new one), and a
+/// signature by any of them is accepted. Until a key exists the file is a
+/// marked placeholder that does not parse, and every signed-era release is
+/// refused rather than installed unverified.
+const RELEASE_KEY: &str = include_str!("../packaging/release-signing-key.asc");
+
+/// Largest release asset the updater will download, applied to the package and
+/// to the checksum list and its signature alike.
+const MAX_ASSET_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Outcome of an update check.
 #[derive(Clone, Debug)]
@@ -213,6 +236,12 @@ pub fn download(
         .header("Content-Length")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(asset.size);
+    if total > MAX_ASSET_BYTES {
+        bail!(
+            "{} is {total} bytes, more than the updater will download",
+            asset.name
+        );
+    }
 
     // Write to a partial file and rename on success, so an interrupted download
     // can never be mistaken for a complete package.
@@ -233,6 +262,10 @@ pub fn download(
         }
         out.write_all(&buf[..n]).context("writing the download")?;
         done += n as u64;
+        if done > MAX_ASSET_BYTES {
+            let _ = std::fs::remove_file(&part);
+            bail!("{} grew past {MAX_ASSET_BYTES} bytes", asset.name);
+        }
         progress(done, total);
     }
     out.flush().ok();
@@ -290,22 +323,178 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 /// digest arrives over TLS in the same API response as the version number, so it
 /// is not something the download itself can influence.
 pub fn verify(path: &Path, asset: &Asset) -> Result<()> {
-    let expected = asset.digest.as_deref().ok_or_else(|| {
+    let actual = sha256_file(path)?;
+    check_digest(&asset.name, &actual, asset.digest.as_deref())
+}
+
+/// The digest-only check: `actual` must equal the API's digest, which must exist.
+fn check_digest(name: &str, actual: &str, expected: Option<&str>) -> Result<()> {
+    let expected = expected.ok_or_else(|| {
         anyhow!(
-            "{} has no published checksum, so it can't be verified; \
-             install it by hand if you trust it",
-            asset.name
+            "{name} has no published checksum, so it can't be verified; \
+             install it by hand if you trust it"
         )
     })?;
-    let actual = sha256_file(path)?;
     if actual != expected {
         bail!(
-            "checksum mismatch on {}: expected {expected}, got {actual}. \
-             The download was discarded and nothing was installed.",
-            asset.name
+            "checksum mismatch on {name}: expected {expected}, got {actual}. \
+             The download was discarded and nothing was installed."
         );
     }
     Ok(())
+}
+
+/// Whether a release at `version` must be signed: true from [`SIGNED_SINCE`]
+/// on. A version that does not parse is treated as signed-era, so a strange
+/// tag can never slip past the check.
+pub fn signing_required(version: &str) -> bool {
+    match (
+        semver::Version::parse(version),
+        semver::Version::parse(SIGNED_SINCE),
+    ) {
+        (Ok(v), Ok(since)) => v >= since,
+        _ => true,
+    }
+}
+
+/// The checksum list and its signature as downloaded from a release. Either is
+/// `None` when the release carries no such asset.
+#[derive(Clone, Debug, Default)]
+pub struct Proof {
+    pub sums: Option<Vec<u8>>,
+    pub sig: Option<Vec<u8>>,
+}
+
+/// Fetch `SHA256SUMS` and `SHA256SUMS.asc` from the release, through the same
+/// download path (private directory, size cap) as the package. A release
+/// without them yields `None` for the missing file; whether that is acceptable
+/// is decided by [`verify_release`], not here.
+pub fn fetch_proof(info: &UpdateInfo) -> Result<Proof> {
+    let mut proof = Proof::default();
+    for (name, slot) in [(SUMS_NAME, &mut proof.sums), (SIG_NAME, &mut proof.sig)] {
+        let Some(asset) = info.assets.iter().find(|a| a.name == name) else {
+            continue;
+        };
+        let path = download(asset, &|_, _| {}, &|| false)?;
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let _ = std::fs::remove_file(&path);
+        *slot = Some(bytes);
+    }
+    Ok(proof)
+}
+
+/// Check a downloaded package against the release's signed checksum list and
+/// the API digest, with the embedded release key. Any failure means the file
+/// must be discarded; the caller deletes it.
+pub fn verify_signed(path: &Path, asset: &Asset, info: &UpdateInfo, proof: &Proof) -> Result<()> {
+    let actual = sha256_file(path)?;
+    verify_release(
+        &info.latest,
+        RELEASE_KEY,
+        &asset.name,
+        &actual,
+        asset.digest.as_deref(),
+        proof.sums.as_deref(),
+        proof.sig.as_deref(),
+    )
+}
+
+/// The whole decision, over bytes, so it can be tested without a network.
+///
+/// For a target below [`SIGNED_SINCE`], this is the digest-only check that
+/// older copies also make. From [`SIGNED_SINCE`] on: the embedded key must be
+/// real, both files must be present, the signature must verify against that
+/// key, the list must name `asset_name` with the hash `actual_sha256`, and the
+/// API digest, when present, must agree too. Every message is one plain
+/// sentence, because the GUI shows it as the failure line.
+pub fn verify_release(
+    target_version: &str,
+    key_armor: &str,
+    asset_name: &str,
+    actual_sha256: &str,
+    api_digest: Option<&str>,
+    sums: Option<&[u8]>,
+    sig: Option<&[u8]>,
+) -> Result<()> {
+    if !signing_required(target_version) {
+        return check_digest(asset_name, actual_sha256, api_digest);
+    }
+    let keys = parse_release_keys(key_armor);
+    if keys.is_empty() {
+        bail!(
+            "This build has no release key, so updates can't be verified. \
+             Download the release by hand."
+        );
+    }
+    let sums = sums.ok_or_else(|| {
+        anyhow!(
+            "This release has no checksum list, so it can't be verified and nothing was installed."
+        )
+    })?;
+    let sig = sig.ok_or_else(|| {
+        anyhow!("This release's checksum list isn't signed, so it can't be verified and nothing was installed.")
+    })?;
+    if !keys.iter().any(|key| signature_matches(key, sums, sig)) {
+        bail!("This release's signature doesn't match NeutronSync's release key, so the download was discarded and nothing was installed.");
+    }
+    let expected = sum_for(sums, asset_name).ok_or_else(|| {
+        anyhow!("The signed checksum list doesn't mention {asset_name}, so the download was discarded and nothing was installed.")
+    })?;
+    if expected != actual_sha256 {
+        bail!("{asset_name} doesn't match its signed checksum, so the download was discarded and nothing was installed.");
+    }
+    if let Some(digest) = api_digest {
+        if digest != actual_sha256 {
+            bail!("{asset_name} doesn't match the checksum GitHub published, so the download was discarded and nothing was installed.");
+        }
+    }
+    Ok(())
+}
+
+/// Every public key in the embedded file: one or more armored blocks, each of
+/// which may itself carry several keys (`gpg --export k1 k2` writes one
+/// block). Empty when the file is still the placeholder or holds no key that
+/// parses; anything unparsable is skipped, never trusted.
+fn parse_release_keys(armor: &str) -> Vec<pgp::composed::SignedPublicKey> {
+    use pgp::composed::Deserializable;
+    const BEGIN: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----";
+    let mut keys = Vec::new();
+    for block in armor.split(BEGIN).skip(1) {
+        let block = format!("{BEGIN}{block}");
+        let found: Vec<pgp::composed::SignedPublicKey> =
+            match pgp::composed::SignedPublicKey::from_string_many(&block) {
+                Ok((parsed, _)) => parsed.filter_map(Result::ok).collect(),
+                Err(_) => Vec::new(),
+            };
+        keys.extend(found);
+    }
+    keys
+}
+
+/// Whether the armored detached signature `sig` over `data` was made by `key`
+/// or one of its subkeys.
+fn signature_matches(key: &pgp::composed::SignedPublicKey, data: &[u8], sig: &[u8]) -> bool {
+    use pgp::composed::{Deserializable, DetachedSignature};
+    let Ok((sig, _)) = DetachedSignature::from_armor_single(std::io::Cursor::new(sig)) else {
+        return false;
+    };
+    sig.verify(key, data).is_ok()
+        || key
+            .public_subkeys
+            .iter()
+            .any(|sub| sig.verify(sub, data).is_ok())
+}
+
+/// The lower-case hex hash recorded for `name` in a `sha256sum`-format list
+/// (`<hex>  <name>`, or `<hex> *<name>` for binary mode).
+fn sum_for(sums: &[u8], name: &str) -> Option<String> {
+    let text = String::from_utf8_lossy(sums);
+    text.lines().find_map(|line| {
+        let (hash, rest) = line.trim().split_once(' ')?;
+        let file = rest.trim_start().trim_start_matches('*');
+        (file == name && hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+            .then(|| hash.to_ascii_lowercase())
+    })
 }
 
 /// Install a downloaded package through the system package manager, elevating
@@ -732,6 +921,293 @@ mod tests {
         println!("digest {:?}", asset.digest);
         verify(&path, asset).expect("the published checksum should match");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- release signing (fixtures under tests/fixtures/signing) -----------
+
+    const TEST_KEY: &str = include_str!("../tests/fixtures/signing/test-release-key.asc");
+    /// Both test keys, as two armored blocks (the rotation layout).
+    const TWO_KEYS: &str = include_str!("../tests/fixtures/signing/test-release-keys-both.asc");
+    /// Both test keys in one armored block (`gpg --export k1 k2`).
+    const TWO_KEYS_ONE_BLOCK: &str =
+        include_str!("../tests/fixtures/signing/test-release-keys-one-block.asc");
+    const SUMS: &[u8] = include_bytes!("../tests/fixtures/signing/SHA256SUMS");
+    const SIG: &[u8] = include_bytes!("../tests/fixtures/signing/SHA256SUMS.asc");
+    /// Signed by the second test key.
+    const SECOND_SIG: &[u8] = include_bytes!("../tests/fixtures/signing/SHA256SUMS.second-key.asc");
+    /// Signed by a third key that is in neither file.
+    const OTHER_SIG: &[u8] = include_bytes!("../tests/fixtures/signing/SHA256SUMS.other-key.asc");
+    const DEB: &str = "neutronsync_0.7.0-1_amd64.deb";
+    /// SHA-256 of the fixture .deb's content, "deb-bytes\n", as SHA256SUMS records it.
+    const DEB_SUM: &str = "274cd245459bebed3c77d2a663d41f8b96fcc76943a7242ed256f7d1c3cdd642";
+
+    #[test]
+    fn signing_is_required_from_signed_since_on() {
+        assert_eq!(SIGNED_SINCE, "0.7.0");
+        assert!(!signing_required("0.6.1"));
+        assert!(!signing_required("0.6.99"));
+        assert!(signing_required("0.7.0"));
+        assert!(signing_required("0.7.1-rc1"));
+        assert!(signing_required("1.0.0"));
+        // Unparsable means signed-era: fail closed.
+        assert!(signing_required("banana"));
+    }
+
+    #[test]
+    fn fixture_sums_name_the_deb() {
+        assert_eq!(sum_for(SUMS, DEB).as_deref(), Some(DEB_SUM));
+        assert_eq!(sum_for(SUMS, "nothing.deb"), None);
+        // Binary-mode lines and odd spacing still parse.
+        assert_eq!(
+            sum_for(format!("{DEB_SUM} *{DEB}\n").as_bytes(), DEB).as_deref(),
+            Some(DEB_SUM)
+        );
+    }
+
+    #[test]
+    fn valid_signature_and_matching_sum_installs() {
+        verify_release(
+            "0.7.0",
+            TEST_KEY,
+            DEB,
+            DEB_SUM,
+            Some(DEB_SUM),
+            Some(SUMS),
+            Some(SIG),
+        )
+        .expect("signed and matching must pass");
+        // The API digest is optional on a signed release.
+        verify_release("0.7.0", TEST_KEY, DEB, DEB_SUM, None, Some(SUMS), Some(SIG))
+            .expect("signed without an API digest must pass");
+    }
+
+    #[test]
+    fn tampered_package_fails() {
+        let wrong = "00".repeat(32);
+        let err = verify_release(
+            "0.7.0",
+            TEST_KEY,
+            DEB,
+            &wrong,
+            Some(&wrong),
+            Some(SUMS),
+            Some(SIG),
+        )
+        .expect_err("a package not matching the signed list must fail");
+        assert!(err.to_string().contains("signed checksum"), "{err}");
+        // A matching signed list but a disagreeing API digest fails too.
+        let err = verify_release(
+            "0.7.0",
+            TEST_KEY,
+            DEB,
+            DEB_SUM,
+            Some(&wrong),
+            Some(SUMS),
+            Some(SIG),
+        )
+        .expect_err("the API digest still counts");
+        assert!(err.to_string().contains("GitHub published"), "{err}");
+    }
+
+    #[test]
+    fn tampered_sums_fail() {
+        let mut sums = SUMS.to_vec();
+        // Swap the first hex digit of the .deb line.
+        let i = sums
+            .windows(DEB_SUM.len())
+            .position(|w| w == DEB_SUM.as_bytes())
+            .unwrap();
+        sums[i] = if sums[i] == b'2' { b'3' } else { b'2' };
+        let err = verify_release(
+            "0.7.0",
+            TEST_KEY,
+            DEB,
+            DEB_SUM,
+            None,
+            Some(&sums),
+            Some(SIG),
+        )
+        .expect_err("an edited list must fail its signature");
+        assert!(err.to_string().contains("signature"), "{err}");
+    }
+
+    #[test]
+    fn any_embedded_key_may_sign_but_no_other() {
+        assert_eq!(parse_release_keys(TEST_KEY).len(), 1);
+        assert_eq!(parse_release_keys(TWO_KEYS).len(), 2);
+        assert_eq!(parse_release_keys(TWO_KEYS_ONE_BLOCK).len(), 2);
+        for keys in [TWO_KEYS, TWO_KEYS_ONE_BLOCK] {
+            verify_release("0.7.0", keys, DEB, DEB_SUM, None, Some(SUMS), Some(SIG))
+                .expect("the first embedded key signs");
+            verify_release(
+                "0.7.0",
+                keys,
+                DEB,
+                DEB_SUM,
+                None,
+                Some(SUMS),
+                Some(SECOND_SIG),
+            )
+            .expect("the second embedded key signs");
+            let err = verify_release(
+                "0.7.0",
+                keys,
+                DEB,
+                DEB_SUM,
+                None,
+                Some(SUMS),
+                Some(OTHER_SIG),
+            )
+            .expect_err("a third key must still fail");
+            assert!(err.to_string().contains("signature"), "{err}");
+        }
+        // With only the first key embedded, the second key's signature fails.
+        let err = verify_release(
+            "0.7.0",
+            TEST_KEY,
+            DEB,
+            DEB_SUM,
+            None,
+            Some(SUMS),
+            Some(SECOND_SIG),
+        )
+        .expect_err("a key not in the file must fail");
+        assert!(err.to_string().contains("signature"), "{err}");
+        // Garbage between or after blocks is skipped, not trusted.
+        let messy = format!(
+            "junk\n{TEST_KEY}\nmore junk\n-----BEGIN PGP PUBLIC KEY BLOCK-----\nnot base64\n"
+        );
+        assert_eq!(parse_release_keys(&messy).len(), 1);
+    }
+
+    #[test]
+    fn signature_by_a_different_key_fails() {
+        let err = verify_release(
+            "0.7.0",
+            TEST_KEY,
+            DEB,
+            DEB_SUM,
+            None,
+            Some(SUMS),
+            Some(OTHER_SIG),
+        )
+        .expect_err("another key's signature must fail");
+        assert!(err.to_string().contains("signature"), "{err}");
+        // So does something that is not a signature at all.
+        let err = verify_release(
+            "0.7.0",
+            TEST_KEY,
+            DEB,
+            DEB_SUM,
+            None,
+            Some(SUMS),
+            Some(b"nope"),
+        )
+        .expect_err("garbage must fail");
+        assert!(err.to_string().contains("signature"), "{err}");
+    }
+
+    #[test]
+    fn missing_signature_on_a_signed_era_release_fails() {
+        let err = verify_release(
+            "0.7.0",
+            TEST_KEY,
+            DEB,
+            DEB_SUM,
+            Some(DEB_SUM),
+            Some(SUMS),
+            None,
+        )
+        .expect_err("no .asc must fail");
+        assert!(err.to_string().contains("isn't signed"), "{err}");
+        let err = verify_release("0.7.0", TEST_KEY, DEB, DEB_SUM, Some(DEB_SUM), None, None)
+            .expect_err("no SHA256SUMS must fail");
+        assert!(err.to_string().contains("no checksum list"), "{err}");
+    }
+
+    #[test]
+    fn older_release_without_the_files_uses_the_digest_check() {
+        verify_release("0.6.1", TEST_KEY, DEB, DEB_SUM, Some(DEB_SUM), None, None)
+            .expect("an older release with a matching digest passes");
+        let err = verify_release(
+            "0.6.1",
+            TEST_KEY,
+            DEB,
+            DEB_SUM,
+            Some(&"00".repeat(32)),
+            None,
+            None,
+        )
+        .expect_err("an older release with a wrong digest fails");
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+        let err = verify_release("0.6.1", TEST_KEY, DEB, DEB_SUM, None, None, None)
+            .expect_err("an older release with no digest fails closed, as before");
+        assert!(err.to_string().contains("can't be verified"), "{err}");
+    }
+
+    #[test]
+    fn placeholder_key_refuses_signed_era_releases() {
+        // The embedded key as built right now. While it is the placeholder the
+        // message must say so; once a real key lands this branch only checks
+        // that the explicit placeholder text is refused.
+        let placeholder = "NEUTRONSYNC RELEASE SIGNING KEY PLACEHOLDER\nnot a key\n";
+        let err = verify_release(
+            "0.7.0",
+            placeholder,
+            DEB,
+            DEB_SUM,
+            Some(DEB_SUM),
+            Some(SUMS),
+            Some(SIG),
+        )
+        .expect_err("a placeholder key must refuse");
+        assert!(err.to_string().contains("no release key"), "{err}");
+        if parse_release_keys(RELEASE_KEY).is_empty() {
+            let err = verify_release(
+                "0.7.0",
+                RELEASE_KEY,
+                DEB,
+                DEB_SUM,
+                Some(DEB_SUM),
+                Some(SUMS),
+                Some(SIG),
+            )
+            .expect_err("the embedded placeholder must refuse");
+            assert_eq!(
+                err.to_string(),
+                "This build has no release key, so updates can't be verified. Download the release by hand."
+            );
+        }
+        // An older target never needs the key.
+        verify_release(
+            "0.6.1",
+            placeholder,
+            DEB,
+            DEB_SUM,
+            Some(DEB_SUM),
+            None,
+            None,
+        )
+        .expect("the placeholder does not affect older releases");
+    }
+
+    #[test]
+    fn verify_signed_reads_the_file_and_uses_the_release_version() {
+        let p = tmpfile("signed", b"deb-bytes\n");
+        let mut info = release_with_assets();
+        info.latest = "0.6.1".into();
+        let asset = Asset {
+            name: DEB.into(),
+            url: String::new(),
+            size: 10,
+            digest: Some(DEB_SUM.into()),
+        };
+        // Older target: the digest alone decides, so no proof is needed.
+        verify_signed(&p, &asset, &info, &Proof::default()).expect("digest-era release");
+        // Signed-era target with no proof is refused whatever the digest says.
+        info.latest = "0.7.0".into();
+        verify_signed(&p, &asset, &info, &Proof::default()).expect_err("signed-era needs proof");
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
