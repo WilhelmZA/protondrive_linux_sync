@@ -2426,6 +2426,34 @@ impl App {
             }
         });
 
+        // What changed since this copy, shown before the install button so the
+        // choice to update is an informed one.
+        let notes = match &*self.update.lock().unwrap() {
+            UpdateState::Done(Ok(info)) if info.newer && !info.notes.trim().is_empty() => {
+                Some(info.notes.clone())
+            }
+            _ => None,
+        };
+        if let Some(notes) = notes {
+            ui.add_space(10.0);
+            ui.scope(|ui| {
+                ui.set_max_width((ui.available_width() - 15.0).max(200.0));
+                card_frame().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(
+                        RichText::new("WHAT'S NEW")
+                            .font(FontId::new(11.0, ff_bold()))
+                            .color(ACCENT),
+                    );
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("release_notes")
+                        .max_height(260.0)
+                        .show(ui, |ui| release_notes(ui, &notes));
+                });
+            });
+        }
+
         // Decide the follow-up action without holding the lock across the UI.
         enum UpdateAction {
             Install(UpdateInfo),
@@ -3055,6 +3083,77 @@ fn spawn_update_install(
 }
 
 /// Bytes as a short human string ("6.5 MB"), for download progress.
+/// Render a release body (Keep a Changelog Markdown as the release workflow
+/// publishes it) with native widgets: version and section headings, bullets,
+/// plain paragraphs. Inline code, bold and links are reduced to their text; the
+/// "Full Changelog" compare line is dropped, the Open release button covers it.
+fn release_notes(ui: &mut egui::Ui, notes: &str) {
+    let mut first = true;
+    for raw in notes.lines() {
+        let line = raw.trim_end();
+        if line.trim().is_empty() || line.starts_with("**Full Changelog**") {
+            continue;
+        }
+        if let Some(version) = line.strip_prefix("## ") {
+            if !first {
+                ui.add_space(10.0);
+            }
+            ui.label(
+                RichText::new(version.trim())
+                    .font(FontId::new(14.0, ff_bold()))
+                    .color(TEXT),
+            );
+            ui.add_space(2.0);
+        } else if let Some(section) = line.strip_prefix("### ") {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(section.trim().to_uppercase())
+                    .font(FontId::new(10.5, ff_bold()))
+                    .color(DIM),
+            );
+        } else if let Some(item) = line.trim_start().strip_prefix("- ") {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(RichText::new("•").size(12.5).color(ACCENT));
+                ui.label(RichText::new(plain_markdown(item)).size(12.5).color(TEXT));
+            });
+        } else {
+            ui.label(
+                RichText::new(plain_markdown(line.trim()))
+                    .size(12.5)
+                    .color(DIM),
+            );
+        }
+        first = false;
+    }
+}
+
+/// Strip the inline Markdown the changelog uses (`code`, **bold**, [text](url))
+/// down to readable text.
+fn plain_markdown(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find('[') {
+        let (before, after) = rest.split_at(start);
+        out.push_str(before);
+        match after.find("](").and_then(|mid| {
+            let end = after[mid..].find(')')? + mid;
+            Some((mid, end))
+        }) {
+            Some((mid, end)) => {
+                out.push_str(&after[1..mid]);
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push('[');
+                rest = &after[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out.replace('`', "").replace("**", "")
+}
+
 fn human_bytes(n: u64) -> String {
     const MB: f64 = 1_000_000.0;
     const KB: f64 = 1_000.0;
@@ -4530,4 +4629,22 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plain_markdown;
+
+    #[test]
+    fn plain_markdown_strips_inline_marks() {
+        assert_eq!(
+            plain_markdown("A config with `[cli] backend = \"cli\"` is **refused**."),
+            "A config with [cli] backend = \"cli\" is refused."
+        );
+        assert_eq!(
+            plain_markdown("See [docs/SYNC_MODEL.md](docs/SYNC_MODEL.md) and [x]"),
+            "See docs/SYNC_MODEL.md and [x]"
+        );
+        assert_eq!(plain_markdown("plain"), "plain");
+    }
 }

@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+- The About page shows what changed before you install an update: the release notes of every version between the one you run and the one on offer, newest first, under "What's new".
+
 ### Removed
 - The `proton-drive` command-line backend. NeutronSync syncs only through `neutronsync-drive`, the sidecar built on Proton's Drive SDK, which has been the default since 0.4.0. A config that still sets `[cli] backend = "cli"` is refused with a message saying so; the other keys that backend used (`binary`, `upload_flags`, `download_flags`, `fresh_cache`, `credentials_store`, `poll_interval`) are ignored and dropped on the next save. `neutronsync sync --backend` is gone. The legacy watch mode that re-walked folders on a timer went with it; the change feed and the daily safety-net walk remain.
 

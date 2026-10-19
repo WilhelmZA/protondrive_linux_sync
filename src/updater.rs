@@ -36,7 +36,9 @@ pub struct UpdateInfo {
     pub newer: bool,
     /// The release's GitHub page (for an "Open release" action).
     pub html_url: String,
-    /// Release notes / body (may be empty).
+    /// What changed since the running version: the release body of every
+    /// published release newer than `current` on this channel, newest first,
+    /// each under a `## vX.Y.Z` heading (may be empty).
     pub notes: String,
     /// Whether the found release is flagged pre-release.
     pub prerelease: bool,
@@ -120,6 +122,13 @@ pub fn pick_asset(info: &UpdateInfo, kind: InstallKind) -> Option<&Asset> {
 /// Uses `GITHUB_TOKEN`/`GH_TOKEN` from the environment when set (needed while
 /// the repo is private); works tokenless once the repo is public.
 pub fn check(channel: UpdateChannel) -> Result<UpdateInfo> {
+    // The recent releases, newest first. They choose the pre-release target and
+    // supply the notes for every version the running copy has missed.
+    let body = fetch(&format!(
+        "https://api.github.com/repos/{REPO}/releases?per_page=20"
+    ))?;
+    let recent: Vec<serde_json::Value> =
+        serde_json::from_str(&body).context("parsing releases JSON")?;
     let release = match channel {
         // The stable channel follows only promoted releases; `/releases/latest`
         // returns the newest non-draft, non-prerelease one.
@@ -130,17 +139,12 @@ pub fn check(channel: UpdateChannel) -> Result<UpdateInfo> {
             serde_json::from_str::<serde_json::Value>(&body).context("parsing release JSON")?
         }
         // The pre-release channel follows the newest published release of any
-        // kind: take the first non-draft entry (the API lists newest first).
-        UpdateChannel::Prerelease => {
-            let body = fetch(&format!(
-                "https://api.github.com/repos/{REPO}/releases?per_page=20"
-            ))?;
-            let arr: Vec<serde_json::Value> =
-                serde_json::from_str(&body).context("parsing releases JSON")?;
-            arr.into_iter()
-                .find(|r| !r["draft"].as_bool().unwrap_or(false))
-                .ok_or_else(|| anyhow!("no published releases yet"))?
-        }
+        // kind: take the first non-draft entry.
+        UpdateChannel::Prerelease => recent
+            .iter()
+            .find(|r| !r["draft"].as_bool().unwrap_or(false))
+            .cloned()
+            .ok_or_else(|| anyhow!("no published releases yet"))?,
     };
 
     let tag = release["tag_name"]
@@ -148,7 +152,6 @@ pub fn check(channel: UpdateChannel) -> Result<UpdateInfo> {
         .ok_or_else(|| anyhow!("release has no tag_name"))?
         .to_string();
     let html_url = release["html_url"].as_str().unwrap_or("").to_string();
-    let notes = release["body"].as_str().unwrap_or("").to_string();
     let prerelease = release["prerelease"].as_bool().unwrap_or(false);
 
     let assets = release["assets"]
@@ -174,6 +177,7 @@ pub fn check(channel: UpdateChannel) -> Result<UpdateInfo> {
     let current = current_version().to_string();
     let latest = tag.trim_start_matches('v').to_string();
     let newer = is_newer(&latest, &current);
+    let notes = notes_since(&recent, channel, &current, &latest, &release);
 
     Ok(UpdateInfo {
         current,
@@ -461,6 +465,45 @@ fn token() -> Option<String> {
 /// Whether `latest` is a newer version than `current`. Prefers a semver
 /// comparison; falls back to "any difference counts as newer" if either string
 /// doesn't parse as semver.
+/// Everything the running copy has missed: the body of each published release
+/// on `channel` that is newer than `current` and not newer than `latest`,
+/// newest first, each under a `## vX.Y.Z` heading. A copy several versions
+/// behind therefore sees every change, not just the newest release's. Falls
+/// back to `chosen`'s own body when the list has nothing to say.
+fn notes_since(
+    recent: &[serde_json::Value],
+    channel: UpdateChannel,
+    current: &str,
+    latest: &str,
+    chosen: &serde_json::Value,
+) -> String {
+    let mut out = String::new();
+    for r in recent {
+        if r["draft"].as_bool().unwrap_or(false) {
+            continue;
+        }
+        if channel == UpdateChannel::Stable && r["prerelease"].as_bool().unwrap_or(false) {
+            continue;
+        }
+        let Some(tag) = r["tag_name"].as_str() else {
+            continue;
+        };
+        let version = tag.trim_start_matches('v');
+        if !is_newer(version, current) || is_newer(version, latest) {
+            continue;
+        }
+        let body = r["body"].as_str().unwrap_or("").trim();
+        if body.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("## v{version}\n{body}\n\n"));
+    }
+    if out.is_empty() {
+        out = chosen["body"].as_str().unwrap_or("").trim().to_string();
+    }
+    out.trim_end().to_string()
+}
+
 fn is_newer(latest: &str, current: &str) -> bool {
     match (
         semver::Version::parse(latest),
@@ -474,6 +517,46 @@ fn is_newer(latest: &str, current: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notes_cover_every_missed_release_newest_first() {
+        let rel = |tag: &str, pre: bool, body: &str| serde_json::json!({"tag_name": tag, "prerelease": pre, "draft": false, "body": body});
+        let recent = vec![
+            rel("v0.6.0", true, "### Removed\n- the CLI backend"),
+            rel("v0.5.3", true, "### Fixed\n- false conflicts"),
+            rel("v0.5.2", false, "### Fixed\n- restart"),
+            rel("v0.5.1", true, ""),
+            rel("v0.5.0", false, "### Added\n- screenshots"),
+        ];
+        // Pre-release channel, two versions behind: both newer bodies, newest
+        // first, and nothing at or below the running version.
+        let notes = notes_since(
+            &recent,
+            UpdateChannel::Prerelease,
+            "0.5.2",
+            "0.6.0",
+            &recent[0],
+        );
+        assert_eq!(
+            notes,
+            "## v0.6.0\n### Removed\n- the CLI backend\n\n## v0.5.3\n### Fixed\n- false conflicts"
+        );
+        // Stable channel skips pre-releases and stops at the chosen release.
+        let notes = notes_since(&recent, UpdateChannel::Stable, "0.4.9", "0.5.2", &recent[2]);
+        assert_eq!(
+            notes,
+            "## v0.5.2\n### Fixed\n- restart\n\n## v0.5.0\n### Added\n- screenshots"
+        );
+        // Nothing newer in the list: the chosen release's own body.
+        let notes = notes_since(
+            &recent[..0],
+            UpdateChannel::Stable,
+            "0.5.0",
+            "0.5.2",
+            &recent[2],
+        );
+        assert_eq!(notes, "### Fixed\n- restart");
+    }
 
     #[test]
     fn semver_comparison() {
