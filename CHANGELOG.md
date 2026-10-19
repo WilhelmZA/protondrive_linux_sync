@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-10-19
+
 ### Fixed
 - A file edited after the scan but before its upload no longer comes back as a conflict on its next edit. The sync recorded the size and time the scan saw, not the newer content it uploaded, so the next local edit looked like a change on both sides and produced a "(conflict ...)" copy. The record now holds what the upload actually sent: the API backend reports the size, time and SHA-1 of the snapshot it uploaded, and the CLI backend reads the file just before sending it.
 
