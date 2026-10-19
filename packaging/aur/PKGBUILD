@@ -30,7 +30,7 @@ source=("neutronsync-${_tag}-${CARCH}-linux.tar.gz::${_base}/neutronsync-${_tag}
 # signature on SHA256SUMS itself against validpgpkeys. One line each: the
 # workflow rewrites these with sed.
 sha256sums=('0000000000000000000000000000000000000000000000000000000000000000' 'SKIP' 'SKIP')
-validpgpkeys=('0000000000000000000000000000000000000000')
+validpgpkeys=('28C582ACB64F9A79563FDBED543CE70174F0FAEA')
 
 prepare() {
   # Belt and braces: the signed list must also name the tarball we unpacked.

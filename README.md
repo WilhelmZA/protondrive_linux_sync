@@ -94,7 +94,7 @@ Import the release signing key first (`gpg --import packaging/release-signing-ke
 
 ### Verifying a release
 
-Every release from 0.7.0 on ships `SHA256SUMS` and a signature `SHA256SUMS.asc` made with the project's release signing key (fingerprint: not yet issued, see [docs/RELEASE_SIGNING.md](docs/RELEASE_SIGNING.md); during a key rotation two fingerprints are listed here and either may sign). To check a download by hand:
+Every release from 0.7.0 on ships `SHA256SUMS` and a signature `SHA256SUMS.asc` made with the project's release signing key (fingerprint `28C582ACB64F9A79563FDBED543CE70174F0FAEA`, see [docs/RELEASE_SIGNING.md](docs/RELEASE_SIGNING.md); during a key rotation two fingerprints are listed here and either may sign). To check a download by hand:
 
 ```sh
 gpg --import release-signing-key.asc      # packaging/release-signing-key.asc in this repository
