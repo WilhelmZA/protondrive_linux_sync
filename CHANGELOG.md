@@ -8,13 +8,20 @@ All notable changes to this project are documented here. The format follows [Kee
 - Releases are signed. Each one ships `SHA256SUMS` and `SHA256SUMS.asc`, signed with a dedicated release key whose public half is built into the app. From 0.7.0 on the updater checks that signature before it installs anything and discards a download that fails it; the release workflow refuses to publish an unsigned release.
 - `neutronsync --version` and the About page show the commit the build was made from.
 - An Arch Linux package, `neutronsync-bin`, on the AUR. It is published when a release is promoted to stable.
+- A guard against mass deletion. One run may delete at most 200 files from a folder pair, and at most 30% of the files that pair keeps in sync (never fewer than 25); whole folders count the files inside them. Past that, the run holds every deletion back, still does everything else, and says so: a banner on the Activity page, "N deletions held back" on the folder card, an error line and exit status 1 from `neutronsync sync`. Two answers: "Restore them" (`neutronsync sync --resync NAME`) brings the files back, "Delete them" (`neutronsync sync --allow-mass-delete NAME`) lets them through for that one run. The limits are `max_delete_files` and `max_delete_percent` in `[options]`; `neutronsync status` shows them.
+- A Conflicts page in the window. Every conflict the sync settled is listed with the folder, the file, when, and what was done: kept both (and where your copy went), kept the newer version from this computer or from Proton Drive, or left as it is. "Show in folder", "Open copy" and "Dismiss" per row, "Dismiss all" for the page. Conflicts settled from the command line show up there too.
+- The sync state file is checked before it is used. A file saved by a newer NeutronSync is refused with a message saying so and is left unchanged. A file that is damaged (random bytes, truncated, a broken page) stops the sync with a message instead of being read as an empty history, which could have turned into a mass change. The window shows "Sync state could not be read" in Activity when that happens.
 
 ### Fixed
+- Baseline rows for files that were already gone on both sides are now forgotten instead of being carried forever, so a run that was killed after a deletion reached Proton Drive settles cleanly on the next run.
 - The packages run on Ubuntu 22.04 and Debian 12 again. Releases are now built on Ubuntu 22.04, so the binaries need glibc 2.35 rather than 2.39, and the release job checks every shipped binary against that floor.
 - The RPM declares its dependencies by name instead of relying on a scan that produced requirements no repository could satisfy.
 
 ### Changed
 - CI now fails on clippy warnings, formatting, a known advisory or an unapproved licence, and audits the sidecar's dependencies.
+
+### Tests
+- Crash tests run the real `neutronsync` binary against the fake sidecar and kill it by PID part-way through downloads, uploads, deletions, a mixed run, and right after an upload the sidecar finished on its own, then check that two clean runs bring both sides back to the same files with nothing left half done. The held mass deletion, the two sync-state refusals and the guard's command-line answers are covered the same way.
 
 ## [0.6.1] - 2026-10-19
 

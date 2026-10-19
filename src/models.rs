@@ -114,6 +114,41 @@ impl Action {
     }
 }
 
+/// How the engine settled a file that changed on both sides.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConflictOutcome {
+    /// Both versions kept; the local one renamed to a "(conflict …)" copy.
+    KeptBoth,
+    /// The newer local version replaced the remote one.
+    KeptLocal,
+    /// The newer remote version replaced the local one.
+    KeptRemote,
+    /// Left as it is until the user chooses.
+    Skipped,
+}
+
+impl ConflictOutcome {
+    /// Stable text form, as stored in `stats.db`.
+    pub fn label(self) -> &'static str {
+        match self {
+            ConflictOutcome::KeptBoth => "kept-both",
+            ConflictOutcome::KeptLocal => "kept-local",
+            ConflictOutcome::KeptRemote => "kept-remote",
+            ConflictOutcome::Skipped => "skipped",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "kept-both" => ConflictOutcome::KeptBoth,
+            "kept-local" => ConflictOutcome::KeptLocal,
+            "kept-remote" => ConflictOutcome::KeptRemote,
+            "skipped" => ConflictOutcome::Skipped,
+            _ => return None,
+        })
+    }
+}
+
 /// One planned operation against a single path.
 #[derive(Clone, Debug)]
 pub struct Op {
@@ -123,6 +158,9 @@ pub struct Op {
     pub reason: String,
     /// Source path for rename/move actions (`path` is the destination).
     pub from: Option<String>,
+    /// Set when this op settles a both-sides-changed file, so `apply` can
+    /// report the outcome once the op has actually succeeded.
+    pub conflict: Option<ConflictOutcome>,
 }
 
 impl Op {
@@ -138,6 +176,20 @@ impl Op {
             is_dir,
             reason: reason.into(),
             from: None,
+            conflict: None,
+        }
+    }
+
+    /// Like [`Op::new`], tagged with the conflict outcome it carries out.
+    pub fn settling(
+        action: Action,
+        path: impl Into<String>,
+        reason: impl Into<String>,
+        outcome: ConflictOutcome,
+    ) -> Self {
+        Op {
+            conflict: Some(outcome),
+            ..Op::new(action, path, false, reason)
         }
     }
 
@@ -154,6 +206,7 @@ impl Op {
             is_dir: false,
             reason: reason.into(),
             from: Some(from.into()),
+            conflict: None,
         }
     }
 

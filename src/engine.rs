@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -24,14 +24,26 @@ use crate::config::{remote_join, strip_root, Config, ConflictPolicy, LocalDelete
 use crate::datefmt::{epoch_to_stamp, now_epoch};
 use crate::logger::Logger;
 use crate::models::{
-    same_content, Action, Change, Compare, DownloadJob, Entry, Op, Plan, Uploaded,
+    same_content, Action, Change, Compare, ConflictOutcome, DownloadJob, Entry, Op, Plan, Uploaded,
 };
 use crate::remote::{ListOutcome, Remote};
 use crate::trash::trash_local;
 
-/// What [`Engine::plan`] returns: the plan, the prospective new baseline,
-/// whether the scan was incomplete, and the baseline rows to prune.
-type Planned = (Plan, BTreeMap<String, Entry>, bool, HashSet<String>);
+/// What [`Engine::plan`] returns.
+struct Planned {
+    plan: Plan,
+    /// The prospective new baseline (provisional until each op completes).
+    new_base: BTreeMap<String, Entry>,
+    /// The scan was incomplete: deletes and renames must be suppressed.
+    incomplete: bool,
+    /// Baseline rows to forget: now under an excluded path, or gone on both
+    /// sides with a complete view.
+    prune: HashSet<String>,
+    /// The baseline the plan was judged against (restricted to the scope).
+    base: BTreeMap<String, Entry>,
+    /// File rows in the whole pair's baseline when the run started.
+    tracked: usize,
+}
 
 pub struct SyncResult {
     pub pair: String,
@@ -39,6 +51,325 @@ pub struct SyncResult {
     pub errors: Vec<String>,
     pub plan_summary: String,
     pub was_in_sync: bool,
+    /// Set when this run held deletions back (see [`DeleteAllowance`]).
+    pub held: Option<HeldCounts>,
+}
+
+/// Deletions a run refused, by side. `local` counts files that would have
+/// left this computer, `remote` files that would have left Proton Drive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeldCounts {
+    pub local: usize,
+    pub remote: usize,
+    pub tracked: usize,
+}
+
+impl HeldCounts {
+    pub fn total(&self) -> usize {
+        self.local + self.remote
+    }
+}
+
+/// Small folders can be emptied without a prompt: the allowance never drops
+/// below this many files while the guard is on.
+pub const DELETE_FLOOR: usize = 25;
+
+/// How many files one run may delete from one pair that tracks `tracked`
+/// files. `None` means the guard is off (both options at 0). Each option at 0
+/// drops only its own term: no fixed cap, or no share-based limit.
+pub fn delete_allowance(max_files: usize, max_percent: u32, tracked: usize) -> Option<usize> {
+    let by_share = || DELETE_FLOOR.max(tracked * max_percent as usize / 100);
+    match (max_files, max_percent) {
+        (0, 0) => None,
+        (0, _) => Some(by_share()),
+        (_, 0) => Some(max_files),
+        _ => Some(max_files.min(by_share())),
+    }
+}
+
+#[derive(Default)]
+struct AllowanceState {
+    used: usize,
+    held: bool,
+    local: usize,
+    remote: usize,
+    /// Files found missing locally by the pre-count, when that held the run.
+    pre_remote: usize,
+}
+
+/// One run's budget for deletions on one pair, shared by every worker of that
+/// run. A folder reserves all of its deletes at once or none of them, and the
+/// first refusal holds the whole run: every later reservation is refused too,
+/// so a run deletes either everything it planned or nothing more.
+pub struct DeleteAllowance {
+    limit: Option<usize>,
+    tracked: usize,
+    state: Mutex<AllowanceState>,
+    incomplete: AtomicBool,
+}
+
+impl DeleteAllowance {
+    pub fn new(limit: Option<usize>, tracked: usize) -> Self {
+        DeleteAllowance {
+            limit,
+            tracked,
+            state: Mutex::new(AllowanceState::default()),
+            incomplete: AtomicBool::new(false),
+        }
+    }
+
+    /// The allowance one run gets from `cfg`, or an unlimited one when the
+    /// user has answered "Delete them" for this run only.
+    pub fn for_run(cfg: &Config, tracked: usize, allow_mass_delete: bool) -> Self {
+        let limit = if allow_mass_delete {
+            None
+        } else {
+            delete_allowance(cfg.max_delete_files, cfg.max_delete_percent, tracked)
+        };
+        Self::new(limit, tracked)
+    }
+
+    pub fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+
+    pub fn tracked(&self) -> usize {
+        self.tracked
+    }
+
+    /// Reserve room for `local` local deletes and `remote` remote deletes, all
+    /// or nothing. Returns false (and holds the run) when they do not fit.
+    pub fn reserve(&self, local: usize, remote: usize) -> bool {
+        let n = local + remote;
+        if n == 0 {
+            return true;
+        }
+        let Some(limit) = self.limit else {
+            return true;
+        };
+        let mut st = self.state.lock().unwrap();
+        if st.held || st.used + n > limit {
+            st.held = true;
+            st.local += local;
+            st.remote += remote;
+            return false;
+        }
+        st.used += n;
+        true
+    }
+
+    /// Hold the run before it starts when a local pre-count already shows
+    /// more files missing than the allowance covers. Returns whether it held.
+    pub fn pre_hold(&self, missing_locally: usize) -> bool {
+        let Some(limit) = self.limit else {
+            return false;
+        };
+        if missing_locally <= limit {
+            return false;
+        }
+        let mut st = self.state.lock().unwrap();
+        st.held = true;
+        st.pre_remote = missing_locally;
+        true
+    }
+
+    pub fn is_held(&self) -> bool {
+        self.state.lock().unwrap().held
+    }
+
+    /// What was refused: (files that would leave this computer, files that
+    /// would leave Proton Drive). The walk's refusals re-count files the
+    /// pre-count already found missing, so the larger of the two is reported.
+    pub fn refused(&self) -> (usize, usize) {
+        let st = self.state.lock().unwrap();
+        (st.local, st.remote.max(st.pre_remote))
+    }
+
+    pub fn counts(&self) -> HeldCounts {
+        let (local, remote) = self.refused();
+        HeldCounts {
+            local,
+            remote,
+            tracked: self.tracked,
+        }
+    }
+
+    /// Note that some part of the run could not see both sides in full, so
+    /// the run must not release a stored hold.
+    pub fn note_incomplete(&self) {
+        self.incomplete.store(true, Ordering::Relaxed);
+    }
+
+    pub fn incomplete(&self) -> bool {
+        self.incomplete.load(Ordering::Relaxed)
+    }
+}
+
+/// File rows (not folders) in a baseline.
+fn tracked_files(base: &BTreeMap<String, Entry>) -> usize {
+    base.values().filter(|e| !e.is_dir).count()
+}
+
+/// How many files a plan would delete on each side: a file delete counts 1, a
+/// folder delete counts the baseline file rows under it that have no delete
+/// of their own in the plan (the batch planner lists both), renames never
+/// count. Returns (local deletes, remote deletes).
+fn count_deletes(plan: &Plan, base: &BTreeMap<String, Entry>) -> (usize, usize) {
+    let count = |action: Action| {
+        let files: HashSet<&str> = plan
+            .ops
+            .iter()
+            .filter(|op| op.action == action && !op.is_dir)
+            .map(|op| op.path.as_str())
+            .collect();
+        let mut n = files.len();
+        for op in plan
+            .ops
+            .iter()
+            .filter(|op| op.action == action && op.is_dir)
+        {
+            let prefix = format!("{}/", op.path);
+            n += base
+                .iter()
+                .filter(|(k, e)| !e.is_dir && k.starts_with(&prefix) && !files.contains(k.as_str()))
+                .count();
+        }
+        n
+    };
+    (count(Action::DeleteLocal), count(Action::DeleteRemote))
+}
+
+/// Drop every delete still in the plan. Renames, transfers and mkdirs stay.
+fn strip_deletes(plan: &mut Plan) {
+    plan.ops
+        .retain(|op| !matches!(op.action, Action::DeleteRemote | Action::DeleteLocal));
+}
+
+/// Baseline files absent from the local tree right now: a plain walk, no
+/// hashing, excludes skipped. The streaming walk judges this before its first
+/// folder, so a whole missing sub-tree is seen as one number.
+fn missing_locally(pair: &Pair, base: &BTreeMap<String, Entry>) -> usize {
+    let root = &pair.local;
+    let mut present: HashSet<String> = HashSet::new();
+    for entry in walkdir::WalkDir::new(root)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(
+            |e| match e.path().strip_prefix(root).ok().and_then(|p| p.to_str()) {
+                Some(r) => !pair.is_excluded(&r.replace('\\', "/")),
+                None => true,
+            },
+        )
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if let Some(rel) = entry
+            .path()
+            .strip_prefix(root)
+            .ok()
+            .and_then(|p| p.to_str())
+        {
+            present.insert(rel.replace('\\', "/"));
+        }
+    }
+    base.iter()
+        .filter(|(k, e)| !e.is_dir && !pair.is_excluded(k) && !present.contains(*k))
+        .count()
+}
+
+/// End-of-run bookkeeping for the deletion guard. A held run stores the hold
+/// (not on a dry run) and reports it; a run that covered the whole pair with a
+/// complete view, was not cancelled and held nothing back clears any stored
+/// hold and says so.
+fn finish_deletes(
+    cfg: &Config,
+    log: &Logger,
+    events: Option<&dyn EventSink>,
+    dry_run: bool,
+    pair: &Pair,
+    allowance: &DeleteAllowance,
+    full_view: bool,
+) -> Option<HeldCounts> {
+    if allowance.is_held() {
+        let counts = allowance.counts();
+        let sides = held_sides(&counts);
+        if dry_run {
+            log.warn(&format!(
+                "{:?}: would hold back {} deletion(s) ({sides}); nothing would be deleted",
+                pair.name,
+                counts.total()
+            ));
+        } else {
+            if let Err(e) = crate::state::record_held_deletes(
+                &cfg.state_dir,
+                &pair.name,
+                counts.local,
+                counts.remote,
+                counts.tracked,
+                now_epoch(),
+            ) {
+                log.warn(&format!(
+                    "could not record held deletions for {:?}: {e}",
+                    pair.name
+                ));
+            }
+            log.error(&format!(
+                "{:?}: {} deletion(s) held back ({sides}) out of {} tracked file(s); nothing was \
+                 deleted. Run `neutronsync sync --resync {}` to restore them, or \
+                 `neutronsync sync --allow-mass-delete {}` to delete them.",
+                pair.name,
+                counts.total(),
+                counts.tracked,
+                pair.name,
+                pair.name
+            ));
+        }
+        if let Some(sink) = events {
+            sink.emit(&SyncEvent::DeletesHeld {
+                pair: pair.name.clone(),
+                local: counts.local,
+                remote: counts.remote,
+                tracked: counts.tracked,
+            });
+        }
+        return Some(counts);
+    }
+    if full_view && !dry_run {
+        match crate::state::clear_held_deletes(&cfg.state_dir, &pair.name) {
+            Ok(true) => {
+                log.info(&format!(
+                    "{:?}: deletions are no longer held back",
+                    pair.name
+                ));
+                if let Some(sink) = events {
+                    sink.emit(&SyncEvent::DeletesReleased {
+                        pair: pair.name.clone(),
+                    });
+                }
+            }
+            Ok(false) => {}
+            Err(e) => log.warn(&format!(
+                "could not clear held deletions for {:?}: {e}",
+                pair.name
+            )),
+        }
+    }
+    None
+}
+
+/// "250 removed on this computer", "260 removed in Proton Drive", or both.
+pub fn held_sides(counts: &HeldCounts) -> String {
+    let mut parts = Vec::new();
+    if counts.remote > 0 {
+        parts.push(format!("{} removed on this computer", counts.remote));
+    }
+    if counts.local > 0 {
+        parts.push(format!("{} removed in Proton Drive", counts.local));
+    }
+    parts.join(", ")
 }
 
 /// Aggregate outcome of syncing a set of pairs. Shared by the CLI, GUI and
@@ -57,16 +388,20 @@ pub fn run_sync(
     resync: bool,
     log: &Logger,
 ) -> RunSummary {
-    run_sync_with(cfg, pairs, dry_run, resync, log, None, None)
+    run_sync_with(cfg, pairs, dry_run, resync, false, log, None, None)
 }
 
 /// Like [`run_sync`], but with an optional structured-event sink and an optional
 /// cancellation flag - used by the GUI/service for progress and stop control.
+/// `allow_mass_delete` switches the deletion guard off for this run only (the
+/// user's "Delete them" answer); it is never read from the config.
+#[allow(clippy::too_many_arguments)]
 pub fn run_sync_with(
     cfg: &Config,
     pairs: &[Pair],
     dry_run: bool,
     resync: bool,
+    allow_mass_delete: bool,
     log: &Logger,
     events: Option<&dyn EventSink>,
     cancel: Option<&AtomicBool>,
@@ -80,6 +415,7 @@ pub fn run_sync_with(
     let dry_run = effective_dry_run(&proton, dry_run, log);
     let mut engine = Engine::new(cfg, proton, log, dry_run);
     engine.set_observer(events, cancel);
+    engine.set_allow_mass_delete(allow_mass_delete);
     let (mut applied, mut errors) = (0usize, 0usize);
     for pair in pairs {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -239,9 +575,31 @@ pub fn run_sync_shallow(
             current: remote_join(&pair.remote, folder),
         });
     }
+    let base = match sync_baseline(cfg, &pair.name, dry_run) {
+        Ok(b) => b,
+        Err(e) => {
+            log.error(&format!("baseline load failed for {:?}: {e:#}", pair.name));
+            if let Some(sink) = events {
+                sink.emit(&SyncEvent::Error {
+                    pair: Some(pair.name.clone()),
+                    text: e.to_string(),
+                });
+            }
+            return RunSummary {
+                applied: 0,
+                errors: 1,
+                pairs: 1,
+            };
+        }
+    };
+    let allowance = Arc::new(DeleteAllowance::for_run(cfg, tracked_files(&base), false));
     let mut engine = Engine::new(cfg, proton, log, dry_run);
     engine.set_observer(events, cancel);
-    match engine.sync_pair_shallow(pair, folder) {
+    engine.set_allowance(allowance.clone());
+    let outcome = engine.sync_pair_shallow_with_base(pair, folder, &base);
+    // A single folder never covers the whole pair, so it never releases a hold.
+    finish_deletes(cfg, log, events, dry_run, pair, &allowance, false);
+    match outcome {
         Ok((r, _children)) => RunSummary {
             applied: r.applied,
             errors: r.errors.len(),
@@ -311,7 +669,7 @@ pub fn run_sync_streaming(
     let base = match sync_baseline(cfg, &pair.name, dry_run) {
         Ok(b) => std::sync::Arc::new(b),
         Err(e) => {
-            log.error(&format!("baseline load failed for {:?}: {e}", pair.name));
+            log.error(&format!("baseline load failed for {:?}: {e:#}", pair.name));
             return RunSummary {
                 applied: 0,
                 errors: 1,
@@ -328,6 +686,20 @@ pub fn run_sync_streaming(
             .unwrap_or(4)
             .clamp(2, 8)
     };
+
+    // One deletion allowance for the whole walk, shared by every worker. The
+    // walk acts folder by folder and never sees the whole deletion at once, so
+    // count what is missing locally up front: a vanished sub-tree then holds
+    // the run before the first folder, not after the first 200 files.
+    let allowance = Arc::new(DeleteAllowance::for_run(cfg, tracked_files(&base), false));
+    let missing = missing_locally(pair, &base);
+    if allowance.pre_hold(missing) {
+        log.warn(&format!(
+            "{:?}: {missing} tracked file(s) are missing locally, more than this run may delete; \
+             holding every deletion back",
+            pair.name
+        ));
+    }
 
     let applied = AtomicUsize::new(0);
     let errors = AtomicUsize::new(0);
@@ -363,6 +735,7 @@ pub fn run_sync_streaming(
                     };
                     let mut eng = Engine::new(cfg, proton, log, dry_run);
                     eng.set_observer(events, cancel);
+                    eng.set_allowance(allowance.clone());
                     loop {
                         if is_cancelled() {
                             break;
@@ -388,6 +761,9 @@ pub fn run_sync_streaming(
                             }
                             Err(e) => {
                                 errors.fetch_add(1, Ordering::Relaxed);
+                                // A folder that was not reconciled leaves part
+                                // of the pair unseen.
+                                allowance.note_incomplete();
                                 log.error(&format!("pair {:?} <{folder}> failed: {e}", pair.name));
                             }
                         }
@@ -403,6 +779,9 @@ pub fn run_sync_streaming(
     if !dry_run && !is_cancelled() {
         let _ = crate::state::set_last_synced(&cfg.state_dir, &pair.name, now_epoch());
     }
+    // A full walk that ran to the end with both sides in view releases a hold.
+    let full_view = !is_cancelled() && !allowance.incomplete();
+    finish_deletes(cfg, log, events, dry_run, pair, &allowance, full_view);
     let applied = applied.load(Ordering::Relaxed);
     let errors = errors.load(Ordering::Relaxed);
     if let Some(sink) = events {
@@ -462,7 +841,7 @@ pub fn run_sync_shallow_many(
     let base = match sync_baseline(cfg, &pair.name, dry_run) {
         Ok(b) => std::sync::Arc::new(b),
         Err(e) => {
-            log.error(&format!("baseline load failed for {:?}: {e}", pair.name));
+            log.error(&format!("baseline load failed for {:?}: {e:#}", pair.name));
             return RunSummary {
                 applied: 0,
                 errors: 1,
@@ -480,6 +859,9 @@ pub fn run_sync_shallow_many(
     };
     let queue: Mutex<std::collections::VecDeque<String>> =
         Mutex::new(folders.iter().cloned().collect());
+    // One allowance for the whole batch: ten folders deleting 30 files each
+    // share one count, and the first folder that does not fit holds the rest.
+    let allowance = Arc::new(DeleteAllowance::for_run(cfg, tracked_files(&base), false));
     let applied = AtomicUsize::new(0);
     let errors = AtomicUsize::new(0);
     let counter = AtomicUsize::new(0);
@@ -505,6 +887,7 @@ pub fn run_sync_shallow_many(
                 };
                 let mut eng = Engine::new(cfg, proton, log, dry_run);
                 eng.set_observer(events, cancel);
+                eng.set_allowance(allowance.clone());
                 loop {
                     if is_cancelled() {
                         break;
@@ -536,6 +919,8 @@ pub fn run_sync_shallow_many(
             });
         }
     });
+    // A batch of folders never covers the whole pair, so it never releases a hold.
+    finish_deletes(cfg, log, events, dry_run, pair, &allowance, false);
     let applied = applied.load(Ordering::Relaxed);
     let errors = errors.load(Ordering::Relaxed);
     if let Some(sink) = events {
@@ -595,6 +980,11 @@ pub struct Engine<'a, R: Remote> {
     ensured: HashSet<String>,
     events: Option<&'a dyn EventSink>,
     cancel: Option<&'a AtomicBool>,
+    /// A run-wide allowance handed in by a caller that shares one across
+    /// workers. When unset, each pair-level call makes its own.
+    allowance: Option<Arc<DeleteAllowance>>,
+    /// The deletion guard is off for this run only ("Delete them").
+    allow_mass_delete: bool,
 }
 
 impl<'a, R: Remote> Engine<'a, R> {
@@ -614,7 +1004,79 @@ impl<'a, R: Remote> Engine<'a, R> {
             ensured: HashSet::new(),
             events: None,
             cancel: None,
+            allowance: None,
+            allow_mass_delete: false,
         }
+    }
+
+    /// Share one run's deletion allowance with this engine (a streaming or
+    /// batch worker). Without it, each pair-level call creates its own.
+    pub fn set_allowance(&mut self, allowance: Arc<DeleteAllowance>) {
+        self.allowance = Some(allowance);
+    }
+
+    /// Switch the deletion guard off for the runs this engine makes. A runtime
+    /// answer, never a config value.
+    pub fn set_allow_mass_delete(&mut self, on: bool) {
+        self.allow_mass_delete = on;
+    }
+
+    /// The allowance for a run over a pair tracking `tracked` files: the
+    /// shared one when a caller set it, else a fresh one for this call.
+    fn run_allowance(&self, tracked: usize) -> Arc<DeleteAllowance> {
+        match &self.allowance {
+            Some(a) => a.clone(),
+            None => Arc::new(DeleteAllowance::for_run(
+                self.cfg,
+                tracked,
+                self.allow_mass_delete,
+            )),
+        }
+    }
+
+    /// Judge a plan against the allowance: reserve every delete at once, and
+    /// when they do not fit, strip them all. Returns whether it held.
+    fn judge_deletes(
+        &self,
+        pair: &Pair,
+        label: &str,
+        plan: &mut Plan,
+        base: &BTreeMap<String, Entry>,
+        allowance: &DeleteAllowance,
+    ) -> bool {
+        let (local, remote) = count_deletes(plan, base);
+        if allowance.reserve(local, remote) {
+            return false;
+        }
+        self.log.warn(&format!(
+            "{:?}{label}: holding back {} deletion(s) ({} from Proton Drive, {} from this \
+             computer); the run may delete at most {} of {} tracked file(s)",
+            pair.name,
+            local + remote,
+            remote,
+            local,
+            allowance.limit().unwrap_or(0),
+            allowance.tracked()
+        ));
+        strip_deletes(plan);
+        true
+    }
+
+    fn finish(
+        &self,
+        pair: &Pair,
+        allowance: &DeleteAllowance,
+        full_view: bool,
+    ) -> Option<HeldCounts> {
+        finish_deletes(
+            self.cfg,
+            &self.log,
+            self.events,
+            self.dry_run,
+            pair,
+            allowance,
+            full_view,
+        )
     }
 
     /// Attach a structured-event sink and/or a cancellation flag (used by the
@@ -812,19 +1274,24 @@ impl<'a, R: Remote> Engine<'a, R> {
         // a scoped sync, restrict the baseline to rows strictly UNDER the scope
         // so nothing outside it is ever seen as missing (and thus deleted) — the
         // scan, reconcile and additive commit all stay within the sub-tree.
-        let base: BTreeMap<String, Entry> = if resync {
+        let full = if resync {
+            // A resync ignores the baseline, not the file it lives in: a
+            // damaged or newer sync state stops the run before any write,
+            // exactly as a normal run would, instead of being overwritten.
+            sync_baseline(self.cfg, &pair.name, self.remote.read_only())?;
             BTreeMap::new()
         } else {
-            let full = sync_baseline(self.cfg, &pair.name, self.remote.read_only())?;
-            match scope {
-                Some(s) => {
-                    let prefix = format!("{s}/");
-                    full.into_iter()
-                        .filter(|(k, _)| k.starts_with(&prefix))
-                        .collect()
-                }
-                None => full,
+            sync_baseline(self.cfg, &pair.name, self.remote.read_only())?
+        };
+        let tracked = tracked_files(&full);
+        let base: BTreeMap<String, Entry> = match scope {
+            Some(s) => {
+                let prefix = format!("{s}/");
+                full.into_iter()
+                    .filter(|(k, _)| k.starts_with(&prefix))
+                    .collect()
             }
+            None => full,
         };
         if base.is_empty() && !resync {
             self.log.info(&format!(
@@ -906,6 +1373,10 @@ impl<'a, R: Remote> Engine<'a, R> {
 
         let mut plan = Plan::default();
         let mut new_base: BTreeMap<String, Entry> = BTreeMap::new();
+        // Baseline rows for paths gone on BOTH sides. With a complete view
+        // that row is stale (a delete that was propagated by an earlier run
+        // that never got to commit, say) and would otherwise linger forever.
+        let mut gone: HashSet<String> = HashSet::new();
 
         let mut keys: Vec<&String> = local
             .keys()
@@ -925,6 +1396,9 @@ impl<'a, R: Remote> Engine<'a, R> {
             }
             let lc = *ls.get(path).unwrap_or(&Change::Absent);
             let rc = *rs.get(path).unwrap_or(&Change::Absent);
+            if lc == Change::Deleted && rc == Change::Deleted && !incomplete {
+                gone.insert(path.clone());
+            }
             self.decide(
                 path,
                 lc,
@@ -946,11 +1420,12 @@ impl<'a, R: Remote> Engine<'a, R> {
         // Baseline rows now under an excluded sub-path are forgotten. This is a
         // pure DB cleanup (no filesystem or remote effect) that makes re-include
         // behave like a fresh folder — union/redownload, never a delete.
-        let prune_excluded: HashSet<String> = base
+        let mut prune: HashSet<String> = base
             .keys()
             .filter(|k| pair.is_excluded(k))
             .cloned()
             .collect();
+        prune.extend(gone);
 
         // Collapse delete+create pairs of identical content into a single
         // rename/move (keeps large files from being re-uploaded on rename).
@@ -959,7 +1434,14 @@ impl<'a, R: Remote> Engine<'a, R> {
         if !incomplete {
             detect_renames(&mut plan, &base, &local, &remote);
         }
-        Ok((plan, new_base, incomplete, prune_excluded))
+        Ok(Planned {
+            plan,
+            new_base,
+            incomplete,
+            prune,
+            base,
+            tracked,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1191,21 +1673,39 @@ impl<'a, R: Remote> Engine<'a, R> {
         plan: &mut Plan,
         nb: &mut BTreeMap<String, Entry>,
     ) {
+        // Every op here carries its outcome, so `apply` can report which way
+        // the conflict went once the op has really succeeded.
         match self.cfg.conflict {
             ConflictPolicy::Skip => {
-                plan.add(Op::new(
+                plan.add(Op::settling(
                     Action::Noop,
                     path,
-                    false,
                     "conflict skipped (both changed)",
+                    ConflictOutcome::Skipped,
                 ));
             }
             ConflictPolicy::Newer => match (le.and_then(|e| e.mtime), re.and_then(|e| e.mtime)) {
                 (Some(lm), Some(rm)) if lm >= rm => {
-                    self.emit_upload(path, le, plan, nb, "conflict: local newer")
+                    plan.add(Op::settling(
+                        Action::Upload,
+                        path,
+                        "conflict: local newer",
+                        ConflictOutcome::KeptLocal,
+                    ));
+                    if let Some(e) = le {
+                        nb.insert(path.to_string(), e.clone());
+                    }
                 }
                 (Some(_), Some(_)) => {
-                    self.emit_download(path, re, plan, nb, "conflict: remote newer")
+                    plan.add(Op::settling(
+                        Action::Download,
+                        path,
+                        "conflict: remote newer",
+                        ConflictOutcome::KeptRemote,
+                    ));
+                    if let Some(e) = re {
+                        nb.insert(path.to_string(), e.clone());
+                    }
                 }
                 _ => self.emit_conflict_keep_both(path, re, plan, nb),
             },
@@ -1220,11 +1720,11 @@ impl<'a, R: Remote> Engine<'a, R> {
         plan: &mut Plan,
         nb: &mut BTreeMap<String, Entry>,
     ) {
-        plan.add(Op::new(
+        plan.add(Op::settling(
             Action::Conflict,
             path,
-            false,
             "both sides changed; keeping both",
+            ConflictOutcome::KeptBoth,
         ));
         if let Some(e) = re {
             nb.insert(path.to_string(), e.clone()); // original name holds remote version
@@ -1294,7 +1794,7 @@ impl<'a, R: Remote> Engine<'a, R> {
         pair: &Pair,
         plan: Plan,
         mut new_base: BTreeMap<String, Entry>,
-        prune_excluded: HashSet<String>,
+        prune: HashSet<String>,
     ) -> (SyncResult, HashSet<String>) {
         let mut result = SyncResult {
             pair: pair.name.clone(),
@@ -1302,6 +1802,7 @@ impl<'a, R: Remote> Engine<'a, R> {
             errors: Vec::new(),
             plan_summary: plan.summary(),
             was_in_sync: plan.is_empty(),
+            held: None,
         };
 
         let mut ops: Vec<Op> = plan.ops;
@@ -1366,6 +1867,17 @@ impl<'a, R: Remote> Engine<'a, R> {
             }
             self.log.info(&op.describe());
             if op.action == Action::Noop {
+                // A skipped conflict is settled by being left alone: report it
+                // so it reaches the inbox, where it shows once however often
+                // it repeats.
+                if let (Some(outcome), false) = (op.conflict, self.dry_run) {
+                    self.emit(SyncEvent::ConflictSettled {
+                        pair: pair.name.clone(),
+                        path: op.path.clone(),
+                        outcome,
+                        copy: None,
+                    });
+                }
                 continue;
             }
             if self.dry_run {
@@ -1382,7 +1894,7 @@ impl<'a, R: Remote> Engine<'a, R> {
             // line carries: the event already names the action and the path.
             let err_text = outcome.as_ref().err().map(|e| e.to_string());
             match outcome {
-                Ok(()) => {
+                Ok(copy) => {
                     result.applied += 1;
                     match op.action {
                         Action::DeleteRemote | Action::DeleteLocal => {
@@ -1398,6 +1910,16 @@ impl<'a, R: Remote> Engine<'a, R> {
                     // Confirm this op's provisional baseline row (harmless for
                     // deletes/no-ops, which aren't in `pending`).
                     done.insert(op.path.clone());
+                    // Only a conflict whose op succeeded is settled; a failed
+                    // one comes back next run.
+                    if let Some(outcome) = op.conflict {
+                        self.emit(SyncEvent::ConflictSettled {
+                            pair: pair.name.clone(),
+                            path: op.path.clone(),
+                            outcome,
+                            copy,
+                        });
+                    }
                 }
                 Err(e) => {
                     let msg = format!("{} {}: {e}", op.action.label(), op.path);
@@ -1443,16 +1965,17 @@ impl<'a, R: Remote> Engine<'a, R> {
         // written (as 'synced'); unseen rows are left intact, so a partial or
         // interrupted run still persists exactly the files that did complete.
         if !self.dry_run {
-            // Forget baseline rows now under an excluded sub-path (pure DB
-            // cleanup, no filesystem or remote effect) so a later re-include
-            // re-downloads rather than propagating a delete.
-            if !prune_excluded.is_empty() {
+            // Forget stale baseline rows: now under an excluded sub-path, or
+            // gone on both sides (pure DB cleanup, no filesystem or remote
+            // effect) so a later re-include re-downloads rather than
+            // propagating a delete, and a finished deletion stops lingering.
+            if !prune.is_empty() {
                 self.log.info(&format!(
-                    "pruning {} baseline row(s) now under an excluded path for {:?}",
-                    prune_excluded.len(),
+                    "pruning {} stale baseline row(s) for {:?}",
+                    prune.len(),
                     pair.name
                 ));
-                deleted_ok.extend(prune_excluded);
+                deleted_ok.extend(prune);
             }
             if let Err(e) = crate::state::commit_baseline(
                 &self.cfg.state_dir,
@@ -1531,6 +2054,12 @@ impl<'a, R: Remote> Engine<'a, R> {
         let done_rels: Mutex<Vec<String>> = Mutex::new(Vec::new());
         let fallback = AtomicBool::new(false);
         let cancel_ref: &AtomicBool = self.cancel.unwrap_or(&fallback);
+        // Downloads that settle a conflict ("remote newer"), reported only
+        // once the download has succeeded.
+        let settles: HashMap<&str, ConflictOutcome> = downloads
+            .iter()
+            .filter_map(|o| o.conflict.map(|c| (o.path.as_str(), c)))
+            .collect();
 
         let on_start = |j: &DownloadJob| {
             log.info(&format!("download    file {} (new remote)", j.rel));
@@ -1550,6 +2079,14 @@ impl<'a, R: Remote> Engine<'a, R> {
                     applied.fetch_add(1, Ordering::Relaxed);
                     match_mtime(&local_root.join(&j.rel), j.mtime);
                     done_rels.lock().unwrap().push(j.rel.clone());
+                    if let (Some(outcome), Some(s)) = (settles.get(j.rel.as_str()), events) {
+                        s.emit(&SyncEvent::ConflictSettled {
+                            pair: pair_name.to_string(),
+                            path: j.rel.clone(),
+                            outcome: *outcome,
+                            copy: None,
+                        });
+                    }
                 }
                 Err(e) => {
                     let msg = format!("download {}: {e}", j.rel);
@@ -1581,12 +2118,14 @@ impl<'a, R: Remote> Engine<'a, R> {
         done_down.extend(done_rels.into_inner().unwrap());
     }
 
+    /// Run one op. Returns the pair-relative path of the conflict copy when
+    /// the op kept both versions; `None` otherwise.
     fn apply_op(
         &mut self,
         pair: &Pair,
         op: &Op,
         new_base: &mut BTreeMap<String, Entry>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let local_full = safe_join(&pair.local, &op.path)?;
         let remote_full = remote_join(&pair.remote, &op.path);
         match op.action {
@@ -1660,18 +2199,20 @@ impl<'a, R: Remote> Engine<'a, R> {
                     match_mtime(&local_full, e.mtime);
                 }
             }
-            Action::Conflict => self.resolve_conflict(pair, &op.path, new_base)?,
+            Action::Conflict => return self.resolve_conflict(pair, &op.path, new_base).map(Some),
             Action::Noop => {}
         }
-        Ok(())
+        Ok(None)
     }
 
+    /// Keep both versions. Returns the pair-relative path of the renamed local
+    /// copy, which now exists on both sides.
     fn resolve_conflict(
         &mut self,
         pair: &Pair,
         rel: &str,
         new_base: &mut BTreeMap<String, Entry>,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let local_full = pair.local.join(rel);
         let stamp = epoch_to_stamp(now_epoch());
         let conflict_rel = conflict_name(rel, &stamp);
@@ -1702,13 +2243,13 @@ impl<'a, R: Remote> Engine<'a, R> {
         new_base.insert(
             conflict_rel.clone(),
             Entry {
-                path: conflict_rel,
+                path: conflict_rel.clone(),
                 is_dir: false,
                 size,
                 ..Default::default()
             },
         );
-        Ok(())
+        Ok(conflict_rel)
     }
 
     fn ensure_remote_base(&mut self, pair: &Pair) -> Result<()> {
@@ -1792,7 +2333,14 @@ impl<'a, R: Remote> Engine<'a, R> {
         self.emit(SyncEvent::PairStarted {
             pair: pair.name.clone(),
         });
-        let (mut plan, new_base, incomplete, prune_excluded) = self.plan(pair, resync, scope)?;
+        let Planned {
+            mut plan,
+            new_base,
+            incomplete,
+            prune,
+            base,
+            tracked,
+        } = self.plan(pair, resync, scope)?;
         if incomplete {
             // Safety: never delete or move based on a partial view of the remote.
             plan.ops.retain(|op| {
@@ -1804,6 +2352,14 @@ impl<'a, R: Remote> Engine<'a, R> {
                         | Action::RenameLocal
                 )
             });
+        }
+        // The whole plan is judged at once: either every delete fits the
+        // allowance or none of them runs this time.
+        let allowance = self.run_allowance(tracked);
+        let label = scope.map(|s| format!(" [{s}]")).unwrap_or_default();
+        self.judge_deletes(pair, &label, &mut plan, &base, &allowance);
+        if incomplete {
+            allowance.note_incomplete();
         }
         if plan.is_empty() {
             self.log.info(&format!(
@@ -1823,7 +2379,11 @@ impl<'a, R: Remote> Engine<'a, R> {
                 .collect(),
         });
         let tracked = new_base.len();
-        let (result, _deleted_ok) = self.apply(pair, plan, new_base, prune_excluded);
+        let (mut result, _deleted_ok) = self.apply(pair, plan, new_base, prune);
+        // Only a run over the whole pair, to the end, with both sides in view
+        // and nothing held, may release a stored hold.
+        let full_view = scope.is_none() && !incomplete && !self.cancelled();
+        result.held = self.finish(pair, &allowance, full_view);
         self.emit(SyncEvent::PairFinished {
             pair: pair.name.clone(),
             applied: result.applied,
@@ -1855,7 +2415,56 @@ impl<'a, R: Remote> Engine<'a, R> {
     /// with any `Remote` (including the test fake) and is the tested reference
     /// for the walk's semantics.
     pub fn sync_pair_streaming(&mut self, pair: &Pair) -> Result<SyncResult> {
+        if !pair.local.exists() {
+            anyhow::bail!(
+                "local folder {} does not exist — refusing streaming walk",
+                pair.local.display()
+            );
+        }
         let base = sync_baseline(self.cfg, &pair.name, self.remote.read_only())?;
+        // One allowance for the whole walk, with the same up-front count of
+        // locally missing files as the concurrent walk.
+        let allowance = Arc::new(DeleteAllowance::for_run(
+            self.cfg,
+            tracked_files(&base),
+            self.allow_mass_delete,
+        ));
+        let missing = missing_locally(pair, &base);
+        if allowance.pre_hold(missing) {
+            self.log.warn(&format!(
+                "{:?}: {missing} tracked file(s) are missing locally, more than this run may \
+                 delete; holding every deletion back",
+                pair.name
+            ));
+        }
+        let previous = self.allowance.replace(allowance.clone());
+        let walked = self.walk_streaming(pair, &base);
+        self.allowance = previous;
+        let (applied, errors) = walked?;
+        if !self.dry_run && !self.cancelled() {
+            let _ = crate::state::set_last_synced(
+                &self.cfg.state_dir,
+                &pair.name,
+                crate::datefmt::now_epoch(),
+            );
+        }
+        let full_view = !self.cancelled() && !allowance.incomplete();
+        let held = self.finish(pair, &allowance, full_view);
+        Ok(SyncResult {
+            pair: pair.name.clone(),
+            applied,
+            was_in_sync: applied == 0 && errors.is_empty(),
+            errors,
+            plan_summary: String::new(),
+            held,
+        })
+    }
+
+    fn walk_streaming(
+        &mut self,
+        pair: &Pair,
+        base: &BTreeMap<String, Entry>,
+    ) -> Result<(usize, Vec<String>)> {
         let mut applied = 0usize;
         let mut errors: Vec<String> = Vec::new();
         let mut frontier: Vec<String> = vec![String::new()];
@@ -1868,7 +2477,7 @@ impl<'a, R: Remote> Engine<'a, R> {
                 if self.cancelled() {
                     break;
                 }
-                let (r, children) = self.sync_pair_shallow_with_base(pair, &folder, &base)?;
+                let (r, children) = self.sync_pair_shallow_with_base(pair, &folder, base)?;
                 applied += r.applied;
                 errors.extend(r.errors);
                 next.extend(children);
@@ -1877,20 +2486,7 @@ impl<'a, R: Remote> Engine<'a, R> {
             next.dedup();
             frontier = next;
         }
-        if !self.dry_run && !self.cancelled() {
-            let _ = crate::state::set_last_synced(
-                &self.cfg.state_dir,
-                &pair.name,
-                crate::datefmt::now_epoch(),
-            );
-        }
-        Ok(SyncResult {
-            pair: pair.name.clone(),
-            applied,
-            was_in_sync: applied == 0 && errors.is_empty(),
-            errors,
-            plan_summary: String::new(),
-        })
+        Ok((applied, errors))
     }
 
     /// Like [`sync_pair_shallow`] but with a pre-loaded baseline snapshot, so a
@@ -2075,6 +2671,10 @@ impl<'a, R: Remote> Engine<'a, R> {
         let rs = classify(&remote_direct, &base_direct, cmp);
         let mut plan = Plan::default();
         let mut new_base: BTreeMap<String, Entry> = BTreeMap::new();
+        let blind = remote_failed || local_failed;
+        // Direct children gone on both sides, seen with both listings in hand:
+        // their rows (and a folder's descendants) are stale and get pruned.
+        let mut gone: Vec<(String, bool)> = Vec::new();
         let mut keys: Vec<&String> = local_direct
             .keys()
             .chain(remote_direct.keys())
@@ -2085,6 +2685,10 @@ impl<'a, R: Remote> Engine<'a, R> {
         for path in keys {
             let lc = *ls.get(path).unwrap_or(&Change::Absent);
             let rc = *rs.get(path).unwrap_or(&Change::Absent);
+            if lc == Change::Deleted && rc == Change::Deleted && !blind {
+                let is_dir = base_direct.get(path).is_some_and(|e| e.is_dir);
+                gone.push((path.clone(), is_dir));
+            }
             self.decide(
                 path,
                 lc,
@@ -2104,7 +2708,7 @@ impl<'a, R: Remote> Engine<'a, R> {
         }
         // Never delete or move on a blind view of either side: if the local
         // read_dir OR the remote listing failed, strip all destructive ops.
-        if remote_failed || local_failed {
+        if blind {
             plan.ops.retain(|op| {
                 !matches!(
                     op.action,
@@ -2115,14 +2719,46 @@ impl<'a, R: Remote> Engine<'a, R> {
                 )
             });
         }
-        // Baseline rows for direct children that are now EXCLUDED. (`base_direct`
-        // already filters excludes out, so scan the full snapshot instead.) These
-        // are pruned so a later re-include re-downloads rather than deleting.
-        let prune_excluded: HashSet<String> = base_all
+        // A deleted direct sub-folder has descendants in the baseline that the
+        // apply's per-key commit won't touch; collect them for cleanup after.
+        // Taken before the allowance is judged, so a held folder delete is
+        // not descended into either: its files stay as they are on both sides.
+        let deleted_dirs: Vec<String> = plan
+            .ops
+            .iter()
+            .filter(|o| matches!(o.action, Action::DeleteRemote | Action::DeleteLocal) && o.is_dir)
+            .map(|o| o.path.clone())
+            .collect();
+        // Judge this folder's deletes against the run's allowance, as one
+        // reservation: a folder delete counts the files under it.
+        let allowance = self.run_allowance(tracked_files(base_all));
+        self.judge_deletes(
+            pair,
+            &format!(" <{label}>"),
+            &mut plan,
+            base_all,
+            &allowance,
+        );
+        if blind {
+            allowance.note_incomplete();
+        }
+        // Baseline rows to forget: direct children that are now EXCLUDED
+        // (`base_direct` already filters excludes out, so scan the full
+        // snapshot instead), pruned so a later re-include re-downloads rather
+        // than deleting; and children gone on both sides, with a folder's
+        // descendants, so a finished deletion stops lingering in the baseline.
+        let mut prune: HashSet<String> = base_all
             .keys()
             .filter(|k| is_direct(k) && pair.is_excluded(k))
             .cloned()
             .collect();
+        for (path, is_dir) in &gone {
+            if *is_dir {
+                let pfx = format!("{path}/");
+                prune.extend(base_all.keys().filter(|k| k.starts_with(&pfx)).cloned());
+            }
+            prune.insert(path.clone());
+        }
 
         if plan.is_empty() {
             self.log
@@ -2132,17 +2768,8 @@ impl<'a, R: Remote> Engine<'a, R> {
                 .info(&format!("shallow <{label}> plan: {}", plan.summary()));
         }
 
-        // A deleted direct sub-folder has descendants in the baseline that the
-        // apply's per-key commit won't touch; collect them for cleanup after.
-        let deleted_dirs: Vec<String> = plan
-            .ops
-            .iter()
-            .filter(|o| matches!(o.action, Action::DeleteRemote | Action::DeleteLocal) && o.is_dir)
-            .map(|o| o.path.clone())
-            .collect();
-
         let tracked = new_base.len();
-        let (mut result, deleted_ok) = self.apply(pair, plan, new_base, prune_excluded);
+        let (mut result, deleted_ok) = self.apply(pair, plan, new_base, prune);
         // A moved or trashed folder's old path remains a valid hint. Missing paths
         // still suppress deletes above, but only real listing failures block ack.
         let listing_error = (remote_failed && !remote_missing) || (local_failed && !local_missing);
@@ -2419,8 +3046,83 @@ fn which_gio() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::safe_join;
+    use super::{delete_allowance, safe_join, DeleteAllowance};
     use std::path::Path;
+
+    #[test]
+    fn allowance_follows_the_formula() {
+        // Defaults: min(200, max(25, 30%)).
+        for (tracked, want) in [(0, 25), (10, 25), (100, 30), (1_000, 200), (100_000, 200)] {
+            assert_eq!(
+                delete_allowance(200, 30, tracked),
+                Some(want),
+                "tracked={tracked}"
+            );
+        }
+        // Both at 0: the guard is off.
+        for tracked in [0, 10, 100, 1_000, 100_000] {
+            assert_eq!(delete_allowance(0, 0, tracked), None);
+        }
+        // files at 0 drops the cap; percent at 0 drops the share.
+        assert_eq!(delete_allowance(0, 30, 100_000), Some(30_000));
+        assert_eq!(delete_allowance(0, 30, 10), Some(25));
+        assert_eq!(delete_allowance(200, 0, 100_000), Some(200));
+        assert_eq!(delete_allowance(5, 0, 10), Some(5));
+    }
+
+    #[test]
+    fn reservations_are_all_or_nothing_and_sticky() {
+        let a = DeleteAllowance::new(Some(200), 1_000);
+        assert!(a.reserve(0, 0));
+        assert!(a.reserve(0, 150));
+        assert!(!a.reserve(0, 60), "150 + 60 does not fit in 200");
+        assert!(a.is_held());
+        assert!(!a.reserve(0, 1), "once held, nothing more fits");
+        assert!(!a.reserve(10, 0));
+        assert_eq!(a.refused(), (10, 61));
+        assert_eq!(a.counts().tracked, 1_000);
+        // Off: everything fits and nothing is ever held.
+        let off = DeleteAllowance::new(None, 10);
+        assert!(off.reserve(5_000, 5_000));
+        assert!(!off.pre_hold(1_000_000));
+        assert!(!off.is_held());
+        // A pre-count hold refuses the very first reservation and reports the
+        // larger of the pre-count and what the walk later refused.
+        let pre = DeleteAllowance::new(Some(25), 300);
+        assert!(!pre.pre_hold(25));
+        assert!(pre.pre_hold(250));
+        assert!(!pre.reserve(0, 30));
+        assert_eq!(pre.refused(), (0, 250));
+    }
+
+    #[test]
+    fn concurrent_reservations_never_exceed_the_allowance() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        for _ in 0..20 {
+            let a = Arc::new(DeleteAllowance::new(Some(200), 1_000));
+            let granted = Arc::new(AtomicUsize::new(0));
+            let handles: Vec<_> = (0..8)
+                .map(|t| {
+                    let a = a.clone();
+                    let granted = granted.clone();
+                    std::thread::spawn(move || {
+                        for i in 0..50 {
+                            let n = 1 + (t * 7 + i) % 11;
+                            if a.reserve(n / 2, n - n / 2) {
+                                granted.fetch_add(n, Ordering::SeqCst);
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert!(granted.load(Ordering::SeqCst) <= 200);
+            assert!(a.is_held(), "8 x 50 reservations must exhaust 200");
+        }
+    }
 
     #[test]
     fn safe_join_allows_nested_but_rejects_escapes() {

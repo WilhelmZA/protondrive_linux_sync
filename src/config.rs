@@ -59,6 +59,12 @@ pub struct Config {
     pub download_threads: usize,
     pub remote_root: String,
     pub propagate_deletes: bool,
+    /// Most files one run may delete from one pair (0 = no fixed cap). See
+    /// [`crate::engine::delete_allowance`].
+    pub max_delete_files: usize,
+    /// Most files one run may delete from one pair, as a share of the files it
+    /// tracks (0 = no share-based limit). Both at 0 turns the guard off.
+    pub max_delete_percent: u32,
     /// Start the watch daemon on launch (the GUI's global "Auto sync").
     pub auto_sync: bool,
     /// Keep running in the system tray when the window is closed.
@@ -141,6 +147,8 @@ struct RawCli {
 struct RawOptions {
     remote_root: Option<String>,
     propagate_deletes: Option<bool>,
+    max_delete_files: Option<u64>,
+    max_delete_percent: Option<u64>,
     local_delete: Option<String>,
     conflict: Option<String>,
     compare: Option<String>,
@@ -340,6 +348,11 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         None => state_home().join("neutronsync"),
     };
 
+    let max_delete_percent = opts.max_delete_percent.unwrap_or(30);
+    if max_delete_percent > 100 {
+        bail!("options.max_delete_percent must be 0..=100, got {max_delete_percent}");
+    }
+
     // Zero pairs is allowed: the app can come up clean and folders get added
     // from the GUI. The engine/watcher simply have nothing to do until then.
     let raw_pairs = raw.pair.unwrap_or_default();
@@ -368,6 +381,8 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         download_threads: cli.download_threads.map(|n| n as usize).unwrap_or(0),
         remote_root,
         propagate_deletes: opts.propagate_deletes.unwrap_or(false),
+        max_delete_files: opts.max_delete_files.unwrap_or(200) as usize,
+        max_delete_percent: max_delete_percent as u32,
         auto_sync: opts.auto_sync.unwrap_or(false),
         run_in_tray: opts.run_in_tray.unwrap_or(false),
         x11_compat: opts.x11_compat.unwrap_or(false),
@@ -415,6 +430,8 @@ struct OutCli {
 struct OutOptions {
     remote_root: String,
     propagate_deletes: bool,
+    max_delete_files: usize,
+    max_delete_percent: u32,
     auto_sync: bool,
     run_in_tray: bool,
     x11_compat: bool,
@@ -487,6 +504,8 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
         options: OutOptions {
             remote_root: cfg.remote_root.clone(),
             propagate_deletes: cfg.propagate_deletes,
+            max_delete_files: cfg.max_delete_files,
+            max_delete_percent: cfg.max_delete_percent,
             auto_sync: cfg.auto_sync,
             run_in_tray: cfg.run_in_tray,
             x11_compat: cfg.x11_compat,
@@ -575,5 +594,35 @@ remote = "Documents"
         )
         .unwrap();
         assert_eq!(load(path.to_str()).unwrap().full_walk_interval, 86400);
+    }
+
+    #[test]
+    fn delete_guard_options_round_trip_and_refuse_bad_percent() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("cfg.toml");
+        let base = r#"
+[cli]
+backend = "api"
+[options]
+state_dir = "/tmp/ns-test-state"
+"#;
+        fs::write(&path, base).unwrap();
+        let mut cfg = load(path.to_str()).unwrap();
+        assert_eq!(cfg.max_delete_files, 200);
+        assert_eq!(cfg.max_delete_percent, 30);
+        for (files, percent) in [(0usize, 0u32), (500, 0), (0, 50), (10, 100)] {
+            cfg.max_delete_files = files;
+            cfg.max_delete_percent = percent;
+            save(&cfg, &path).unwrap();
+            let text = fs::read_to_string(&path).unwrap();
+            assert!(text.contains(&format!("max_delete_files = {files}")));
+            assert!(text.contains(&format!("max_delete_percent = {percent}")));
+            let loaded = load(path.to_str()).unwrap();
+            assert_eq!(loaded.max_delete_files, files);
+            assert_eq!(loaded.max_delete_percent, percent);
+        }
+        fs::write(&path, format!("{base}max_delete_percent = 101\n")).unwrap();
+        let err = load(path.to_str()).unwrap_err().to_string();
+        assert!(err.contains("max_delete_percent"), "{err}");
     }
 }

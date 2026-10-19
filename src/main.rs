@@ -27,22 +27,39 @@ struct DbSink {
 
 impl EventSink for DbSink {
     fn emit(&self, ev: &SyncEvent) {
-        if let SyncEvent::OpFinished {
-            pair,
-            action,
-            path,
-            ok,
-            error,
-        } = ev
-        {
-            let _ = self.stats.record_op(
+        match ev {
+            SyncEvent::OpFinished {
                 pair,
                 action,
                 path,
-                *ok,
-                error.as_deref(),
-                neutronsync::datefmt::now_epoch(),
-            );
+                ok,
+                error,
+            } => {
+                let _ = self.stats.record_op(
+                    pair,
+                    action,
+                    path,
+                    *ok,
+                    error.as_deref(),
+                    neutronsync::datefmt::now_epoch(),
+                );
+            }
+            // A CLI run's conflicts land in the same inbox the window shows.
+            SyncEvent::ConflictSettled {
+                pair,
+                path,
+                outcome,
+                copy,
+            } => {
+                let _ = self.stats.record_conflict(
+                    pair,
+                    path,
+                    *outcome,
+                    copy.as_deref(),
+                    neutronsync::datefmt::now_epoch(),
+                );
+            }
+            _ => {}
         }
     }
 }
@@ -88,8 +105,13 @@ enum Cmd {
         pair: Vec<String>,
         #[arg(long)]
         dry_run: bool,
+        /// Merge both sides afresh, deleting nothing (brings held-back files back).
         #[arg(long)]
         resync: bool,
+        /// Let this run delete more files than the allowance permits, for the
+        /// named pair(s) only. Never applies to every pair at once.
+        #[arg(long)]
+        allow_mass_delete: bool,
         #[arg(long)]
         json: bool,
     },
@@ -122,8 +144,9 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
             pair,
             dry_run,
             resync,
+            allow_mass_delete,
             json,
-        } => cmd_sync(cli, pair, *dry_run, *resync, *json),
+        } => cmd_sync(cli, pair, *dry_run, *resync, *allow_mass_delete, *json),
         Cmd::Watch { pair } => cmd_watch(cli, pair),
     }
 }
@@ -234,6 +257,16 @@ fn cmd_status(cli: &Cli) -> anyhow::Result<ExitCode> {
         "propagate del.  {} (local -> {:?})",
         cfg.propagate_deletes, cfg.local_delete
     );
+    println!(
+        "delete guard    max_delete_files = {}, max_delete_percent = {}{}",
+        cfg.max_delete_files,
+        cfg.max_delete_percent,
+        if cfg.max_delete_files == 0 && cfg.max_delete_percent == 0 {
+            " (off)"
+        } else {
+            ""
+        }
+    );
     println!("conflict        {:?}", cfg.conflict);
     println!("compare         {:?}", cfg.compare);
     println!("state dir       {}", cfg.state_dir.display());
@@ -269,8 +302,19 @@ fn cmd_sync(
     pairs: &[String],
     dry_run: bool,
     resync: bool,
+    allow_mass_delete: bool,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
+    // The permission to delete past the allowance is given for named pairs
+    // only, so it can never be applied to every pair by accident.
+    if allow_mass_delete && pairs.is_empty() {
+        eprintln!(
+            "usage: neutronsync sync --allow-mass-delete NAME...\n\
+             --allow-mass-delete needs the name of the folder pair whose held-back deletions \
+             you want carried out. Nothing was synced."
+        );
+        return Ok(ExitCode::from(2));
+    }
     let cfg = load_cfg(cli)?;
     let proton = select(&cfg)?;
     let log = if proton.read_only() {
@@ -307,20 +351,57 @@ fn cmd_sync(
     let db_sink = if dry_run {
         None
     } else {
-        Stats::open(&cfg.state_dir)
-            .ok()
-            .map(|stats| DbSink { stats })
+        match Stats::open(&cfg.state_dir) {
+            Ok(stats) => Some(DbSink { stats }),
+            Err(e) => {
+                // Every pair refuses the same file below; say why once here.
+                log.warn(&format!("sync state could not be opened: {e:#}"));
+                None
+            }
+        }
     };
     let mut engine = Engine::new(&cfg, proton, &log, dry_run);
     if let Some(sink) = &db_sink {
         engine.set_observer(Some(sink as &dyn EventSink), None);
     }
+    engine.set_allow_mass_delete(allow_mass_delete);
     let mut total_errors = 0usize;
     let mut summaries: Vec<(String, usize, usize, String)> = Vec::new();
     for pair in &selected {
         match engine.sync_pair(pair, resync) {
             Ok(res) => {
                 total_errors += res.errors.len();
+                if let Some(held) = res.held {
+                    // A held run is a failed run: say what was refused, on
+                    // which side, and the two ways to answer it.
+                    total_errors += 1;
+                    let sides = neutronsync::engine::held_sides(&held);
+                    if dry_run {
+                        log.error(&format!(
+                            "pair {:?}: would hold back {} deletions ({sides}) of {} tracked \
+                             files. Nothing would be deleted. To bring the files back: \
+                             neutronsync sync --resync {}  To delete them: \
+                             neutronsync sync --allow-mass-delete {}",
+                            res.pair,
+                            held.total(),
+                            held.tracked,
+                            res.pair,
+                            res.pair
+                        ));
+                    } else {
+                        log.error(&format!(
+                            "pair {:?}: {} deletions held back ({sides}) of {} tracked files. \
+                             Nothing was deleted. To bring the files back: \
+                             neutronsync sync --resync {}  To delete them: \
+                             neutronsync sync --allow-mass-delete {}",
+                            res.pair,
+                            held.total(),
+                            held.tracked,
+                            res.pair,
+                            res.pair
+                        ));
+                    }
+                }
                 log.info(&format!(
                     "pair {:?}: {} change(s) applied, {} error(s){}\n",
                     res.pair,
@@ -332,7 +413,7 @@ fn cmd_sync(
             }
             Err(e) => {
                 total_errors += 1;
-                log.error(&format!("pair {:?} failed: {e}", pair.name));
+                log.error(&format!("pair {:?} failed: {e:#}", pair.name));
             }
         }
     }

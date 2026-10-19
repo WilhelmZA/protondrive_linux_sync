@@ -43,6 +43,27 @@ Consequences that are intentional:
 - Deleting a whole sub-folder locally trashes the remote folder (recoverably) and cleans that sub-folder's descendant rows out of the baseline (the shallow commit only removed the folder's own row, so descendants are pruned explicitly).
 - A brand-new remote sub-folder initially appears as an empty local folder. Events for its children queue their parent for shallow reconcile.
 
+## Deletions held back
+
+Deleting is the one action a sync cannot undo on its own, so each run of a pair may delete only so many files before it stops and asks. The allowance for a run is `min(max_delete_files, max(25, tracked * max_delete_percent / 100))`, where `tracked` is the number of files in the pair's baseline when the run starts. The defaults are `max_delete_files = 200` and `max_delete_percent = 30`, so a folder of 1,000 files may lose 200 in one run and a folder of 100 files may lose 30; the floor of 25 lets a small folder be emptied without a prompt. Setting one option to 0 drops only its own term; both at 0 switch the guard off. (`delete_allowance` in `engine.rs`.)
+
+What counts: a file delete counts one, a folder delete counts every baseline file under it, and a move or rename counts nothing. Both directions count against the same allowance, files that would leave this computer and files that would leave Proton Drive. The whole plan is judged at once: either every delete fits or none of them runs. On the folder-by-folder walks (the hot pass, a batch of folders, the streaming full walk) every worker shares one allowance for the run, each folder reserves all of its deletes or none, and the first refusal holds every later folder too. The streaming walk also counts what is missing locally before its first folder, so a vanished sub-tree holds the run up front instead of after the first 200 files.
+
+When a run holds deletions back it still does everything else it planned (uploads, downloads, new folders), leaves every baseline row in place so the next run sees the same deletions again, stores the hold in `stats.db` (table `held_deletes`), logs an error naming the pair, the counts and the side, and `neutronsync sync` exits 1. The window shows a banner on the Activity page and the folder card says "N deletions held back". The two answers:
+
+- **Restore them** (`neutronsync sync --resync NAME`): merge both sides afresh, deleting nothing, which brings the missing files back from the side that still has them.
+- **Delete them** (`neutronsync sync --allow-mass-delete NAME`): switch the guard off for that one run of that pair and let the deletions through. The flag needs a pair name; it never applies to every pair at once, and it is never a config value.
+
+The stored hold is cleared only by a run that covers the whole pair, runs to the end, is not cancelled, saw both sides in full, and held nothing back. Hot passes, scoped runs, shallow batches and dry runs never clear it. A dry run reports what it would hold and writes nothing.
+
+## Conflicts
+
+A conflict (changed on both sides since the baseline) is settled by the `conflict` policy and then recorded in `stats.db` (table `conflicts`) once the settling transfer has actually completed: `keep-both` after the copy exists on both sides, `newer` after the upload or download of the winner, `skip` at plan time. A failed transfer records nothing and the conflict comes back next run. A `skip` conflict that repeats every run keeps one row with a count of how often it was seen, until it is dismissed. The window lists them on the Conflicts page. Note that `newer` replaces the losing copy without keeping a local backup of it.
+
+## Sync state file
+
+`stats.db` carries `PRAGMA user_version` (2 in this build). A file saved by a newer NeutronSync is refused with a message saying so, unchanged. A file SQLite cannot read (random bytes, truncated, a damaged page) is an error, never an empty baseline, so it can never be mistaken for "nothing was ever synced" and turn into a mass change.
+
 ## Config knobs
 
 | Key | Meaning |
@@ -53,6 +74,8 @@ Consequences that are intentional:
 | `scan_threads` | Concurrent remote-scan workers (0 = auto, capped at 8). |
 | `download_threads` | Concurrent downloads (0 = auto, kept modest). |
 | `propagate_deletes` | Whether deletions cross to the other side. |
+| `max_delete_files` | Most files one run may delete from one pair (default 200; 0 = no cap). |
+| `max_delete_percent` | Share of a pair's tracked files one run may delete, never below 25 files (default 30; 0 = no share limit). |
 | `local_delete` | `trash` (recoverable) or `remove` (permanent) for local deletes. |
 | `conflict` | `keep-both` (default), `newer`, or `skip`. |
 | `compare` | `size+mtime` (default), `size`, or `sha1`. |

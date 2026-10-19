@@ -99,6 +99,19 @@ def mutable(request):
         if method in writes:
             with (home / 'writes').open('a') as out:
                 out.write(json.dumps(request) + '\n')
+            # Crash controls for the disaster suite. `exit_after_writes` ends
+            # the sidecar (status 1) once the Nth write request is logged and
+            # before it is answered; a replacement sidecar keeps counting past
+            # N, so the crash happens once. The delays hold a logged upload or
+            # trash open long enough for a test to kill the client mid-request.
+            if controls.get('exit_after_writes'):
+                logged = sum(1 for _ in (home / 'writes').open())
+                if logged == int(controls['exit_after_writes']):
+                    os._exit(1)
+            if method == 'file.upload':
+                time.sleep(controls.get('upload_delay', 0))
+            if method == 'node.trash':
+                time.sleep(controls.get('trash_delay', 0))
             if controls.get('write_error'):
                 raise Failure(controls['write_error'])
         if method == 'node.resolve':

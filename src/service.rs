@@ -16,10 +16,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{self, Config, Pair};
 use crate::datefmt::now_epoch;
-use crate::engine::run_sync_with;
+use crate::engine::{held_sides, run_sync_with, HeldCounts};
 use crate::events::{EventSink, SyncEvent};
 use crate::logger::Logger;
-use crate::stats::Stats;
+use crate::stats::{ConflictRecord, HeldDeletes, Stats};
 use crate::watcher;
 
 const ACTIVITY_CAP: usize = 500;
@@ -353,6 +353,45 @@ impl EventSink for StateSink {
                 }
                 s.push(ActivityKind::Error, text.clone());
             }
+            SyncEvent::DeletesHeld {
+                pair,
+                local,
+                remote,
+                tracked,
+            } => {
+                // The hold itself lives in stats.db (the engine stored it); the
+                // feed gets one plain line so the run's outcome is visible.
+                let counts = HeldCounts {
+                    local: *local,
+                    remote: *remote,
+                    tracked: *tracked,
+                };
+                s.push(
+                    ActivityKind::Error,
+                    format!(
+                        "{pair}: {} deletions held back ({}). Nothing was deleted.",
+                        counts.total(),
+                        held_sides(&counts)
+                    ),
+                );
+            }
+            SyncEvent::DeletesReleased { pair } => {
+                s.push(
+                    ActivityKind::Info,
+                    format!("{pair}: deletions are no longer held back"),
+                );
+            }
+            SyncEvent::ConflictSettled {
+                pair,
+                path,
+                outcome,
+                copy,
+            } => {
+                drop(s);
+                if let Some(st) = &self.stats {
+                    let _ = st.record_conflict(pair, path, *outcome, copy.as_deref(), now_epoch());
+                }
+            }
         }
     }
 }
@@ -370,7 +409,12 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(cfg: Config) -> Self {
-        let stats = Stats::open(&cfg.state_dir).ok().map(Arc::new);
+        // A sync state that cannot be read is said so, up front, instead of
+        // the app starting as if it had never synced.
+        let (stats, stats_error) = match Stats::open(&cfg.state_dir) {
+            Ok(st) => (Some(Arc::new(st)), None),
+            Err(e) => (None, Some(format!("Sync state could not be read: {e:#}"))),
+        };
         // Seed last_synced from the DB so a folder that has synced before isn't
         // shown as "Initializing…" on a fresh process start.
         let pairs: Vec<PairState> = cfg
@@ -389,6 +433,14 @@ impl Controller {
 
         // restore the recent activity feed from the DB so it survives restarts
         let mut activity: VecDeque<ActivityItem> = VecDeque::new();
+        if let Some(text) = stats_error {
+            activity.push_back(ActivityItem {
+                ts: now_epoch(),
+                kind: ActivityKind::Error,
+                text,
+                op: None,
+            });
+        }
         if let Some(st) = &stats {
             let _ = st.prune_ops(1000);
             if let Ok(recs) = st.recent_ops(100) {
@@ -513,6 +565,22 @@ impl Controller {
 
     /// Reconcile the named pairs (empty = all) on a background thread.
     pub fn sync(&self, names: Vec<String>, dry_run: bool) {
+        self.sync_with(names, dry_run, false, false);
+    }
+
+    /// "Restore them": run one pair once with both sides merged afresh, so the
+    /// files whose deletion was held back come back.
+    pub fn restore_held(&self, name: String) {
+        self.sync_with(vec![name], false, true, false);
+    }
+
+    /// "Delete them": run one pair once with the deletion guard off, for this
+    /// run only. The permission is never written to the config.
+    pub fn delete_held(&self, name: String) {
+        self.sync_with(vec![name], false, false, true);
+    }
+
+    fn sync_with(&self, names: Vec<String>, dry_run: bool, resync: bool, allow_mass_delete: bool) {
         if self.busy.swap(true, Ordering::SeqCst) {
             return; // already running
         }
@@ -545,7 +613,8 @@ impl Controller {
                 &cfg,
                 &pairs,
                 dry_run,
-                false,
+                resync,
+                allow_mass_delete,
                 &log,
                 Some(&sink),
                 Some(&cancel),
@@ -560,6 +629,35 @@ impl Controller {
     /// Request cancellation of the current sync (stops before the next op).
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
+    }
+
+    /// Pairs whose deletions are held back, read from `stats.db` so the tray,
+    /// the window and the CLI all see the same holds.
+    pub fn held_deletes(&self) -> Vec<HeldDeletes> {
+        self.stats
+            .as_ref()
+            .and_then(|st| st.held_deletes().ok())
+            .unwrap_or_default()
+    }
+
+    /// Conflicts waiting to be looked at, newest first.
+    pub fn conflicts(&self) -> Vec<ConflictRecord> {
+        self.stats
+            .as_ref()
+            .and_then(|st| st.conflicts().ok())
+            .unwrap_or_default()
+    }
+
+    pub fn dismiss_conflict(&self, id: i64) {
+        if let Some(st) = &self.stats {
+            let _ = st.dismiss_conflict(id);
+        }
+    }
+
+    pub fn dismiss_all_conflicts(&self) {
+        if let Some(st) = &self.stats {
+            let _ = st.dismiss_all_conflicts();
+        }
     }
 
     /// Start the watch daemon for the named pairs (empty = all).
@@ -763,6 +861,92 @@ mod tests {
         assert_eq!(s.pairs[0].tracked, 5);
         assert!(s.pairs[0].last_synced.is_some());
         assert!(s.activity.iter().any(|a| a.text.contains("2 applied")));
+    }
+
+    #[test]
+    fn sink_records_holds_and_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let stats = Arc::new(Stats::open(dir.path()).unwrap());
+        let st = state_with(&["docs"]);
+        let sink = StateSink {
+            state: st.clone(),
+            stats: Some(stats.clone()),
+        };
+        sink.emit(&SyncEvent::DeletesHeld {
+            pair: "docs".into(),
+            local: 0,
+            remote: 250,
+            tracked: 300,
+        });
+        {
+            let s = st.lock().unwrap();
+            let last = s.activity.back().unwrap();
+            assert_eq!(last.kind, ActivityKind::Error);
+            assert_eq!(
+                last.text,
+                "docs: 250 deletions held back (250 removed on this computer). Nothing was deleted."
+            );
+        }
+        for _ in 0..3 {
+            sink.emit(&SyncEvent::ConflictSettled {
+                pair: "docs".into(),
+                path: "a.txt".into(),
+                outcome: crate::models::ConflictOutcome::Skipped,
+                copy: None,
+            });
+        }
+        sink.emit(&SyncEvent::ConflictSettled {
+            pair: "docs".into(),
+            path: "b.txt".into(),
+            outcome: crate::models::ConflictOutcome::KeptBoth,
+            copy: Some("b (conflict 1).txt".into()),
+        });
+        let rows = stats.conflicts().unwrap();
+        assert_eq!(rows.len(), 2);
+        let skipped = rows.iter().find(|r| r.path == "a.txt").unwrap();
+        assert_eq!(skipped.seen, 3);
+        let both = rows.iter().find(|r| r.path == "b.txt").unwrap();
+        assert_eq!(both.copy.as_deref(), Some("b (conflict 1).txt"));
+    }
+
+    #[test]
+    fn unreadable_sync_state_is_reported_in_the_feed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("stats.db"), b"garbage, not a database").unwrap();
+        let mut cfg = crate::config::Config {
+            sidecar: Some(dir.path().join("no-such-sidecar")),
+            scan_threads: 0,
+            download_threads: 0,
+            remote_root: "/my-files".into(),
+            propagate_deletes: false,
+            max_delete_files: 200,
+            max_delete_percent: 30,
+            auto_sync: false,
+            run_in_tray: false,
+            x11_compat: false,
+            local_delete: crate::config::LocalDelete::Trash,
+            conflict: crate::config::ConflictPolicy::KeepBoth,
+            compare: crate::models::Compare::SizeMtime,
+            full_walk_interval: 86400,
+            scan_interval_secs: 120,
+            debounce_secs: 2,
+            update_channel: crate::config::UpdateChannel::Stable,
+            check_on_launch: false,
+            state_dir: dir.path().to_path_buf(),
+            pairs: vec![],
+            source_path: None,
+        };
+        cfg.pairs.clear();
+        let ctrl = Controller::new(cfg);
+        let snap = ctrl.snapshot();
+        let line = snap
+            .activity
+            .iter()
+            .find(|a| a.text.starts_with("Sync state could not be read: "))
+            .expect("an error line about the sync state");
+        assert_eq!(line.kind, ActivityKind::Error);
+        assert!(ctrl.held_deletes().is_empty());
+        assert!(ctrl.conflicts().is_empty());
     }
 
     #[test]

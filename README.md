@@ -163,7 +163,9 @@ When the background tray is doing the work, an open window mirrors its live stat
 - A missing baseline (first run, or a wiped state dir) unions both sides rather than mirroring, so a lost baseline can't trigger a mass delete.
 - If a folder's local root is missing (an unmounted drive) or its remote base folder has vanished, the pair is refused for that run instead of being read as "everything was deleted".
 - A failed or interrupted run never poisons the wider sync: the baseline records a file only after its transfer actually completes, so a timeout, an error, or a run cancelled part-way leaves every other file's state untouched and retries the rest next run in the correct direction. This is what stops a half-finished run from later mistaking a not-yet-downloaded file for a deletion.
-- Conflicts keep both copies by default (`name (conflict <timestamp>).ext`).
+- Conflicts keep both copies by default (`name (conflict <timestamp>).ext`). Every settled conflict is listed on the window's Conflicts page, with where the copy went, until you dismiss it.
+- A run may delete only so many files from one folder pair before it stops and asks: at most `max_delete_files` (default 200) and at most `max_delete_percent` (default 30) of the files that pair keeps in sync, never fewer than 25. Whole folders count the files inside them. Past that, the run holds every deletion back, does everything else, and says so in the window and on the command line. "Restore them" (`neutronsync sync --resync NAME`) brings the files back; "Delete them" (`neutronsync sync --allow-mass-delete NAME`) lets them through for that one run. So an unmounted drive, a stray `rm -rf`, or a folder emptied by mistake cannot wipe the other side.
+- A sync state file that is damaged, or was saved by a newer NeutronSync, stops the sync with a message rather than being read as "nothing was ever synced".
 
 ## Selective sync
 
@@ -181,6 +183,8 @@ TOML at `~/.config/neutronsync/neutronsync.toml` (override with `-c PATH` or `$N
 remote_root = "/my-files"     # Proton's per-user root
 propagate_deletes = false     # deletes cross over (recoverably); false = never delete
 local_delete = "trash"        # trash | remove
+# max_delete_files = 200      # most files one run may delete from a pair (0 = no cap)
+# max_delete_percent = 30     # ... and at most this share of its files, never under 25 (0 = off)
 conflict = "keep-both"        # keep-both | newer | skip
 compare = "size+mtime"        # size | size+mtime | sha1
 full_walk_interval = 86400    # seconds between safety-net full checks (default 1 day)

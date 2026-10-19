@@ -57,6 +57,27 @@ pub enum SyncEvent {
     /// so a logged-out state surfaces as one clear banner instead of a pile of
     /// per-folder transfer errors.
     Auth { signed_in: bool },
+    /// A run refused to delete because it would have removed more files than
+    /// the allowance permits (see [`crate::engine::DeleteAllowance`]). Emitted
+    /// once per run per pair, after the run. `local` counts files that would
+    /// have left this computer, `remote` files that would have left Proton
+    /// Drive, and `tracked` the files the pair tracked when the run started.
+    DeletesHeld {
+        pair: String,
+        local: usize,
+        remote: usize,
+        tracked: usize,
+    },
+    /// A full run of the pair held nothing back, so its stored hold is gone.
+    DeletesReleased { pair: String },
+    /// A file that changed on both sides has been settled. `copy` is the
+    /// pair-relative path of the renamed local version when both were kept.
+    ConflictSettled {
+        pair: String,
+        path: String,
+        outcome: crate::models::ConflictOutcome,
+        copy: Option<String>,
+    },
 }
 
 /// Receiver of [`SyncEvent`]s. Implementations must be cheap and thread-safe:

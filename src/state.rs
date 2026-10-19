@@ -148,3 +148,20 @@ pub fn last_synced(state_dir: &Path, name: &str) -> Result<Option<i64>> {
 pub fn set_last_synced(state_dir: &Path, name: &str, ts: i64) -> Result<()> {
     Stats::open(state_dir)?.set_last_synced(name, ts)
 }
+
+/// Record that `name`'s deletions were held back (see [`Stats::record_held_deletes`]).
+pub fn record_held_deletes(
+    state_dir: &Path,
+    name: &str,
+    local: usize,
+    remote: usize,
+    tracked: usize,
+    now: i64,
+) -> Result<()> {
+    Stats::open(state_dir)?.record_held_deletes(name, local, remote, tracked, now)
+}
+
+/// Forget `name`'s hold. Returns whether one was stored.
+pub fn clear_held_deletes(state_dir: &Path, name: &str) -> Result<bool> {
+    Stats::open(state_dir)?.clear_held_deletes(name)
+}

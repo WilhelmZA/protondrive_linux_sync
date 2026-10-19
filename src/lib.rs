@@ -52,6 +52,14 @@ remote_root = "/my-files"
 # online trash, local -> desktop trash (see local_delete). A missing baseline
 # unions both sides, so a lost sync state never triggers a mass delete.
 propagate_deletes = true
+# How many files one sync may delete from one folder pair before it stops and
+# asks: at most max_delete_files, and at most max_delete_percent of the files
+# the pair tracks (never fewer than 25, so a small folder can be emptied). A
+# run over that holds every deletion back, keeps the files on both sides, and
+# the Activity page (or `neutronsync sync`) tells you how to answer. Set one
+# option to 0 to drop that limit; both at 0 switch the check off.
+# max_delete_files = 200
+# max_delete_percent = 30
 # How a propagated deletion removes the LOCAL copy:
 #   trash   send it to the freedesktop trash via gio (recoverable)
 #   remove  unlink permanently (no recovery)

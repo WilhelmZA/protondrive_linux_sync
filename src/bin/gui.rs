@@ -22,8 +22,9 @@ use eframe::egui::{
 };
 
 use neutronsync::config::{self, Config, ConflictPolicy, LocalDelete, Pair, UpdateChannel};
-use neutronsync::models::{Compare, Entry};
+use neutronsync::models::{Compare, ConflictOutcome, Entry};
 use neutronsync::service::{ActivityKind, ActivityOp, AppState, Controller, PairState, Phase};
+use neutronsync::stats::{ConflictRecord, HeldDeletes};
 use neutronsync::tray_policy::{self, ChildEnd, DaemonBanner, SupervisorAction};
 use neutronsync::updater::{self, UpdateInfo};
 
@@ -76,6 +77,7 @@ enum Icon {
     Arrow,
     Upload,
     Download,
+    Conflict,
 }
 
 fn icon_glyph(icon: Icon) -> &'static str {
@@ -95,6 +97,7 @@ fn icon_glyph(icon: Icon) -> &'static str {
         Icon::Arrow => ph::ARROW_RIGHT,
         Icon::Upload => ph::ARROW_UP,
         Icon::Download => ph::ARROW_DOWN,
+        Icon::Conflict => ph::ARROWS_LEFT_RIGHT,
     }
 }
 
@@ -384,14 +387,16 @@ fn status_dot(ui: &mut egui::Ui, col: Color32, pulse: bool) {
 enum Nav {
     Activity,
     Folders,
+    Conflicts,
     Settings,
     Account,
     About,
 }
 
-const NAV_ITEMS: [(Nav, Icon, &str); 5] = [
+const NAV_ITEMS: [(Nav, Icon, &str); 6] = [
     (Nav::Activity, Icon::Activity, "Activity"),
     (Nav::Folders, Icon::Folder, "Folders"),
+    (Nav::Conflicts, Icon::Conflict, "Conflicts"),
     (Nav::Settings, Icon::Gear, "Settings"),
     (Nav::Account, Icon::User, "Account"),
     (Nav::About, Icon::Info, "About"),
@@ -663,6 +668,14 @@ struct App {
     daemon_watch: DaemonWatch,
     _win_lock: Option<PidLock>,
 
+    // Held deletions and the conflict inbox, read from stats.db at most every
+    // two seconds so they are right whichever process did the sync.
+    holds: Vec<HeldDeletes>,
+    conflicts: Vec<ConflictRecord>,
+    last_state_poll: f64,
+    /// The pair whose "Delete them" answer is awaiting confirmation.
+    confirm_delete_held: Option<String>,
+
     // `--screenshots <dir>`: drive the window through scripted scenes with
     // made-up data and write one PNG per scene. None in normal use.
     demo: Option<Demo>,
@@ -728,6 +741,10 @@ impl App {
             mode_daemon,
             daemon_watch,
             _win_lock: win_lock,
+            holds: Vec::new(),
+            conflicts: Vec::new(),
+            last_state_poll: -1.0,
+            confirm_delete_held: None,
             demo: None,
         };
         // Resume Auto sync if it was on last time — but not in daemon mode, where
@@ -813,6 +830,18 @@ impl App {
             self.daemon_watch.spawned = true;
             self.daemon_watch.last_spawn = now;
         }
+    }
+
+    /// Re-read held deletions and the conflict inbox from stats.db, at most
+    /// every two seconds. Both are written by whichever process ran the sync
+    /// (this window, the tray, or the CLI), so the file is the one truth.
+    fn poll_state(&mut self, now: f64) {
+        if self.demo.is_some() || !tray_policy::check_due(now, self.last_state_poll, 2.0) {
+            return;
+        }
+        self.last_state_poll = now;
+        self.holds = self.ctrl.held_deletes();
+        self.conflicts = self.ctrl.conflicts();
     }
 
     /// "Try again" resets the failure count and starts background sync once.
@@ -1138,6 +1167,7 @@ impl eframe::App for App {
         self.pump_tray(ctx);
         let now = ctx.input(|i| i.time);
         self.poll_daemon_liveness(now);
+        self.poll_state(now);
         // pump the remote browser channel
         if let Some(rx) = &self.browser_rx {
             if let Ok(res) = rx.try_recv() {
@@ -1266,6 +1296,7 @@ impl eframe::App for App {
                     match self.nav {
                         Nav::Activity => self.page_activity(ui, &snap),
                         Nav::Folders => self.page_folders(ui, &snap),
+                        Nav::Conflicts => self.page_conflicts(ui),
                         Nav::Settings => self.page_settings(ui),
                         Nav::Account => self.page_account(ui, &snap),
                         Nav::About => self.page_about(ui),
@@ -1280,6 +1311,7 @@ impl eframe::App for App {
         self.browser_window(ctx);
         self.exclude_window(ctx);
         self.remove_local_dialog(ctx);
+        self.delete_held_dialog(ctx);
         self.logout_dialog(ctx);
         self.reset_dialog(ctx);
         self.toast_overlay(ctx);
@@ -1291,6 +1323,10 @@ impl eframe::App for App {
 
         if snap.busy || snap.watching || self.nav_t < 1.0 || self.toast.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        } else if self.demo.is_none() {
+            // Holds and conflicts can arrive from the tray or the CLI with no
+            // input here; wake up for the next two-second read.
+            ctx.request_repaint_after(std::time::Duration::from_millis(2100));
         }
     }
 }
@@ -1394,20 +1430,35 @@ impl App {
                         vec2(18.0, 18.0),
                     );
                     draw_icon(ui.painter(), ir, *icon, icol);
-                    ui.painter().text(
+                    let font = FontId::new(
+                        13.0,
+                        if selected {
+                            ff_bold()
+                        } else {
+                            FontFamily::Proportional
+                        },
+                    );
+                    let label_rect = ui.painter().text(
                         pos2(rect.left() + 44.0, rect.center().y),
                         Align2::LEFT_CENTER,
                         *label,
-                        FontId::new(
-                            13.0,
-                            if selected {
-                                ff_bold()
-                            } else {
-                                FontFamily::Proportional
-                            },
-                        ),
+                        font,
                         col,
                     );
+                    // The number of conflicts waiting, beside the label.
+                    if *nav == Nav::Conflicts && !self.conflicts.is_empty() {
+                        let count = thousands(self.conflicts.len());
+                        let cfont = FontId::new(11.0, ff_bold());
+                        let cw = galley_w(ui, &count, cfont.clone()) + 12.0;
+                        let pill = Rect::from_min_size(
+                            pos2(label_rect.right() + 8.0, rect.center().y - 9.0),
+                            vec2(cw, 18.0),
+                        );
+                        ui.painter()
+                            .rect_filled(pill, 9.0, WARN.gamma_multiply(0.22));
+                        ui.painter()
+                            .text(pill.center(), Align2::CENTER_CENTER, count, cfont, WARN);
+                    }
                     if resp.clicked() {
                         clicked = Some(*nav);
                     }
@@ -1628,6 +1679,29 @@ impl App {
             let _ = activity_banner(ui, bcol, bicon, btitle, &bsub, busy, None);
         }
 
+        // One banner per folder whose deletions were held back. Signed out
+        // wins: nothing can be answered until the session is back.
+        if !snap.signed_out {
+            let holds = self.holds.clone();
+            for hold in &holds {
+                ui.add_space(10.0);
+                match held_banner(ui, hold, !active) {
+                    HeldAction::Restore => {
+                        self.ctrl.restore_held(hold.pair.clone());
+                        self.toast(
+                            ui.ctx(),
+                            format!("Bringing the files back in {}…", hold.pair),
+                            false,
+                        );
+                    }
+                    HeldAction::Delete => {
+                        self.confirm_delete_held = Some(hold.pair.clone());
+                    }
+                    HeldAction::None => {}
+                }
+            }
+        }
+
         ui.add_space(14.0);
 
         // live in-progress operations, pinned above the feed
@@ -1805,6 +1879,18 @@ impl App {
                                     ps.as_ref(),
                                     self.cfg.pairs[i].auto && snap.watching,
                                 );
+                                if let Some(h) =
+                                    self.holds.iter().find(|h| h.pair == self.cfg.pairs[i].name)
+                                {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} held back",
+                                            plural(h.local + h.remote, "deletion")
+                                        ))
+                                        .size(12.0)
+                                        .color(WARN),
+                                    );
+                                }
                             });
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -1938,6 +2024,210 @@ impl App {
             self.commit();
             self.ctrl.sync(vec![name], false);
             self.set_nav(Nav::Activity);
+        }
+    }
+
+    fn page_conflicts(&mut self, ui: &mut egui::Ui) {
+        let count = self.conflicts.len();
+        let mut dismiss_all = false;
+        self.page_header(ui, "Conflicts", |ui, _app| {
+            if count > 0 && button(ui, None, "Dismiss all", Btn::Secondary, false, true).clicked() {
+                dismiss_all = true;
+            }
+        });
+        if self.conflicts.is_empty() {
+            empty_state(
+                ui,
+                "No conflicts.",
+                "A file changed on both sides since its last sync shows up here once \
+                 a sync has settled it.",
+            );
+            return;
+        }
+        ui.label(
+            RichText::new(
+                "Files that changed on both sides since their last sync, and how each \
+                 one was settled. Dismiss a row once you have looked at it.",
+            )
+            .size(13.0)
+            .color(DIM),
+        );
+        ui.add_space(12.0);
+
+        let locals: std::collections::HashMap<String, PathBuf> = self
+            .cfg
+            .pairs
+            .iter()
+            .map(|p| (p.name.clone(), p.local.clone()))
+            .collect();
+        let rows = self.conflicts.clone();
+        let mut open_target: Option<PathBuf> = None;
+        let mut dismiss: Option<i64> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_max_width((ui.available_width() - 15.0).max(200.0));
+                for c in &rows {
+                    let root = locals.get(&c.pair);
+                    let copy_full = c
+                        .copy
+                        .as_ref()
+                        .and_then(|copy| root.map(|r| r.join(copy)))
+                        .filter(|p| p.exists());
+                    card_frame().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            let (ir, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
+                            ui.painter().rect_filled(ir, 8.0, WARN.gamma_multiply(0.18));
+                            draw_icon(ui.painter(), ir.shrink(7.0), Icon::Conflict, WARN);
+                            ui.add_space(6.0);
+                            ui.vertical(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&c.path)
+                                            .font(FontId::new(14.0, ff_bold()))
+                                            .color(TEXT),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(&c.path);
+                                ui.label(RichText::new(conflict_sentence(c)).size(12.5).color(DIM));
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let when = if c.seen > 1 {
+                                        format!("{} · {} times", rel_time(c.last_ts), c.seen)
+                                    } else {
+                                        rel_time(c.last_ts)
+                                    };
+                                    ui.label(RichText::new(when).size(11.5).color(DIM2));
+                                    ui.add_space(10.0);
+                                    ui.label(RichText::new(&c.pair).size(12.0).color(ACCENT));
+                                },
+                            );
+                        });
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if button(
+                                ui,
+                                Some(Icon::Folder),
+                                "Show in folder",
+                                Btn::Secondary,
+                                true,
+                                root.is_some(),
+                            )
+                            .clicked()
+                            {
+                                if let Some(r) = root {
+                                    let parent =
+                                        c.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                                    open_target = Some(r.join(parent));
+                                }
+                            }
+                            if let Some(copy) = &copy_full {
+                                if button(ui, None, "Open copy", Btn::Ghost, true, true).clicked() {
+                                    open_target = Some(copy.clone());
+                                }
+                            }
+                            if button(ui, None, "Dismiss", Btn::Ghost, true, true).clicked() {
+                                dismiss = Some(c.id);
+                            }
+                        });
+                    });
+                    ui.add_space(10.0);
+                }
+            });
+        if let Some(p) = open_target {
+            open_path(&p);
+        }
+        if let Some(id) = dismiss {
+            self.ctrl.dismiss_conflict(id);
+            self.conflicts.retain(|c| c.id != id);
+            self.last_state_poll = -1.0;
+        }
+        if dismiss_all {
+            self.ctrl.dismiss_all_conflicts();
+            self.conflicts.clear();
+            self.last_state_poll = -1.0;
+        }
+    }
+
+    /// "Delete them" asks once more, and says where the files go.
+    fn delete_held_dialog(&mut self, ctx: &egui::Context) {
+        let Some(name) = self.confirm_delete_held.clone() else {
+            return;
+        };
+        let Some(hold) = self.holds.iter().find(|h| h.pair == name).cloned() else {
+            self.confirm_delete_held = None;
+            return;
+        };
+        let total = hold.local + hold.remote;
+        let local_fate = match self.cfg.local_delete {
+            LocalDelete::Trash => "go to the desktop trash",
+            LocalDelete::Remove => "are removed from this computer for good",
+        };
+        let mut parts = Vec::new();
+        if hold.remote > 0 {
+            parts.push(format!(
+                "the {} removed on this computer go to the Proton Drive trash",
+                plural(hold.remote, "file")
+            ));
+        }
+        if hold.local > 0 {
+            parts.push(format!(
+                "the {} removed in Proton Drive {local_fate}",
+                plural(hold.local, "file")
+            ));
+        }
+        let body = format!(
+            "This finishes the deletion that was held back: {}.",
+            parts.join(", and ")
+        );
+        let mut choice: Option<bool> = None;
+        egui::Window::new("Delete held files")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .frame(card_frame().inner_margin(egui::Margin::same(18)))
+            .title_bar(false)
+            .show(ctx, |ui| {
+                ui.set_max_width(360.0);
+                ui.label(
+                    RichText::new(format!("Delete {} from {name}?", plural(total, "file")))
+                        .font(FontId::new(15.0, ff_bold()))
+                        .color(TEXT),
+                );
+                ui.add_space(4.0);
+                ui.label(RichText::new(body).size(12.5).color(DIM));
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if button(
+                            ui,
+                            Some(Icon::Trash),
+                            "Delete them",
+                            Btn::Danger,
+                            false,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            choice = Some(true);
+                        }
+                        if button(ui, None, "Cancel", Btn::Secondary, false, true).clicked() {
+                            choice = Some(false);
+                        }
+                    });
+                });
+            });
+        if let Some(go) = choice {
+            self.confirm_delete_held = None;
+            if go {
+                self.ctrl.delete_held(name.clone());
+                self.toast(ctx, format!("Deleting the held files in {name}…"), false);
+                self.set_nav(Nav::Activity);
+            }
         }
     }
 
@@ -3007,6 +3297,111 @@ fn activity_banner(
     clicked
 }
 
+/// The answer chosen on a held-deletions banner.
+enum HeldAction {
+    None,
+    Restore,
+    Delete,
+}
+
+/// "They were removed on this computer", "in Proton Drive", or both.
+fn held_where(hold: &HeldDeletes) -> &'static str {
+    match (hold.remote > 0, hold.local > 0) {
+        (true, true) => "on this computer and in Proton Drive",
+        (true, false) => "on this computer",
+        _ => "in Proton Drive",
+    }
+}
+
+/// A WARN banner for one folder whose deletions were held back, with the two
+/// answers: bring the files back, or delete them after all.
+fn held_banner(ui: &mut egui::Ui, hold: &HeldDeletes, enabled: bool) -> HeldAction {
+    let total = hold.local + hold.remote;
+    let share = match (total * 100).checked_div(hold.tracked) {
+        Some(pct) => format!(
+            "That is {}% of the {} this folder keeps in sync.",
+            pct.max(1),
+            plural(hold.tracked, "file")
+        ),
+        None => String::new(),
+    };
+    let sub = format!(
+        "{share} They were removed {}. Nothing was deleted.",
+        held_where(hold)
+    );
+    let mut action = HeldAction::None;
+    let col = WARN;
+    let frame = egui::Frame::default()
+        .fill(col.gamma_multiply(0.11))
+        .stroke(Stroke::new(1.0, col.gamma_multiply(0.34)))
+        .corner_radius(12.0)
+        .inner_margin(egui::Margin::symmetric(16, 14));
+    ui.scope(|ui| {
+        ui.set_max_width((ui.available_width() - 15.0).max(200.0));
+        frame.show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (br, _) = ui.allocate_exact_size(vec2(38.0, 38.0), Sense::hover());
+                ui.painter().rect_filled(br, 10.0, col.gamma_multiply(0.22));
+                draw_icon(ui.painter(), br.shrink(9.0), Icon::Trash, col);
+                ui.add_space(12.0);
+                // Leave room for the two buttons on the right; the sentence
+                // wraps inside what is left instead of running under them.
+                let text_width = (ui.available_width() - 270.0).max(160.0);
+                ui.vertical(|ui| {
+                    ui.set_max_width(text_width);
+                    ui.add_space(1.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "{} held back in {}",
+                            plural(total, "deletion"),
+                            hold.pair
+                        ))
+                        .font(FontId::new(15.0, ff_bold()))
+                        .color(TEXT),
+                    );
+                    ui.add_space(1.0);
+                    ui.add(
+                        egui::Label::new(RichText::new(sub.trim()).size(12.0).color(DIM)).wrap(),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if button(ui, None, "Delete them", Btn::Secondary, false, enabled).clicked() {
+                        action = HeldAction::Delete;
+                    }
+                    if button(ui, None, "Restore them", Btn::Primary, false, enabled).clicked() {
+                        action = HeldAction::Restore;
+                    }
+                });
+            });
+        });
+    });
+    action
+}
+
+/// One plain sentence per conflict outcome.
+fn conflict_sentence(c: &ConflictRecord) -> String {
+    match c.outcome {
+        ConflictOutcome::KeptBoth => {
+            let name = c
+                .copy
+                .as_deref()
+                .map(|p| p.rsplit('/').next().unwrap_or(p).to_string())
+                .unwrap_or_else(|| "a conflict copy".to_string());
+            format!("Changed on both sides. Kept both; your version is saved as {name}.")
+        }
+        ConflictOutcome::KeptLocal => {
+            "Changed on both sides. Kept the newer version from this computer.".to_string()
+        }
+        ConflictOutcome::KeptRemote => {
+            "Changed on both sides. Kept the newer version from Proton Drive.".to_string()
+        }
+        ConflictOutcome::Skipped => {
+            "Changed on both sides. Left as it is until you choose.".to_string()
+        }
+    }
+}
+
 /// What an Activity row click wants to open locally.
 enum Open {
     File,
@@ -3838,6 +4233,8 @@ fn starter_config(path: &Path) -> Config {
         download_threads: 0,
         remote_root: config::DEFAULT_REMOTE_ROOT.into(),
         propagate_deletes: true,
+        max_delete_files: 200,
+        max_delete_percent: 30,
         auto_sync: false,
         run_in_tray: false,
         x11_compat: false,
@@ -4531,6 +4928,10 @@ impl App {
             mode_daemon: false,
             daemon_watch: DaemonWatch::new(),
             _win_lock: None,
+            holds: Vec::new(),
+            conflicts: Vec::new(),
+            last_state_poll: -1.0,
+            confirm_delete_held: None,
             demo: Some(Demo {
                 dir,
                 scenes: demo_scenes(),

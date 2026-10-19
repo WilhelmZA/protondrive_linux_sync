@@ -13,13 +13,15 @@ use neutronsync::config::{Config, ConflictPolicy, LocalDelete, Pair, UpdateChann
 use neutronsync::engine::Engine;
 use neutronsync::events::{EventSink, SyncEvent};
 use neutronsync::logger::Logger;
-use neutronsync::models::{Compare, Entry, Uploaded};
+use neutronsync::models::{Compare, ConflictOutcome, Entry, Uploaded};
 use neutronsync::remote::{ListOutcome, Remote};
+use neutronsync::stats::Stats;
 
 // --- in-memory fake remote --------------------------------------------------
 #[derive(Default)]
 struct Store {
     files: BTreeMap<String, Vec<u8>>, // absolute proton path -> bytes
+    mtimes: BTreeMap<String, i64>,    // absolute proton path -> claimed mtime, when known
     dirs: BTreeSet<String>,
     moves: usize,                               // count of rename/move calls
     fail_dir: Option<String>,                   // absolute path whose listing should error
@@ -79,6 +81,7 @@ impl Remote for FakeRemote {
                         path: rest.to_string(),
                         is_dir: false,
                         size: data.len() as u64,
+                        mtime: s.mtimes.get(f).copied(),
                         ..Default::default()
                     });
                 }
@@ -108,7 +111,16 @@ impl Remote for FakeRemote {
         if self.store.borrow().fail_upload.as_deref() == Some(key.as_str()) {
             anyhow::bail!("simulated upload failure for {key}");
         }
-        self.store.borrow_mut().files.insert(key, data);
+        let mtime = std::fs::metadata(local_path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64);
+        let mut s = self.store.borrow_mut();
+        if let Some(m) = mtime {
+            s.mtimes.insert(key.clone(), m);
+        }
+        s.files.insert(key, data);
         Ok(None)
     }
 
@@ -132,9 +144,11 @@ impl Remote for FakeRemote {
         let p = remote_path.trim_end_matches('/').to_string();
         let mut s = self.store.borrow_mut();
         s.files.remove(&p);
+        s.mtimes.remove(&p);
         s.dirs.remove(&p);
         let pref = format!("{p}/");
         s.files.retain(|k, _| !k.starts_with(&pref));
+        s.mtimes.retain(|k, _| !k.starts_with(&pref));
         s.dirs.retain(|k| !k.starts_with(&pref));
         Ok(())
     }
@@ -159,6 +173,8 @@ fn cfg(root: &Path) -> Config {
         download_threads: 0,
         remote_root: "/my-files".into(),
         propagate_deletes: false,
+        max_delete_files: 200,
+        max_delete_percent: 30,
         auto_sync: false,
         run_in_tray: false,
         x11_compat: false,
@@ -1477,5 +1493,681 @@ fn shallow_remote_notfound_suppresses_delete() {
     assert!(
         t.path().join("local/A/x.txt").exists(),
         "a remote NotFound must not delete the still-present local file"
+    );
+}
+
+// ---- deletion guard --------------------------------------------------------
+
+/// Captures every event as a value, so tests can match on fields.
+struct EventLog(std::sync::Arc<std::sync::Mutex<Vec<SyncEvent>>>);
+impl EventSink for EventLog {
+    fn emit(&self, ev: &SyncEvent) {
+        self.0.lock().unwrap().push(ev.clone());
+    }
+}
+
+struct Run {
+    result: neutronsync::engine::SyncResult,
+    events: Vec<SyncEvent>,
+}
+
+/// Run one full pair sync and return its result and every event it emitted.
+fn run_logged(cfg: &Config, remote: FakeRemote, resync: bool, dry_run: bool) -> Run {
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = EventLog(events.clone());
+    let log = Logger::silent();
+    let mut eng = Engine::new(cfg, remote, &log, dry_run);
+    eng.set_observer(Some(&sink), None);
+    let result = eng.sync_pair(&cfg.pairs[0], resync).unwrap();
+    let events = events.lock().unwrap().clone();
+    Run { result, events }
+}
+
+fn held_events(events: &[SyncEvent]) -> Vec<(usize, usize, usize)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            SyncEvent::DeletesHeld {
+                local,
+                remote,
+                tracked,
+                ..
+            } => Some((*local, *remote, *tracked)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn released(events: &[SyncEvent]) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, SyncEvent::DeletesReleased { .. }))
+}
+
+fn held_row(cfg: &Config) -> Option<neutronsync::stats::HeldDeletes> {
+    Stats::open(&cfg.state_dir)
+        .unwrap()
+        .held_for(&cfg.pairs[0].name)
+        .unwrap()
+}
+
+fn baseline(cfg: &Config) -> BTreeMap<String, Entry> {
+    neutronsync::state::load_baseline(&cfg.state_dir, &cfg.pairs[0].name).unwrap()
+}
+
+/// `n` files named `<dir>/f<i>.txt` (or `f<i>.txt` at the root) holding `body`.
+fn seed_files(root: &Path, dir: &str, n: usize) {
+    for i in 0..n {
+        let rel = if dir.is_empty() {
+            format!("f{i}.txt")
+        } else {
+            format!("{dir}/f{i}.txt")
+        };
+        write(&root.join("local").join(&rel), &format!("body {dir} {i}"));
+    }
+}
+
+fn remove_files(root: &Path, dir: &str, from: usize, to: usize) {
+    for i in from..to {
+        let rel = if dir.is_empty() {
+            format!("f{i}.txt")
+        } else {
+            format!("{dir}/f{i}.txt")
+        };
+        std::fs::remove_file(root.join("local").join(rel)).unwrap();
+    }
+}
+
+/// 300 tracked files on both sides (250 flat, 50 under `sub`), deletes on.
+fn tracked_300(tag: &str) -> (Tmp, Config, Rc<RefCell<Store>>) {
+    let t = Tmp::new(tag);
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    c.local_delete = LocalDelete::Remove;
+    let (fake, store) = FakeRemote::new();
+    seed_files(t.path(), "", 250);
+    seed_files(t.path(), "sub", 50);
+    run(&c, fake, false);
+    assert_eq!(remote_files(&store).len(), 300);
+    assert_eq!(baseline(&c).values().filter(|e| !e.is_dir).count(), 300);
+    (t, c, store)
+}
+
+#[test]
+fn mass_local_deletion_is_held_on_the_batch_path() {
+    // AC-3: 250 of 300 deleted locally is far over the allowance (200). The
+    // run trashes nothing, still uploads a new file, reports the hold once,
+    // stores it, and keeps every baseline row so the next run sees it again.
+    let (t, c, store) = tracked_300("hold-batch");
+    remove_files(t.path(), "", 0, 250);
+    write(&t.path().join("local/new.txt"), "created in the same run");
+
+    let (f, _s) = reuse(&store);
+    let r = run_logged(&c, f, false, false);
+    let remote = remote_files(&store);
+    assert_eq!(
+        remote.keys().filter(|k| k.contains("/f")).count(),
+        300,
+        "nothing may be trashed on Proton"
+    );
+    assert_eq!(
+        remote.get("/my-files/docs/new.txt").map(String::as_str),
+        Some("created in the same run"),
+        "the upload in the same run still happens"
+    );
+    assert_eq!(held_events(&r.events), vec![(0, 250, 300)]);
+    assert_eq!(
+        r.result.held.map(|h| (h.local, h.remote, h.tracked)),
+        Some((0, 250, 300))
+    );
+    let row = held_row(&c).expect("a held_deletes row");
+    assert_eq!((row.local, row.remote, row.tracked), (0, 250, 300));
+    let base = baseline(&c);
+    for i in 0..250 {
+        assert!(
+            base.contains_key(&format!("f{i}.txt")),
+            "row f{i} must stay"
+        );
+    }
+
+    // A second run holds the same 250 again (new.txt is tracked by now).
+    let (f, _s) = reuse(&store);
+    let r = run_logged(&c, f, false, false);
+    assert_eq!(held_events(&r.events), vec![(0, 250, 301)]);
+    assert_eq!(
+        remote_files(&store)
+            .keys()
+            .filter(|k| k.contains("/f"))
+            .count(),
+        300
+    );
+    assert!(held_row(&c).is_some());
+}
+
+#[test]
+fn small_deletion_propagates_without_a_hold() {
+    // AC-4: 20 of 300 is under the allowance; all 20 go and no row is written.
+    let (t, c, store) = tracked_300("hold-small");
+    remove_files(t.path(), "", 0, 20);
+    let (f, _s) = reuse(&store);
+    let r = run_logged(&c, f, false, false);
+    assert!(held_events(&r.events).is_empty());
+    assert!(r.result.held.is_none());
+    let remote = remote_files(&store);
+    for i in 0..20 {
+        assert!(!remote.contains_key(&format!("/my-files/docs/f{i}.txt")));
+    }
+    assert_eq!(remote.keys().filter(|k| k.contains("/f")).count(), 280);
+    assert!(held_row(&c).is_none());
+}
+
+#[test]
+fn folder_delete_counts_the_files_under_it() {
+    // AC-5: one folder holding 260 of 300 files is one delete op but counts
+    // 260, on the batch path and on a shallow reconcile of its parent.
+    for shallow in [false, true] {
+        let t = Tmp::new("hold-folder");
+        let mut c = cfg(t.path());
+        c.propagate_deletes = true;
+        let (fake, store) = FakeRemote::new();
+        seed_files(t.path(), "big", 260);
+        seed_files(t.path(), "", 40);
+        run(&c, fake, false);
+        std::fs::remove_dir_all(t.path().join("local/big")).unwrap();
+
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = EventLog(events.clone());
+        let (f, _s) = reuse(&store);
+        let log = Logger::silent();
+        let mut eng = Engine::new(&c, f, &log, false);
+        eng.set_observer(Some(&sink), None);
+        if shallow {
+            eng.sync_pair_shallow(&c.pairs[0], "").unwrap();
+        } else {
+            let r = eng.sync_pair(&c.pairs[0], false).unwrap();
+            assert_eq!(r.held.map(|h| (h.local, h.remote)), Some((0, 260)));
+            assert_eq!(held_events(&events.lock().unwrap()), vec![(0, 260, 300)]);
+        }
+        let remote = remote_files(&store);
+        assert_eq!(
+            remote.keys().filter(|k| k.contains("/big/")).count(),
+            260,
+            "shallow={shallow}: the folder's files must survive on Proton"
+        );
+        assert!(remote.contains_key("/my-files/docs/big/f0.txt"));
+        assert_eq!(baseline(&c).values().filter(|e| !e.is_dir).count(), 300);
+    }
+}
+
+#[test]
+fn streaming_walk_holds_a_mass_deletion_before_the_first_folder() {
+    // AC-6 (reference walk): 250 of 300 gone across many sub-folders. The
+    // up-front local count holds the run, so no folder deletes anything.
+    let t = Tmp::new("hold-stream");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    for d in 0..10 {
+        seed_files(t.path(), &format!("d{d}"), 30);
+    }
+    run_streaming(&c, fake);
+    assert_eq!(remote_files(&store).len(), 300);
+    for d in 0..8 {
+        std::fs::remove_dir_all(t.path().join(format!("local/d{d}"))).unwrap();
+    }
+    remove_files(t.path(), "d8", 0, 10);
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = EventLog(events.clone());
+    let (f, _s) = reuse(&store);
+    let log = Logger::silent();
+    let mut eng = Engine::new(&c, f, &log, false);
+    eng.set_observer(Some(&sink), None);
+    let r = eng.sync_pair_streaming(&c.pairs[0]).unwrap();
+    assert_eq!(remote_files(&store).len(), 300, "nothing may be trashed");
+    assert_eq!(
+        r.held.map(|h| (h.local, h.remote, h.tracked)),
+        Some((0, 250, 300))
+    );
+    assert_eq!(held_events(&events.lock().unwrap()), vec![(0, 250, 300)]);
+    assert_eq!(baseline(&c).values().filter(|e| !e.is_dir).count(), 300);
+    assert!(held_row(&c).is_some());
+}
+
+#[test]
+fn remote_folder_trash_is_held_on_the_streaming_walk() {
+    // AC-7: a remote top-level folder with 260 of 300 files vanishes. The walk
+    // deletes nothing locally and reports 260 that would have left this computer.
+    let t = Tmp::new("hold-remote");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    c.local_delete = LocalDelete::Remove;
+    let (fake, store) = FakeRemote::new();
+    seed_files(t.path(), "big", 260);
+    seed_files(t.path(), "", 40);
+    run_streaming(&c, fake);
+    {
+        let (f, _s) = reuse(&store);
+        f.trash("/my-files/docs/big").unwrap();
+    }
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = EventLog(events.clone());
+    let (f, _s) = reuse(&store);
+    let log = Logger::silent();
+    let mut eng = Engine::new(&c, f, &log, false);
+    eng.set_observer(Some(&sink), None);
+    let r = eng.sync_pair_streaming(&c.pairs[0]).unwrap();
+    assert!(t.path().join("local/big/f0.txt").exists());
+    assert_eq!(
+        walkdir::WalkDir::new(t.path().join("local/big"))
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .count(),
+        260,
+        "no local file may be removed"
+    );
+    assert_eq!(
+        r.held.map(|h| (h.local, h.remote, h.tracked)),
+        Some((260, 0, 300))
+    );
+    assert_eq!(held_events(&events.lock().unwrap()), vec![(260, 0, 300)]);
+    assert_eq!(baseline(&c).values().filter(|e| !e.is_dir).count(), 300);
+}
+
+/// A pair whose deletions are held, with the 250 files then put back locally
+/// so a full run would have nothing to hold.
+fn held_then_restored(tag: &str) -> (Tmp, Config, Rc<RefCell<Store>>) {
+    let (t, c, store) = tracked_300(tag);
+    remove_files(t.path(), "", 0, 250);
+    let (f, _s) = reuse(&store);
+    let r = run_logged(&c, f, false, false);
+    assert_eq!(held_events(&r.events).len(), 1);
+    assert!(held_row(&c).is_some());
+    seed_files(t.path(), "", 250);
+    (t, c, store)
+}
+
+#[test]
+fn full_run_with_nothing_to_hold_releases_the_hold() {
+    // AC-9: a later full run with nothing to hold clears the row and says so.
+    let (_t, c, store) = held_then_restored("release-full");
+    let (f, _s) = reuse(&store);
+    let r = run_logged(&c, f, false, false);
+    assert!(held_events(&r.events).is_empty());
+    assert!(
+        released(&r.events),
+        "DeletesReleased expected: {:?}",
+        r.events
+    );
+    assert!(held_row(&c).is_none());
+    // A clean follow-up does not announce a release again.
+    let (f, _s) = reuse(&store);
+    let r = run_logged(&c, f, false, false);
+    assert!(!released(&r.events));
+}
+
+#[test]
+fn restore_them_is_a_resync_that_releases_the_hold() {
+    // D8 "Restore them": a resync merges both sides afresh, deleting nothing,
+    // brings the 250 files back and clears the hold.
+    let (t, c, store) = tracked_300("release-resync");
+    remove_files(t.path(), "", 0, 250);
+    let (f, _s) = reuse(&store);
+    run_logged(&c, f, false, false);
+    assert!(held_row(&c).is_some());
+    let (f, _s) = reuse(&store);
+    let r = run_logged(&c, f, true, false);
+    assert!(released(&r.events));
+    assert!(held_row(&c).is_none());
+    for i in 0..250 {
+        assert!(
+            t.path().join(format!("local/f{i}.txt")).exists(),
+            "f{i} restored"
+        );
+    }
+    assert_eq!(remote_files(&store).len(), 300);
+}
+
+#[test]
+fn hot_pass_never_releases_the_hold() {
+    let (_t, c, store) = held_then_restored("release-hot");
+    let (f, _s) = reuse(&store);
+    let log = Logger::silent();
+    let mut eng = Engine::new(&c, f, &log, false);
+    eng.sync_pair_shallow(&c.pairs[0], "").unwrap();
+    assert!(
+        held_row(&c).is_some(),
+        "a shallow pass must not clear the hold"
+    );
+}
+
+#[test]
+fn scoped_run_never_releases_the_hold() {
+    let (_t, c, store) = held_then_restored("release-scoped");
+    let (f, _s) = reuse(&store);
+    let log = Logger::silent();
+    let mut eng = Engine::new(&c, f, &log, false);
+    eng.sync_pair_scoped(&c.pairs[0], false, Some("sub"))
+        .unwrap();
+    assert!(
+        held_row(&c).is_some(),
+        "a scoped run must not clear the hold"
+    );
+}
+
+#[test]
+fn dry_run_never_releases_the_hold() {
+    let (_t, c, store) = held_then_restored("release-dry");
+    let (f, _s) = reuse(&store);
+    let r = run_logged(&c, f, false, true);
+    assert!(!released(&r.events));
+    assert!(held_row(&c).is_some(), "a dry run must not clear the hold");
+}
+
+#[test]
+fn cancelled_run_never_releases_the_hold() {
+    let (_t, c, store) = held_then_restored("release-cancel");
+    let (f, _s) = reuse(&store);
+    let log = Logger::silent();
+    let cancel = AtomicBool::new(true);
+    let mut eng = Engine::new(&c, f, &log, false);
+    eng.set_observer(None, Some(&cancel));
+    let _ = eng.sync_pair(&c.pairs[0], false);
+    assert!(
+        held_row(&c).is_some(),
+        "a cancelled run must not clear the hold"
+    );
+}
+
+#[test]
+fn incomplete_remote_scan_never_releases_the_hold() {
+    let (_t, c, store) = held_then_restored("release-incomplete");
+    store.borrow_mut().fail_dir = Some("/my-files/docs/sub".into());
+    let (f, _s) = reuse(&store);
+    let r = run_logged(&c, f, false, false);
+    assert!(!released(&r.events));
+    assert!(
+        held_row(&c).is_some(),
+        "an incomplete scan must not clear the hold"
+    );
+}
+
+#[test]
+fn delete_them_switches_the_guard_off_for_one_run() {
+    // D8 "Delete them": the allowance is off for that run only; the 250
+    // deletions go through and the hold is cleared.
+    let (t, c, store) = tracked_300("allow-mass");
+    remove_files(t.path(), "", 0, 250);
+    let (f, _s) = reuse(&store);
+    run_logged(&c, f, false, false);
+    assert!(held_row(&c).is_some());
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = EventLog(events.clone());
+    let (f, _s) = reuse(&store);
+    let log = Logger::silent();
+    let mut eng = Engine::new(&c, f, &log, false);
+    eng.set_observer(Some(&sink), None);
+    eng.set_allow_mass_delete(true);
+    let r = eng.sync_pair(&c.pairs[0], false).unwrap();
+    assert!(r.held.is_none());
+    assert_eq!(remote_files(&store).len(), 50);
+    assert!(released(&events.lock().unwrap()));
+    assert!(held_row(&c).is_none());
+    assert_eq!(baseline(&c).values().filter(|e| !e.is_dir).count(), 50);
+}
+
+#[test]
+fn guard_off_in_config_deletes_everything() {
+    // Both options at 0: the guard is off and a mass deletion is mirrored.
+    let (t, mut c, store) = tracked_300("guard-off");
+    c.max_delete_files = 0;
+    c.max_delete_percent = 0;
+    remove_files(t.path(), "", 0, 250);
+    let (f, _s) = reuse(&store);
+    let r = run_logged(&c, f, false, false);
+    assert!(r.result.held.is_none());
+    assert_eq!(remote_files(&store).len(), 50);
+}
+
+#[test]
+fn rows_gone_on_both_sides_are_forgotten() {
+    // A delete that reached Proton but whose run never committed leaves a
+    // baseline row behind. With both sides in view that row is dropped, so
+    // the next run plans nothing instead of carrying it forever.
+    let t = Tmp::new("gone-both");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/a.txt"), "a");
+    write(&t.path().join("local/d/b.txt"), "b");
+    run(&c, fake, false);
+    std::fs::remove_file(t.path().join("local/a.txt")).unwrap();
+    std::fs::remove_dir_all(t.path().join("local/d")).unwrap();
+    {
+        let (f, _s) = reuse(&store);
+        f.trash("/my-files/docs/a.txt").unwrap();
+        f.trash("/my-files/docs/d").unwrap();
+    }
+    let (f, _s) = reuse(&store);
+    let r = run_logged(&c, f, false, false);
+    assert_eq!(r.result.applied, 0);
+    assert!(
+        baseline(&c).is_empty(),
+        "stale rows must be pruned: {:?}",
+        baseline(&c)
+    );
+    // The shallow path prunes a gone folder's descendants too.
+    let t2 = Tmp::new("gone-both-shallow");
+    let mut c2 = cfg(t2.path());
+    c2.propagate_deletes = true;
+    let (fake2, store2) = FakeRemote::new();
+    write(&t2.path().join("local/d/b.txt"), "b");
+    write(&t2.path().join("local/d/e/c.txt"), "c");
+    run(&c2, fake2, false);
+    std::fs::remove_dir_all(t2.path().join("local/d")).unwrap();
+    {
+        let (f, _s) = reuse(&store2);
+        f.trash("/my-files/docs/d").unwrap();
+    }
+    let (f, _s) = reuse(&store2);
+    let log = Logger::silent();
+    let mut eng = Engine::new(&c2, f, &log, false);
+    eng.sync_pair_shallow(&c2.pairs[0], "").unwrap();
+    assert!(baseline(&c2).is_empty(), "{:?}", baseline(&c2));
+}
+
+// ---- conflict inbox ----------------------------------------------------------
+
+fn settled(events: &[SyncEvent]) -> Vec<(String, ConflictOutcome, Option<String>)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            SyncEvent::ConflictSettled {
+                path,
+                outcome,
+                copy,
+                ..
+            } => Some((path.clone(), *outcome, copy.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn set_mtime(p: &Path, secs: i64) {
+    let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+    f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64))
+        .unwrap();
+}
+
+#[test]
+fn keep_both_reports_the_copy_once_it_exists_on_both_sides() {
+    // AC-13
+    let t = Tmp::new("inbox-both");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/a.txt"), "base");
+    run(&c, fake, false);
+    write(&t.path().join("local/a.txt"), "local-change");
+    store.borrow_mut().files.insert(
+        "/my-files/docs/a.txt".into(),
+        b"remote-change-different".to_vec(),
+    );
+    let (f, _s) = reuse(&store);
+    let r = run_logged(&c, f, false, false);
+    let got = settled(&r.events);
+    assert_eq!(got.len(), 1, "{got:?}");
+    let (path, outcome, copy) = &got[0];
+    assert_eq!(path, "a.txt");
+    assert_eq!(*outcome, ConflictOutcome::KeptBoth);
+    let copy = copy.as_ref().expect("the copy's relative path");
+    assert!(copy.contains("(conflict"), "{copy}");
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("local").join(copy)).unwrap(),
+        "local-change"
+    );
+    assert_eq!(
+        remote_files(&store)
+            .get(&format!("/my-files/docs/{copy}"))
+            .map(String::as_str),
+        Some("local-change")
+    );
+}
+
+#[test]
+fn newer_policy_reports_the_winner_only_after_the_transfer() {
+    // AC-14: local newer -> KeptLocal after the upload; remote newer ->
+    // KeptRemote after the download; a failed transfer reports nothing.
+    for (local_newer, fail) in [(true, false), (false, false), (true, true), (false, true)] {
+        let t = Tmp::new("inbox-newer");
+        let mut c = cfg(t.path());
+        c.conflict = ConflictPolicy::Newer;
+        let (fake, store) = FakeRemote::new();
+        let local = t.path().join("local/a.txt");
+        write(&local, "base");
+        set_mtime(&local, 1_700_000_000);
+        run(&c, fake, false);
+        write(&local, "local-edit");
+        let (lm, rm) = if local_newer {
+            (1_700_000_900, 1_700_000_500)
+        } else {
+            (1_700_000_500, 1_700_000_900)
+        };
+        set_mtime(&local, lm);
+        {
+            let mut s = store.borrow_mut();
+            s.files.insert(
+                "/my-files/docs/a.txt".into(),
+                b"remote-edit-longer".to_vec(),
+            );
+            s.mtimes.insert("/my-files/docs/a.txt".into(), rm);
+            if fail && local_newer {
+                s.fail_upload = Some("/my-files/docs/a.txt".into());
+            }
+            if fail && !local_newer {
+                s.fail_download = Some("/my-files/docs/a.txt".into());
+            }
+        }
+        let (f, _s) = reuse(&store);
+        let r = run_logged(&c, f, false, false);
+        let got = settled(&r.events);
+        if fail {
+            assert!(got.is_empty(), "local_newer={local_newer}: {got:?}");
+            assert!(!r.result.errors.is_empty());
+            continue;
+        }
+        let want = if local_newer {
+            ConflictOutcome::KeptLocal
+        } else {
+            ConflictOutcome::KeptRemote
+        };
+        assert_eq!(got, vec![("a.txt".to_string(), want, None)]);
+        let body = if local_newer {
+            "local-edit"
+        } else {
+            "remote-edit-longer"
+        };
+        assert_eq!(std::fs::read_to_string(&local).unwrap(), body);
+        assert_eq!(
+            remote_files(&store)
+                .get("/my-files/docs/a.txt")
+                .map(String::as_str),
+            Some(body)
+        );
+    }
+}
+
+/// Records settled conflicts into stats.db the way the CLI and GUI sinks do.
+struct InboxSink(std::sync::Arc<Stats>);
+impl EventSink for InboxSink {
+    fn emit(&self, ev: &SyncEvent) {
+        if let SyncEvent::ConflictSettled {
+            pair,
+            path,
+            outcome,
+            copy,
+        } = ev
+        {
+            self.0
+                .record_conflict(
+                    pair,
+                    path,
+                    *outcome,
+                    copy.as_deref(),
+                    neutronsync::datefmt::now_epoch(),
+                )
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn skipped_conflict_shows_once_until_dismissed() {
+    // AC-15 and AC-16: three runs over one skipped conflict leave one row
+    // seen three times; dismissing hides it; the same conflict again is new.
+    let t = Tmp::new("inbox-skip");
+    let mut c = cfg(t.path());
+    c.conflict = ConflictPolicy::Skip;
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/a.txt"), "base");
+    run(&c, fake, false);
+    write(&t.path().join("local/a.txt"), "local-change");
+    store.borrow_mut().files.insert(
+        "/my-files/docs/a.txt".into(),
+        b"remote-change-different".to_vec(),
+    );
+    let stats = std::sync::Arc::new(Stats::open(&c.state_dir).unwrap());
+    let sink = InboxSink(stats.clone());
+    for _ in 0..3 {
+        let (f, _s) = reuse(&store);
+        let log = Logger::silent();
+        let mut eng = Engine::new(&c, f, &log, false);
+        eng.set_observer(Some(&sink), None);
+        eng.sync_pair(&c.pairs[0], false).unwrap();
+    }
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("local/a.txt")).unwrap(),
+        "local-change",
+        "skip leaves the local file alone"
+    );
+    let rows = stats.conflicts().unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].outcome, ConflictOutcome::Skipped);
+    assert_eq!(rows[0].seen, 3);
+    assert_eq!(stats.conflict_count().unwrap(), 1);
+    stats.dismiss_conflict(rows[0].id).unwrap();
+    assert_eq!(stats.conflict_count().unwrap(), 0);
+    {
+        let (f, _s) = reuse(&store);
+        let log = Logger::silent();
+        let mut eng = Engine::new(&c, f, &log, false);
+        eng.set_observer(Some(&sink), None);
+        eng.sync_pair(&c.pairs[0], false).unwrap();
+    }
+    let rows = stats.conflicts().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].seen, 1,
+        "after a dismissal the conflict is news again"
     );
 }

@@ -716,3 +716,167 @@ fn transfer_thread_overrides_fallback_clamp_and_error_callbacks() {
         });
     assert_eq!(failed.load(Ordering::SeqCst), jobs.len());
 }
+
+// ---- deletion guard against the real API path --------------------------------
+
+/// Captures every event as a value.
+struct EventLog(Mutex<Vec<neutronsync::events::SyncEvent>>);
+impl neutronsync::events::EventSink for EventLog {
+    fn emit(&self, ev: &neutronsync::events::SyncEvent) {
+        self.0.lock().unwrap().push(ev.clone());
+    }
+}
+
+fn held_events(log: &EventLog) -> Vec<(usize, usize, usize)> {
+    log.0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            neutronsync::events::SyncEvent::DeletesHeld {
+                local,
+                remote,
+                tracked,
+                ..
+            } => Some((*local, *remote, *tracked)),
+            _ => None,
+        })
+        .collect()
+}
+
+impl Harness {
+    /// The same file on both sides, with the fixture's mtime, so the first
+    /// run only records it.
+    fn both(&self, folder: &str, name: &str, body: &str) {
+        self.remote(name, folder, Some(body));
+        let rel = format!("{folder}/{name}");
+        self.local(&rel, body);
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(self.cfg.pairs[0].local.join(&rel))
+            .unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+            .unwrap();
+    }
+    fn trashes(&self) -> usize {
+        self.writes()
+            .iter()
+            .filter(|r| r["method"] == "node.trash")
+            .count()
+    }
+    fn held_row(&self) -> Option<neutronsync::stats::HeldDeletes> {
+        neutronsync::stats::Stats::open(&self.cfg.state_dir)
+            .unwrap()
+            .held_for("test")
+            .unwrap()
+    }
+}
+
+#[test]
+fn streaming_walk_holds_a_mass_deletion_at_every_thread_count() {
+    // AC-6: 300 tracked files over ten folders, 250 of them removed locally
+    // (eight whole folders and ten files of a ninth). Whatever the thread
+    // count, the walk trashes nothing, reports one hold and keeps the rows.
+    for threads in 1..=8 {
+        let mut h = Harness::new();
+        h.cfg.scan_threads = threads;
+        for d in 0..10 {
+            let folder = format!("d{d}");
+            h.remote(&folder, "test", None);
+            for i in 0..30 {
+                h.both(&folder, &format!("d{d}f{i}.txt"), &format!("body {d} {i}"));
+            }
+        }
+        let log = Logger::silent();
+        let first = engine::run_sync_streaming(&h.cfg, &h.cfg.pairs[0], &log, None, None);
+        assert_eq!(first.errors, 0, "threads={threads}");
+        assert_eq!(
+            h.baseline().values().filter(|e| !e.is_dir).count(),
+            300,
+            "threads={threads}"
+        );
+        for d in 0..8 {
+            fs::remove_dir_all(h.cfg.pairs[0].local.join(format!("d{d}"))).unwrap();
+        }
+        for i in 0..10 {
+            fs::remove_file(h.cfg.pairs[0].local.join(format!("d8/d8f{i}.txt"))).unwrap();
+        }
+        let before = h.trashes();
+        let events = EventLog(Mutex::new(Vec::new()));
+        let second = engine::run_sync_streaming(&h.cfg, &h.cfg.pairs[0], &log, Some(&events), None);
+        assert_eq!(second.errors, 0, "threads={threads}");
+        assert_eq!(
+            h.trashes(),
+            before,
+            "threads={threads}: nothing may be trashed"
+        );
+        assert_eq!(h.trashes(), 0);
+        assert_eq!(
+            held_events(&events),
+            vec![(0, 250, 300)],
+            "threads={threads}"
+        );
+        assert_eq!(
+            h.baseline().values().filter(|e| !e.is_dir).count(),
+            300,
+            "threads={threads}: every baseline row stays"
+        );
+        let row = h.held_row().expect("held_deletes row");
+        assert_eq!((row.local, row.remote, row.tracked), (0, 250, 300));
+    }
+}
+
+#[test]
+fn shallow_batch_shares_one_allowance_across_its_folders() {
+    // AC-8: ten folders each losing 30 of 100 files; 1,000 tracked gives an
+    // allowance of 200. Reservations are all or nothing per folder, so six
+    // folders empty and the rest keep every row; nothing goes over 200.
+    let h = Harness::new();
+    for d in 0..10 {
+        let folder = format!("d{d}");
+        h.remote(&folder, "test", None);
+        for i in 0..100 {
+            h.both(&folder, &format!("d{d}f{i}.txt"), &format!("body {d} {i}"));
+        }
+    }
+    let first = h.run();
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+    assert_eq!(first.applied, 0, "{}", first.plan_summary);
+    assert_eq!(h.baseline().values().filter(|e| !e.is_dir).count(), 1_000);
+    for d in 0..10 {
+        for i in 0..30 {
+            fs::remove_file(h.cfg.pairs[0].local.join(format!("d{d}/d{d}f{i}.txt"))).unwrap();
+        }
+    }
+    let folders: Vec<String> = (0..10).map(|d| format!("d{d}")).collect();
+    let log = Logger::silent();
+    let events = EventLog(Mutex::new(Vec::new()));
+    let result =
+        engine::run_sync_shallow_many(&h.cfg, &h.cfg.pairs[0], &folders, &log, Some(&events), None);
+    assert_eq!(result.errors, 0);
+    let trashed = h.trashes();
+    assert!(trashed <= 200, "trashed {trashed}");
+    assert_eq!(
+        trashed, 180,
+        "six folders of 30 fit, the seventh is refused"
+    );
+    let base = h.baseline();
+    let mut emptied = 0;
+    for d in 0..10 {
+        let rows = base
+            .keys()
+            .filter(|k| k.starts_with(&format!("d{d}/")))
+            .count();
+        assert!(
+            rows == 100 || rows == 70,
+            "d{d}: a refused folder keeps all its rows, got {rows}"
+        );
+        if rows == 70 {
+            emptied += 1;
+        }
+    }
+    assert_eq!(emptied, 6);
+    assert_eq!(held_events(&events), vec![(0, 120, 1_000)]);
+    let row = h.held_row().expect("held_deletes row");
+    assert_eq!((row.local, row.remote, row.tracked), (0, 120, 1_000));
+}
