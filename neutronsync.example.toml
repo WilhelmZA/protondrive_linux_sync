@@ -84,6 +84,21 @@ compare = "size+mtime"
 # upload_limit_kbps = 0
 # download_limit_kbps = 0
 
+# Desktop (GUI; also set from Settings > General).
+#   notifications          - desktop notifications for files changed in two
+#                            places (at most one every five minutes), a folder
+#                            whose sync problem has lasted ten minutes, and a
+#                            Proton sign-out. A locked keyring sends nothing.
+#   theme                  - "system" follows the desktop's light or dark
+#                            preference (dark when it reports none); "light"
+#                            or "dark" fixes it.
+#   file_manager_bookmarks - keep one sidebar bookmark per synced folder in
+#                            the file manager (gtk-3.0/bookmarks). NeutronSync
+#                            only ever removes lines it added itself.
+# notifications = true
+# theme = "system"
+# file_manager_bookmarks = false
+
 # Add one [[pair]] per folder you want kept in sync. None exist by default;
 # uncomment and edit. `auto` (default true) includes the pair when "Auto sync"
 # (the watch daemon) is on; set it false to keep a pair manual-only.

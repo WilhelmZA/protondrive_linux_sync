@@ -1,9 +1,90 @@
-//! Restart and window-liveness decisions for the headless tray.
+//! Restart, window-liveness and status decisions for the headless tray.
 //!
-//! These functions do not spawn processes or read the display sockets. The
-//! supervisor and the window supply the facts and apply the decision.
+//! These functions do not spawn processes, read the display sockets or touch
+//! GTK. The supervisor, the tray tick and the window supply the facts and
+//! apply the decision.
 
 use std::path::PathBuf;
+
+use crate::datefmt::relative_time;
+use crate::service::{AppState, Phase};
+
+/// What the tray icon shows. One state at a time, in this priority order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrayState {
+    /// Signed out, or the keyring is locked: sync is waiting on the user.
+    Attention,
+    /// A folder's last sync had a problem.
+    Error,
+    /// A folder is scanning or syncing, or a run is in flight.
+    Syncing,
+    /// Nothing running, nothing wrong.
+    Idle,
+}
+
+/// The icon state for a snapshot: Attention beats Error beats Syncing beats Idle.
+pub fn tray_state(state: &AppState) -> TrayState {
+    if state.signed_out || state.account.keyring_locked {
+        return TrayState::Attention;
+    }
+    if state.pairs.iter().any(|p| p.phase == Phase::Error) {
+        return TrayState::Error;
+    }
+    if state.busy
+        || state
+            .pairs
+            .iter()
+            .any(|p| matches!(p.phase, Phase::Scanning | Phase::Syncing))
+    {
+        return TrayState::Syncing;
+    }
+    TrayState::Idle
+}
+
+/// The one-line status in the tray menu (and after "NeutronSync — " in the
+/// tooltip). `now` is epoch seconds, for the "last sync" wording.
+pub fn tray_status_text(state: &AppState, now: i64) -> String {
+    match tray_state(state) {
+        TrayState::Attention => {
+            if state.signed_out {
+                "Signed out — open NeutronSync to sign in".to_string()
+            } else {
+                "Waiting for the keyring to unlock".to_string()
+            }
+        }
+        TrayState::Error => {
+            let broken: Vec<&str> = state
+                .pairs
+                .iter()
+                .filter(|p| p.phase == Phase::Error)
+                .map(|p| p.name.as_str())
+                .collect();
+            if broken.len() == 1 {
+                format!("Problem in {}", broken[0])
+            } else {
+                format!("Problems in {} folders", broken.len())
+            }
+        }
+        TrayState::Syncing => {
+            let (done, total) = state
+                .pairs
+                .iter()
+                .filter(|p| matches!(p.phase, Phase::Scanning | Phase::Syncing))
+                .fold((0usize, 0usize), |(d, t), p| {
+                    (d + p.progress.done, t + p.progress.total)
+                });
+            if total > 0 {
+                format!("Syncing {} of {total}", done.min(total))
+            } else {
+                "Syncing…".to_string()
+            }
+        }
+        TrayState::Idle => match state.pairs.iter().filter_map(|p| p.last_synced).max() {
+            Some(ts) => format!("Up to date · last sync {}", relative_time(now, ts)),
+            None => "Up to date".to_string(),
+        },
+    }
+}
 
 /// How a tray child stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,6 +250,127 @@ pub fn x11_socket_path(display: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::{AccountState, PairState, Progress};
+
+    fn pair(name: &str, phase: Phase) -> PairState {
+        PairState {
+            name: name.into(),
+            local: format!("/home/alex/{name}"),
+            remote: format!("/my-files/{name}"),
+            phase,
+            progress: Progress::default(),
+            scanned_folders: 0,
+            current_op: None,
+            last_error: None,
+            last_synced: None,
+            tracked: 0,
+        }
+    }
+
+    fn state(pairs: Vec<PairState>) -> AppState {
+        AppState {
+            pairs,
+            account: AccountState {
+                checked: true,
+                backend_ready: true,
+                signed_in: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn idle_when_nothing_runs_and_nothing_is_wrong() {
+        let s = state(vec![
+            pair("Documents", Phase::Synced),
+            pair("Photos", Phase::Idle),
+        ]);
+        assert_eq!(tray_state(&s), TrayState::Idle);
+        assert_eq!(tray_state(&AppState::default()), TrayState::Idle);
+    }
+
+    #[test]
+    fn syncing_for_a_scanning_or_syncing_folder_or_a_busy_run() {
+        let s = state(vec![pair("Documents", Phase::Scanning)]);
+        assert_eq!(tray_state(&s), TrayState::Syncing);
+        let s = state(vec![pair("Documents", Phase::Syncing)]);
+        assert_eq!(tray_state(&s), TrayState::Syncing);
+        let mut s = state(vec![pair("Documents", Phase::Synced)]);
+        s.busy = true;
+        assert_eq!(tray_state(&s), TrayState::Syncing);
+    }
+
+    #[test]
+    fn error_beats_syncing() {
+        let s = state(vec![
+            pair("Documents", Phase::Error),
+            pair("Photos", Phase::Syncing),
+        ]);
+        assert_eq!(tray_state(&s), TrayState::Error);
+    }
+
+    #[test]
+    fn attention_for_signed_out_and_for_a_locked_keyring() {
+        let mut s = state(vec![
+            pair("Documents", Phase::Error),
+            pair("Photos", Phase::Syncing),
+        ]);
+        s.signed_out = true;
+        assert_eq!(tray_state(&s), TrayState::Attention);
+
+        let mut s = state(vec![pair("Documents", Phase::Error)]);
+        s.account.keyring_locked = true;
+        s.account.signed_in = false;
+        assert_eq!(tray_state(&s), TrayState::Attention);
+    }
+
+    #[test]
+    fn status_text_follows_the_state() {
+        let now = 1_000_000;
+        let mut s = state(vec![
+            pair("Documents", Phase::Synced),
+            pair("Photos", Phase::Synced),
+        ]);
+        assert_eq!(tray_status_text(&s, now), "Up to date");
+        s.pairs[0].last_synced = Some(now - 300);
+        s.pairs[1].last_synced = Some(now - 4000);
+        assert_eq!(
+            tray_status_text(&s, now),
+            "Up to date · last sync 5 minutes ago"
+        );
+
+        s.pairs[0].phase = Phase::Syncing;
+        s.pairs[0].progress = Progress {
+            done: 30,
+            total: 100,
+        };
+        s.pairs[1].phase = Phase::Syncing;
+        s.pairs[1].progress = Progress { done: 7, total: 20 };
+        assert_eq!(tray_status_text(&s, now), "Syncing 37 of 120");
+        s.pairs[0].phase = Phase::Scanning;
+        s.pairs[0].progress = Progress::default();
+        s.pairs[1].phase = Phase::Scanning;
+        s.pairs[1].progress = Progress::default();
+        assert_eq!(tray_status_text(&s, now), "Syncing…");
+
+        s.pairs[0].phase = Phase::Error;
+        s.pairs[1].phase = Phase::Synced;
+        assert_eq!(tray_status_text(&s, now), "Problem in Documents");
+        s.pairs[1].phase = Phase::Error;
+        assert_eq!(tray_status_text(&s, now), "Problems in 2 folders");
+
+        s.account.keyring_locked = true;
+        assert_eq!(
+            tray_status_text(&s, now),
+            "Waiting for the keyring to unlock"
+        );
+        s.signed_out = true;
+        assert_eq!(
+            tray_status_text(&s, now),
+            "Signed out — open NeutronSync to sign in"
+        );
+    }
 
     #[test]
     fn clean_exit_stops_without_restart() {

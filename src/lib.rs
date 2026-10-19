@@ -10,6 +10,7 @@
 
 pub mod auth_signal;
 pub mod backend;
+pub mod bookmarks;
 pub mod changefeed;
 pub mod config;
 pub mod datefmt;
@@ -19,6 +20,7 @@ pub mod events;
 pub mod ignore;
 pub mod logger;
 pub mod models;
+pub mod notify_policy;
 pub mod process_lock;
 pub mod remote;
 pub mod retry;
@@ -91,6 +93,15 @@ debounce = 2
 # from 256 KB/s to 10 MB/s under Settings > Network.
 # upload_limit_kbps = 0
 # download_limit_kbps = 0
+
+# Desktop (GUI). Desktop notifications for files changed in two places, a
+# folder whose sync problem does not clear, and a Proton sign-out. Window
+# colours: "system" follows the desktop's light or dark preference (dark when
+# it reports none), or fix it with "light" or "dark". One file manager sidebar
+# bookmark per synced folder; NeutronSync only ever removes lines it added.
+# notifications = true
+# theme = "system"
+# file_manager_bookmarks = false
 
 # Add one [[pair]] per folder you want kept in sync. None are created for you;
 # add them here or from the GUI. Example (uncomment and edit):

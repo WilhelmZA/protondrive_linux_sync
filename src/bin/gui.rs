@@ -21,37 +21,123 @@ use eframe::egui::{
     self, pos2, vec2, Align2, Color32, FontFamily, FontId, Rect, RichText, Sense, Stroke,
 };
 
-use neutronsync::config::{self, Config, ConflictPolicy, LocalDelete, Pair, UpdateChannel};
+use neutronsync::bookmarks;
+use neutronsync::config::{self, Config, ConflictPolicy, LocalDelete, Pair, Theme, UpdateChannel};
 use neutronsync::models::{Compare, ConflictOutcome, Entry};
+use neutronsync::notify_policy::{self, NotifyMemory};
 use neutronsync::service::{ActivityKind, ActivityOp, AppState, Controller, PairState, Phase};
 use neutronsync::stats::{ConflictRecord, HeldDeletes};
-use neutronsync::tray_policy::{self, ChildEnd, DaemonBanner, SupervisorAction};
+use neutronsync::tray_policy::{self, ChildEnd, DaemonBanner, SupervisorAction, TrayState};
 use neutronsync::updater::{self, UpdateInfo};
 
 // --- palette (reference/gui/palette/palette.md) -----------------------------
-const NAV_BG: Color32 = Color32::from_rgb(0x16, 0x15, 0x1C);
-const PANEL: Color32 = Color32::from_rgb(0x1C, 0x1B, 0x24);
-const PANEL2: Color32 = Color32::from_rgb(0x23, 0x22, 0x30);
-const SEL: Color32 = Color32::from_rgb(0x2A, 0x28, 0x33);
-const TEXT: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
-const DIM: Color32 = Color32::from_rgb(0x8E, 0x8B, 0x9A);
-const DIM2: Color32 = Color32::from_rgb(0x6C, 0x6A, 0x7A);
-const ACCENT: Color32 = Color32::from_rgb(0x6D, 0x4A, 0xFF);
-const ACCENT_HI: Color32 = Color32::from_rgb(0x7C, 0x5C, 0xFF);
-const ACCENT_LO: Color32 = Color32::from_rgb(0x5C, 0x3E, 0xDB);
-const OK: Color32 = Color32::from_rgb(0x3C, 0xBB, 0x87);
-const DANGER: Color32 = Color32::from_rgb(0xE0, 0x50, 0x64);
-const WARN: Color32 = Color32::from_rgb(0xD8, 0xA0, 0x50);
-/// Off-state switch track: visibly a control, even on a PANEL2 card.
-const TRACK_OFF: Color32 = Color32::from_rgb(0x3B, 0x39, 0x4A);
-/// Disabled filled button: muted, with a legible label.
-const BTN_OFF: Color32 = Color32::from_rgb(0x2E, 0x2C, 0x3E);
-
-fn line_col() -> Color32 {
-    Color32::from_rgba_unmultiplied(255, 255, 255, 20)
+/// The window's colours. `DARK` is the original palette, `LIGHT` its
+/// counterpart for a light desktop; `pal()` returns the active one, chosen by
+/// the Appearance setting (`config::Theme`) and the desktop's preference.
+struct Palette {
+    nav_bg: Color32,
+    panel: Color32,
+    panel2: Color32,
+    sel: Color32,
+    text: Color32,
+    dim: Color32,
+    dim2: Color32,
+    accent: Color32,
+    accent_hi: Color32,
+    accent_lo: Color32,
+    ok: Color32,
+    danger: Color32,
+    warn: Color32,
+    /// Off-state switch track: visibly a control, even on a `panel2` card.
+    track_off: Color32,
+    /// Disabled filled button: muted, with a legible label.
+    btn_off: Color32,
+    /// Switch knob when off and when on.
+    knob_off: Color32,
+    knob_on: Color32,
+    /// Text and glyphs on an accent-filled surface (primary button, avatar).
+    on_accent: Color32,
+    /// Card drop shadow.
+    shadow: Color32,
+    /// Hairlines and hover washes: a tint of this colour at these alphas.
+    wash: (u8, u8, u8),
+    line_alpha: u8,
+    hover_alpha: u8,
 }
-fn hover_col() -> Color32 {
-    Color32::from_rgba_unmultiplied(255, 255, 255, 14)
+
+impl Palette {
+    /// Hairline between surfaces.
+    fn line(&self) -> Color32 {
+        let (r, g, b) = self.wash;
+        Color32::from_rgba_unmultiplied(r, g, b, self.line_alpha)
+    }
+    /// Hover wash over a row or a ghost button.
+    fn hover(&self) -> Color32 {
+        let (r, g, b) = self.wash;
+        Color32::from_rgba_unmultiplied(r, g, b, self.hover_alpha)
+    }
+}
+
+static DARK: Palette = Palette {
+    nav_bg: Color32::from_rgb(0x16, 0x15, 0x1C),
+    panel: Color32::from_rgb(0x1C, 0x1B, 0x24),
+    panel2: Color32::from_rgb(0x23, 0x22, 0x30),
+    sel: Color32::from_rgb(0x2A, 0x28, 0x33),
+    text: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    dim: Color32::from_rgb(0x8E, 0x8B, 0x9A),
+    dim2: Color32::from_rgb(0x6C, 0x6A, 0x7A),
+    accent: Color32::from_rgb(0x6D, 0x4A, 0xFF),
+    accent_hi: Color32::from_rgb(0x7C, 0x5C, 0xFF),
+    accent_lo: Color32::from_rgb(0x5C, 0x3E, 0xDB),
+    ok: Color32::from_rgb(0x3C, 0xBB, 0x87),
+    danger: Color32::from_rgb(0xE0, 0x50, 0x64),
+    warn: Color32::from_rgb(0xD8, 0xA0, 0x50),
+    track_off: Color32::from_rgb(0x3B, 0x39, 0x4A),
+    btn_off: Color32::from_rgb(0x2E, 0x2C, 0x3E),
+    knob_off: Color32::from_rgb(0xD4, 0xD2, 0xDE),
+    knob_on: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    on_accent: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    shadow: Color32::from_black_alpha(70),
+    wash: (255, 255, 255),
+    line_alpha: 20,
+    hover_alpha: 14,
+};
+
+static LIGHT: Palette = Palette {
+    nav_bg: Color32::from_rgb(0xEC, 0xEA, 0xF3),
+    panel: Color32::from_rgb(0xF7, 0xF6, 0xFB),
+    panel2: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    sel: Color32::from_rgb(0xE2, 0xDF, 0xF0),
+    text: Color32::from_rgb(0x1C, 0x1B, 0x24),
+    dim: Color32::from_rgb(0x5E, 0x5B, 0x6E),
+    dim2: Color32::from_rgb(0x7A, 0x77, 0x89),
+    accent: Color32::from_rgb(0x6D, 0x4A, 0xFF),
+    accent_hi: Color32::from_rgb(0x5C, 0x3E, 0xDB),
+    accent_lo: Color32::from_rgb(0x4B, 0x30, 0xC4),
+    ok: Color32::from_rgb(0x2E, 0x9A, 0x6E),
+    danger: Color32::from_rgb(0xC8, 0x38, 0x4C),
+    warn: Color32::from_rgb(0xB0, 0x7A, 0x1E),
+    track_off: Color32::from_rgb(0xC9, 0xC6, 0xD6),
+    btn_off: Color32::from_rgb(0xE6, 0xE4, 0xEF),
+    knob_off: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    knob_on: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    on_accent: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    shadow: Color32::from_black_alpha(28),
+    wash: (0, 0, 0),
+    line_alpha: 26,
+    hover_alpha: 12,
+};
+
+/// True while the window paints with `LIGHT`. Flipped by `sync_theme`.
+static LIGHT_MODE: AtomicBool = AtomicBool::new(false);
+
+/// The active palette.
+fn pal() -> &'static Palette {
+    if LIGHT_MODE.load(Ordering::Relaxed) {
+        &LIGHT
+    } else {
+        &DARK
+    }
 }
 
 fn ff_bold() -> FontFamily {
@@ -118,7 +204,7 @@ fn draw_logo(painter: &egui::Painter, rect: Rect, tex: Option<&egui::TextureHand
         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
         painter.image(tex.id(), rect, uv, Color32::WHITE);
     } else {
-        painter.circle_filled(rect.center(), rect.width() * 0.5, ACCENT);
+        painter.circle_filled(rect.center(), rect.width() * 0.5, pal().accent);
     }
 }
 
@@ -144,16 +230,7 @@ fn now_secs() -> i64 {
 }
 
 fn rel_time(ts: i64) -> String {
-    let d = (now_secs() - ts).max(0);
-    match d {
-        0..=44 => "just now".into(),
-        45..=119 => "1 minute ago".into(),
-        120..=3599 => format!("{} minutes ago", d / 60),
-        3600..=7199 => "1 hour ago".into(),
-        7200..=86399 => format!("{} hours ago", d / 3600),
-        86400..=172799 => "yesterday".into(),
-        _ => format!("{} days ago", d / 86400),
-    }
+    neutronsync::datefmt::relative_time(now_secs(), ts)
 }
 
 /// "1 folder" / "2 folders".
@@ -180,7 +257,7 @@ fn thousands(n: usize) -> String {
 
 fn galley_w(ui: &egui::Ui, text: &str, font: FontId) -> f32 {
     ui.painter()
-        .layout_no_wrap(text.to_owned(), font, TEXT)
+        .layout_no_wrap(text.to_owned(), font, pal().text)
         .size()
         .x
 }
@@ -206,15 +283,15 @@ fn elide_front(ui: &egui::Ui, text: &str, font: FontId, max_w: f32) -> String {
 /// A raised surface (card / banner) with a soft drop shadow.
 fn card_frame() -> egui::Frame {
     egui::Frame::default()
-        .fill(PANEL2)
-        .stroke(Stroke::new(1.0, line_col()))
+        .fill(pal().panel2)
+        .stroke(Stroke::new(1.0, pal().line()))
         .corner_radius(10.0)
         .inner_margin(egui::Margin::same(16))
         .shadow(egui::epaint::Shadow {
             offset: [0, 4],
             blur: 16,
             spread: 0,
-            color: Color32::from_black_alpha(70),
+            color: pal().shadow,
         })
 }
 
@@ -278,22 +355,26 @@ fn button_width(
     let (bg, fg) = match kind {
         // A disabled filled button goes muted rather than translucent, so the
         // label stays readable instead of fading into the accent.
-        Btn::Primary | Btn::Secondary if !enabled => (BTN_OFF, DIM),
+        Btn::Primary | Btn::Secondary if !enabled => (pal().btn_off, pal().dim),
         Btn::Primary => {
             let base = if down {
-                ACCENT_LO
+                pal().accent_lo
             } else {
-                mix(ACCENT, ACCENT_HI, hov)
+                mix(pal().accent, pal().accent_hi, hov)
             };
-            (base, TEXT)
+            (base, pal().on_accent)
         }
         Btn::Secondary => {
-            let base = mix(SEL, mix(SEL, TEXT, 0.10), hov);
-            (if down { ACCENT_LO } else { base }, TEXT)
+            let base = mix(pal().sel, mix(pal().sel, pal().text, 0.10), hov);
+            if down {
+                (pal().accent_lo, pal().on_accent)
+            } else {
+                (base, pal().text)
+            }
         }
         Btn::Ghost => (
-            mix(Color32::TRANSPARENT, hover_col(), hov),
-            if enabled { TEXT } else { DIM2 },
+            mix(Color32::TRANSPARENT, pal().hover(), hov),
+            if enabled { pal().text } else { pal().dim2 },
         ),
         Btn::Danger => (
             mix(
@@ -301,10 +382,10 @@ fn button_width(
                 Color32::from_rgba_unmultiplied(224, 80, 100, 40),
                 hov,
             ),
-            DANGER,
+            pal().danger,
         ),
     };
-    let fg = if enabled { fg } else { DIM2 };
+    let fg = if enabled { fg } else { pal().dim2 };
     if bg.a() > 0 {
         painter.rect_filled(rect, 8.0, bg);
     }
@@ -339,15 +420,15 @@ fn switch(ui: &mut egui::Ui, on: bool) -> bool {
     let hov = ui
         .ctx()
         .animate_bool_with_time(resp.id.with("hov"), resp.hovered(), 0.12);
-    let off = mix(TRACK_OFF, mix(TRACK_OFF, TEXT, 0.08), hov);
-    let track = mix(off, mix(ACCENT, ACCENT_HI, hov), t);
+    let off = mix(pal().track_off, mix(pal().track_off, pal().text, 0.08), hov);
+    let track = mix(off, mix(pal().accent, pal().accent_hi, hov), t);
     painter.rect_filled(rect, h / 2.0, track);
     let kr = h / 2.0 - 3.0;
     let cx = rect.left() + h / 2.0 + t * (w - h);
     let knob = pos2(cx, rect.center().y);
     // soft shadow under the knob lifts it off the track
     painter.circle_filled(knob + vec2(0.0, 1.0), kr, Color32::from_black_alpha(60));
-    painter.circle_filled(knob, kr, mix(Color32::from_rgb(0xD4, 0xD2, 0xDE), TEXT, t));
+    painter.circle_filled(knob, kr, mix(pal().knob_off, pal().knob_on, t));
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -358,7 +439,7 @@ fn switch(ui: &mut egui::Ui, on: bool) -> bool {
 fn meter(ui: &mut egui::Ui, width: f32, frac: f32, col: Color32, id: egui::Id) {
     let (rect, _) = ui.allocate_exact_size(vec2(width, 6.0), Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 3.0, TRACK_OFF);
+    painter.rect_filled(rect, 3.0, pal().track_off);
     let f = ui
         .ctx()
         .animate_value_with_time(id, frac.clamp(0.0, 1.0), 0.5);
@@ -412,10 +493,265 @@ struct Toast {
 // system tray (tray-icon / GTK AppIndicator) — lives in the headless daemon
 // ============================================================================
 
-/// The app icon as a `tray_icon::Icon` (RGBA).
-fn tray_icon_image() -> Option<tray_icon::Icon> {
-    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/logo.png")).ok()?;
-    tray_icon::Icon::from_rgba(icon.rgba, icon.width, icon.height).ok()
+/// The four tray icons, built once at start from `assets/logo.png`: the plain
+/// logo for Idle, and the logo with a coloured dot for the other states.
+struct TrayIcons {
+    idle: tray_icon::Icon,
+    syncing: tray_icon::Icon,
+    attention: tray_icon::Icon,
+    error: tray_icon::Icon,
+}
+
+impl TrayIcons {
+    fn build() -> Option<Self> {
+        let logo =
+            eframe::icon_data::from_png_bytes(include_bytes!("../../assets/logo.png")).ok()?;
+        let make = |dot: Option<Color32>| {
+            let mut rgba = logo.rgba.clone();
+            if let Some(colour) = dot {
+                paint_state_dot(&mut rgba, logo.width, logo.height, colour);
+            }
+            tray_icon::Icon::from_rgba(rgba, logo.width, logo.height).ok()
+        };
+        Some(TrayIcons {
+            idle: make(None)?,
+            syncing: make(Some(DARK.accent))?,
+            attention: make(Some(DARK.warn))?,
+            error: make(Some(DARK.danger))?,
+        })
+    }
+
+    fn for_state(&self, state: TrayState) -> &tray_icon::Icon {
+        match state {
+            TrayState::Idle => &self.idle,
+            TrayState::Syncing => &self.syncing,
+            TrayState::Attention => &self.attention,
+            TrayState::Error => &self.error,
+        }
+    }
+}
+
+/// Paint a filled dot in the lower right quarter of a straight-alpha RGBA
+/// image, with a dark outline so it reads on light and dark panels.
+fn paint_state_dot(rgba: &mut [u8], width: u32, height: u32, colour: Color32) {
+    let (w, h) = (width as f32, height as f32);
+    let (cx, cy) = (w * 0.76, h * 0.76);
+    let radius = w * 0.17;
+    let outline = w * 0.045;
+    let edge = (w / 128.0).max(1.0); // anti-aliasing width in pixels
+    let dark = DARK.nav_bg;
+    for y in 0..height {
+        for x in 0..width {
+            let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+            if d > radius + outline + edge {
+                continue;
+            }
+            // Outline covers the whole disc; the fill sits on top of it.
+            let ring_cov = ((radius + outline + edge - d) / edge).clamp(0.0, 1.0);
+            let fill_cov = ((radius + edge * 0.5 - d) / edge).clamp(0.0, 1.0);
+            let i = ((y * width + x) * 4) as usize;
+            blend_over(&mut rgba[i..i + 4], dark, ring_cov);
+            blend_over(&mut rgba[i..i + 4], colour, fill_cov);
+        }
+    }
+}
+
+/// Source-over `colour` at `coverage` onto one straight-alpha RGBA pixel.
+fn blend_over(px: &mut [u8], colour: Color32, coverage: f32) {
+    if coverage <= 0.0 {
+        return;
+    }
+    let sa = coverage.clamp(0.0, 1.0);
+    let da = px[3] as f32 / 255.0;
+    let oa = sa + da * (1.0 - sa);
+    if oa <= 0.0 {
+        return;
+    }
+    let src = [colour.r() as f32, colour.g() as f32, colour.b() as f32];
+    for c in 0..3 {
+        let dst = px[c] as f32;
+        px[c] = ((src[c] * sa + dst * da * (1.0 - sa)) / oa)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+    }
+    px[3] = (oa * 255.0).round().clamp(0.0, 255.0) as u8;
+}
+
+// ---------------------------------------------------------------------------
+// desktop notifications (org.freedesktop.Notifications over the session bus)
+// ---------------------------------------------------------------------------
+
+/// Set once the first failed notification has been logged, so an unreachable
+/// bus costs one line on stderr and nothing else.
+static NOTIFY_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Decides and sends desktop notices for the process that owns sync: the
+/// tray when `run_in_tray` is on, otherwise the window. The window in tray
+/// mode never has one, so no notice is sent twice.
+struct Notifier {
+    prev: AppState,
+    mem: NotifyMemory,
+}
+
+impl Notifier {
+    fn new(snap: &AppState) -> Self {
+        Notifier {
+            prev: Self::remember(snap),
+            mem: NotifyMemory::default(),
+        }
+    }
+
+    /// The policy reads phases, errors and the account; the feeds are dropped
+    /// so the kept copy stays small.
+    fn remember(snap: &AppState) -> AppState {
+        let mut kept = snap.clone();
+        kept.activity.clear();
+        kept.active.clear();
+        kept
+    }
+
+    /// One pass: drain the settled conflicts and send what the policy says.
+    /// With notifications off the memory is cleared, so nothing old fires
+    /// when they are turned back on.
+    fn tick(&mut self, ctrl: &Controller, snap: &AppState, enabled: bool) {
+        let settled = ctrl.take_settled_conflicts();
+        if enabled {
+            for notice in
+                notify_policy::notices(&self.prev, snap, &settled, &mut self.mem, now_secs())
+            {
+                send_notification(notice.title, notice.body);
+            }
+        } else {
+            self.mem = NotifyMemory::default();
+        }
+        self.prev = Self::remember(snap);
+    }
+}
+
+/// Send one notice on a short-lived thread, so a slow notification service
+/// never holds up the tray tick or a frame. Failures are logged once.
+fn send_notification(title: String, body: String) {
+    thread::spawn(move || {
+        if let Err(e) = notify_over_dbus(&title, &body) {
+            if !NOTIFY_FAILURE_LOGGED.swap(true, Ordering::SeqCst) {
+                eprintln!(
+                    "neutronsync: desktop notifications are unavailable ({e}); sync continues without them"
+                );
+            }
+        }
+    });
+}
+
+/// `org.freedesktop.Notifications.Notify` with app name "NeutronSync" and the
+/// installed `neutronsync` icon. No actions.
+fn notify_over_dbus(title: &str, body: &str) -> Result<(), gtk::glib::Error> {
+    use gtk::gio;
+    use gtk::glib::ToVariant;
+    let conn = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)?;
+    let mut hints: std::collections::HashMap<String, gtk::glib::Variant> =
+        std::collections::HashMap::new();
+    hints.insert("desktop-entry".into(), "neutronsync-gui".to_variant());
+    let args = (
+        "NeutronSync",
+        0u32,
+        "neutronsync",
+        title,
+        body,
+        Vec::<String>::new(),
+        hints,
+        -1i32,
+    )
+        .to_variant();
+    conn.call_sync(
+        Some("org.freedesktop.Notifications"),
+        "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications",
+        "Notify",
+        Some(&args),
+        None,
+        gio::DBusCallFlags::NONE,
+        5000,
+        gio::Cancellable::NONE,
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// file manager sidebar bookmarks
+// ---------------------------------------------------------------------------
+
+/// `$XDG_CONFIG_HOME/gtk-3.0/bookmarks`, falling back to `~/.config`.
+fn bookmarks_path() -> PathBuf {
+    config::config_home().join("gtk-3.0").join("bookmarks")
+}
+
+/// Bring the sidebar bookmarks in line with the config: one line per synced
+/// folder while the option is on, none of ours when it is off. Only lines
+/// NeutronSync added (listed in `<state_dir>/bookmarks.json`) are ever
+/// removed. With the option off and nothing owned the bookmarks file is not
+/// opened at all.
+fn reconcile_bookmarks(cfg: &Config) {
+    let owned_path = cfg.state_dir.join("bookmarks.json");
+    let owned: Vec<bookmarks::Owned> = std::fs::read(&owned_path)
+        .ok()
+        .and_then(|bytes| read_owned_bookmarks(&bytes))
+        .unwrap_or_default();
+    if !cfg.file_manager_bookmarks && owned.is_empty() {
+        return;
+    }
+    let wanted: Vec<bookmarks::Entry> = if cfg.file_manager_bookmarks {
+        cfg.pairs
+            .iter()
+            .filter(|p| p.local.is_absolute())
+            .map(|p| bookmarks::Entry {
+                path: p.local.clone(),
+                label: p.name.clone(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let path = bookmarks_path();
+    let current = std::fs::read_to_string(&path).unwrap_or_default();
+    let result = bookmarks::reconcile(&current, &wanted, &owned);
+    if result.changed {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        write_atomic(&path, result.text.as_bytes());
+    }
+    if result.owned != owned {
+        let _ = std::fs::create_dir_all(&cfg.state_dir);
+        if let Ok(json) = serde_json::to_vec(&result.owned) {
+            write_atomic(&owned_path, &json);
+        }
+    }
+}
+
+/// `bookmarks.json`: a list of `{path, label}` records. The first version of
+/// the file held bare paths; those are read as records without a label,
+/// which `bookmarks::reconcile` matches only when the folder has one line.
+fn read_owned_bookmarks(bytes: &[u8]) -> Option<Vec<bookmarks::Owned>> {
+    if let Ok(records) = serde_json::from_slice::<Vec<bookmarks::Owned>>(bytes) {
+        return Some(records);
+    }
+    let paths: Vec<PathBuf> = serde_json::from_slice(bytes).ok()?;
+    Some(
+        paths
+            .into_iter()
+            .map(|path| bookmarks::Owned { path, label: None })
+            .collect(),
+    )
+}
+
+/// Write through a temp file in the same directory, then rename over.
+fn write_atomic(path: &Path, bytes: &[u8]) {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".neutronsync-tmp");
+    let tmp = PathBuf::from(tmp);
+    if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -679,18 +1015,27 @@ struct App {
     // `--screenshots <dir>`: drive the window through scripted scenes with
     // made-up data and write one PNG per scene. None in normal use.
     demo: Option<Demo>,
+
+    /// Desktop notices, decided from this window's own controller. Unused
+    /// in tray mode, where the tray process owns sync and notifies.
+    notifier: Notifier,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        install_theme(&cc.egui_ctx);
-        ensure_desktop_integration();
         let config_path = config::find_config(None).unwrap_or_else(config::default_config_path);
         let (cfg, config_loaded) = match config::load(None) {
             Ok(c) => (c, true),
             Err(_) => (starter_config(&config_path), false),
         };
+        // The desktop's preference is unknown until the first frame; a fixed
+        // choice applies before anything is painted so a light window never
+        // flashes dark.
+        LIGHT_MODE.store(cfg.theme == Theme::Light, Ordering::Relaxed);
+        install_theme(&cc.egui_ctx);
+        ensure_desktop_integration();
         let ctrl = Controller::new(cfg.clone());
+        let notifier = Notifier::new(&ctrl.snapshot());
         // With the tray on, a headless daemon owns the tray + watcher; this window
         // just ensures one exists, takes a window lock, and exits on close.
         let mode_daemon = cfg.run_in_tray;
@@ -746,6 +1091,7 @@ impl App {
             last_state_poll: -1.0,
             confirm_delete_held: None,
             demo: None,
+            notifier,
         };
         // Resume Auto sync if it was on last time — but not in daemon mode, where
         // the daemon owns the watcher (only one watcher may hold the lock).
@@ -766,6 +1112,21 @@ impl App {
         app
     }
 
+    /// Pick the palette for this frame: the Appearance setting, or the
+    /// desktop's preference when it is "system" (dark when the desktop
+    /// reports none). Repaints egui's widgets only when the palette changes.
+    fn sync_theme(&self, ctx: &egui::Context) {
+        let light = match self.cfg.theme {
+            Theme::Light => true,
+            Theme::Dark => false,
+            Theme::System => ctx.system_theme() == Some(egui::Theme::Light),
+        };
+        if LIGHT_MODE.load(Ordering::Relaxed) != light {
+            LIGHT_MODE.store(light, Ordering::Relaxed);
+            apply_visuals(ctx);
+        }
+    }
+
     fn toast(&mut self, ctx: &egui::Context, msg: impl Into<String>, err: bool) {
         self.toast = Some(Toast {
             msg: msg.into(),
@@ -776,6 +1137,9 @@ impl App {
 
     fn commit(&mut self) {
         self.ctrl.commit_config(self.cfg.clone());
+        if self.demo.is_none() {
+            reconcile_bookmarks(&self.cfg);
+        }
     }
 
     /// When the tray is on, the headless daemon owns it. This window just makes
@@ -936,15 +1300,15 @@ impl App {
                 if self.excl_loading {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label(RichText::new("Loading folders…").color(DIM));
+                        ui.label(RichText::new("Loading folders…").color(pal().dim));
                     });
                 } else if let Some(e) = self.excl_error.clone() {
-                    ui.label(RichText::new(e).size(12.0).color(WARN));
+                    ui.label(RichText::new(e).size(12.0).color(pal().warn));
                 } else if self.excl_entries.is_empty() {
                     ui.label(
                         RichText::new("This Proton folder has no subfolders to choose from.")
                             .size(12.0)
-                            .color(DIM),
+                            .color(pal().dim),
                     );
                 } else {
                     ui.label(
@@ -953,7 +1317,7 @@ impl App {
                              alone — the Proton copy is never touched.",
                         )
                         .size(12.0)
-                        .color(DIM),
+                        .color(pal().dim),
                     );
                     ui.add_space(8.0);
                     let entries = self.excl_entries.clone();
@@ -1011,10 +1375,14 @@ impl App {
                 ui.label(
                     RichText::new("These folders will no longer sync:")
                         .size(13.0)
-                        .color(TEXT),
+                        .color(pal().text),
                 );
                 for f in &folders {
-                    ui.label(RichText::new(format!("   • {f}")).size(12.0).color(DIM));
+                    ui.label(
+                        RichText::new(format!("   • {f}"))
+                            .size(12.0)
+                            .color(pal().dim),
+                    );
                 }
                 ui.add_space(8.0);
                 ui.label(
@@ -1023,7 +1391,7 @@ impl App {
                          stays untouched, and they re-download if you include them again.",
                     )
                     .size(12.0)
-                    .color(DIM),
+                    .color(pal().dim),
                 );
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
@@ -1090,7 +1458,13 @@ impl App {
     }
 }
 
+/// Fonts once, then the visuals for the active palette.
 fn install_theme(ctx: &egui::Context) {
+    install_fonts(ctx);
+    apply_visuals(ctx);
+}
+
+fn install_fonts(ctx: &egui::Context) {
     // fonts: Noto Sans as the proportional face + a bold family for headings.
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
@@ -1118,20 +1492,37 @@ fn install_theme(ctx: &egui::Context) {
     // icon code points render inline anywhere we draw text.
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     ctx.set_fonts(fonts);
+}
 
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = PANEL;
-    visuals.window_fill = PANEL;
-    visuals.window_stroke = Stroke::new(1.0, line_col());
-    visuals.extreme_bg_color = NAV_BG;
-    visuals.override_text_color = Some(TEXT);
-    visuals.selection.bg_fill = ACCENT.gamma_multiply(0.5);
-    visuals.hyperlink_color = ACCENT_HI;
-    visuals.widgets.inactive.bg_fill = PANEL2;
-    visuals.widgets.inactive.weak_bg_fill = PANEL2;
-    visuals.widgets.hovered.bg_fill = SEL;
-    visuals.widgets.hovered.weak_bg_fill = SEL;
-    visuals.widgets.active.bg_fill = SEL;
+/// Paint egui's own widgets from the active palette. Called at start and
+/// again whenever `sync_theme` switches palettes, so a change in Settings
+/// repaints at once.
+fn apply_visuals(ctx: &egui::Context) {
+    let light = LIGHT_MODE.load(Ordering::Relaxed);
+    let mut visuals = if light {
+        egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
+    };
+    visuals.panel_fill = pal().panel;
+    visuals.window_fill = pal().panel;
+    visuals.window_stroke = Stroke::new(1.0, pal().line());
+    visuals.extreme_bg_color = pal().nav_bg;
+    visuals.override_text_color = Some(pal().text);
+    visuals.selection.bg_fill = pal().accent.gamma_multiply(0.5);
+    visuals.hyperlink_color = pal().accent_hi;
+    visuals.widgets.inactive.bg_fill = pal().panel2;
+    visuals.widgets.inactive.weak_bg_fill = pal().panel2;
+    visuals.widgets.hovered.bg_fill = pal().sel;
+    visuals.widgets.hovered.weak_bg_fill = pal().sel;
+    visuals.widgets.active.bg_fill = pal().sel;
+    // Pin egui's own theme to ours, so its light/dark switch never fights
+    // the palette: the Appearance setting is the one source of truth.
+    ctx.set_theme(if light {
+        egui::ThemePreference::Light
+    } else {
+        egui::ThemePreference::Dark
+    });
     ctx.set_visuals(visuals);
 
     ctx.all_styles_mut(|style| {
@@ -1144,7 +1535,7 @@ fn heading(ui: &mut egui::Ui, text: &str) {
     ui.label(
         RichText::new(text)
             .font(FontId::new(26.0, ff_bold()))
-            .color(TEXT),
+            .color(pal().text),
     );
 }
 
@@ -1152,6 +1543,7 @@ impl eframe::App for App {
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root_ui.ctx().clone();
         let ctx = &ctx;
+        self.sync_theme(ctx);
         if self.logo_tex.is_none() {
             if let Ok(ic) =
                 eframe::icon_data::from_png_bytes(include_bytes!("../../assets/logo.png"))
@@ -1213,6 +1605,12 @@ impl eframe::App for App {
             state
         } else {
             let mine = self.ctrl.snapshot();
+            // Only the process that owns sync notifies (D1): this window when
+            // the tray is off; in tray mode the tray does it.
+            if !self.mode_daemon {
+                self.notifier
+                    .tick(&self.ctrl, &mine, self.cfg.notifications);
+            }
             // A dead tray leaves status.json behind. Ignore it and show this
             // window's own state until background sync is publishing again.
             if self.mode_daemon && self.daemon_watch.alive {
@@ -1340,7 +1738,7 @@ impl App {
     fn nav_rail(&mut self, root_ui: &mut egui::Ui, snap: &AppState) {
         let logo = self.logo_tex.clone();
         let frame = egui::Frame::default()
-            .fill(NAV_BG)
+            .fill(pal().nav_bg)
             .inner_margin(egui::Margin::same(10));
         egui::containers::Panel::left("nav")
             .exact_size(224.0)
@@ -1357,12 +1755,12 @@ impl App {
                         ui.label(
                             RichText::new("NeutronSync")
                                 .font(FontId::new(13.5, ff_bold()))
-                                .color(TEXT),
+                                .color(pal().text),
                         );
                         ui.label(
                             RichText::new("Proton Drive sync for Linux")
                                 .size(11.0)
-                                .color(DIM),
+                                .color(pal().dim),
                         );
                     });
                 });
@@ -1399,12 +1797,12 @@ impl App {
                 painter.rect_filled(
                     Rect::from_min_size(pos2(x, cur_y), vec2(w, row_h)),
                     8.0,
-                    SEL,
+                    pal().sel,
                 );
                 painter.rect_filled(
                     Rect::from_min_size(pos2(x, cur_y + 9.0), vec2(3.0, row_h - 18.0)),
                     2.0,
-                    ACCENT,
+                    pal().accent,
                 );
 
                 // labels/icons on top
@@ -1420,11 +1818,15 @@ impl App {
                         ui.painter().rect_filled(
                             rect,
                             8.0,
-                            mix(Color32::TRANSPARENT, hover_col(), hov),
+                            mix(Color32::TRANSPARENT, pal().hover(), hov),
                         );
                     }
-                    let col = if selected { TEXT } else { mix(DIM, TEXT, hov) };
-                    let icol = if selected { ACCENT } else { col };
+                    let col = if selected {
+                        pal().text
+                    } else {
+                        mix(pal().dim, pal().text, hov)
+                    };
+                    let icol = if selected { pal().accent } else { col };
                     let ir = Rect::from_center_size(
                         pos2(rect.left() + 24.0, rect.center().y),
                         vec2(18.0, 18.0),
@@ -1455,9 +1857,14 @@ impl App {
                             vec2(cw, 18.0),
                         );
                         ui.painter()
-                            .rect_filled(pill, 9.0, WARN.gamma_multiply(0.22));
-                        ui.painter()
-                            .text(pill.center(), Align2::CENTER_CENTER, count, cfont, WARN);
+                            .rect_filled(pill, 9.0, pal().warn.gamma_multiply(0.22));
+                        ui.painter().text(
+                            pill.center(),
+                            Align2::CENTER_CENTER,
+                            count,
+                            cfont,
+                            pal().warn,
+                        );
                     }
                     if resp.clicked() {
                         clicked = Some(*nav);
@@ -1471,7 +1878,7 @@ impl App {
                 egui::containers::Panel::bottom("nav_foot")
                     .frame(
                         egui::Frame::default()
-                            .fill(NAV_BG)
+                            .fill(pal().nav_bg)
                             .inner_margin(egui::Margin {
                                 left: 4,
                                 right: 4,
@@ -1484,7 +1891,7 @@ impl App {
                         ui.painter().hline(
                             ui.min_rect().x_range(),
                             ui.min_rect().top(),
-                            Stroke::new(1.0, line_col()),
+                            Stroke::new(1.0, pal().line()),
                         );
                         ui.add_space(8.0);
                         self.footer_status(ui, snap);
@@ -1499,20 +1906,20 @@ impl App {
         let last = snap.pairs.iter().filter_map(|p| p.last_synced).max();
         let any_err = snap.pairs.iter().any(|p| p.phase == Phase::Error);
         let (col, pulse, text) = if snap.busy {
-            (ACCENT, true, "Syncing…".to_string())
+            (pal().accent, true, "Syncing…".to_string())
         } else if snap.watching {
-            (ACCENT, true, "Auto sync on".to_string())
+            (pal().accent, true, "Auto sync on".to_string())
         } else if any_err {
-            (DANGER, false, "Sync error".to_string())
+            (pal().danger, false, "Sync error".to_string())
         } else if let Some(ts) = last {
-            (OK, false, format!("Synced {}", rel_time(ts)))
+            (pal().ok, false, format!("Synced {}", rel_time(ts)))
         } else {
-            (DIM, false, "Idle".to_string())
+            (pal().dim, false, "Idle".to_string())
         };
         ui.horizontal(|ui| {
             status_dot(ui, col, pulse);
             ui.add_space(2.0);
-            ui.label(RichText::new(text).size(12.5).color(TEXT));
+            ui.label(RichText::new(text).size(12.5).color(pal().text));
         });
     }
 
@@ -1528,7 +1935,7 @@ impl App {
         };
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
-                ui.label(RichText::new("Auto sync").size(12.5).color(TEXT));
+                ui.label(RichText::new("Auto sync").size(12.5).color(pal().text));
                 let sub = if on && self.mode_daemon {
                     format!(
                         "On · tray is watching {n} folder{}",
@@ -1539,7 +1946,7 @@ impl App {
                 } else {
                     "Off · sync on demand".to_string()
                 };
-                ui.label(RichText::new(sub).size(11.0).color(DIM));
+                ui.label(RichText::new(sub).size(11.0).color(pal().dim));
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if switch(ui, on) {
@@ -1635,16 +2042,16 @@ impl App {
             // blocked on it, so it takes priority over scan/sync/idle states
             // and over the background-sync banner drawn above this page.
             (
-                DANGER,
+                pal().danger,
                 Icon::Info,
                 "Signed out of Proton",
                 "Sign in on the Account tab to resume syncing".into(),
             )
         } else if suppress_phase {
-            (ACCENT, Icon::Info, "", String::new())
+            (pal().accent, Icon::Info, "", String::new())
         } else if active {
             (
-                ACCENT,
+                pal().accent,
                 Icon::Sync,
                 if never_synced {
                     "Initializing…"
@@ -1656,7 +2063,7 @@ impl App {
                 current_op_line(snap),
             )
         } else if watching {
-            (ACCENT, Icon::Cloud, "Auto sync on", {
+            (pal().accent, Icon::Cloud, "Auto sync on", {
                 let tracked: usize = snap.pairs.iter().map(|p| p.tracked).sum();
                 let folders = plural(self.auto_names().len(), "folder");
                 if tracked > 0 {
@@ -1667,13 +2074,13 @@ impl App {
             })
         } else if snap.pairs.iter().any(|p| p.phase == Phase::Error) {
             (
-                DANGER,
+                pal().danger,
                 Icon::Info,
                 "Last sync had errors",
                 "See the log below".into(),
             )
         } else {
-            (OK, Icon::Check, "Synced", last_synced_line(snap))
+            (pal().ok, Icon::Check, "Synced", last_synced_line(snap))
         };
         if !suppress_phase {
             let _ = activity_banner(ui, bcol, bicon, btitle, &bsub, busy, None);
@@ -1709,7 +2116,7 @@ impl App {
             ui.label(
                 RichText::new(format!("{} files in flight", snap.active.len()))
                     .font(FontId::new(11.0, ff_bold()))
-                    .color(ACCENT),
+                    .color(pal().accent),
             );
             ui.add_space(4.0);
         }
@@ -1746,9 +2153,9 @@ impl App {
         if has_files {
             ui.scope(|ui| {
                 ui.set_max_width((ui.available_width() - 15.0).max(200.0));
-                activity_cols(ui, "FOLDER", DIM2, "WHEN", DIM2, false, |ui| {
+                activity_cols(ui, "FOLDER", pal().dim2, "WHEN", pal().dim2, false, |ui| {
                     ui.add_space(32.0);
-                    ui.label(RichText::new("NAME").size(11.0).color(DIM2));
+                    ui.label(RichText::new("NAME").size(11.0).color(pal().dim2));
                 });
                 ui.add_space(4.0);
                 ui.separator();
@@ -1789,20 +2196,38 @@ impl App {
                         }
                         None => {
                             // a real error with no file attached
-                            activity_cols(ui, "", DIM2, &rel_time(item.ts), DIM2, false, |ui| {
-                                let (ir, _) =
-                                    ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
-                                ui.painter()
-                                    .rect_filled(ir, 6.0, DANGER.gamma_multiply(0.16));
-                                draw_icon(ui.painter(), ir.shrink(5.0), Icon::Info, DANGER);
-                                ui.add_space(8.0);
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&item.text).size(13.0).color(DANGER),
-                                    )
-                                    .truncate(),
-                                );
-                            });
+                            activity_cols(
+                                ui,
+                                "",
+                                pal().dim2,
+                                &rel_time(item.ts),
+                                pal().dim2,
+                                false,
+                                |ui| {
+                                    let (ir, _) =
+                                        ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
+                                    ui.painter().rect_filled(
+                                        ir,
+                                        6.0,
+                                        pal().danger.gamma_multiply(0.16),
+                                    );
+                                    draw_icon(
+                                        ui.painter(),
+                                        ir.shrink(5.0),
+                                        Icon::Info,
+                                        pal().danger,
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&item.text)
+                                                .size(13.0)
+                                                .color(pal().danger),
+                                        )
+                                        .truncate(),
+                                    );
+                                },
+                            );
                             ui.add_space(4.0);
                         }
                     }
@@ -1836,7 +2261,7 @@ impl App {
             }
         });
 
-        ui.label(RichText::new("Each pair keeps a local folder and a Proton Drive folder in sync, both ways. Sync one on demand, or set it to Auto to keep it live while Auto sync is on.").size(13.0).color(DIM));
+        ui.label(RichText::new("Each pair keeps a local folder and a Proton Drive folder in sync, both ways. Sync one on demand, or set it to Auto to keep it live while Auto sync is on.").size(13.0).color(pal().dim));
         ui.add_space(12.0);
 
         let mut remove: Option<usize> = None;
@@ -1864,8 +2289,8 @@ impl App {
                         ui.horizontal(|ui| {
                             let (ir, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
                             ui.painter()
-                                .rect_filled(ir, 8.0, ACCENT.gamma_multiply(0.18));
-                            draw_icon(ui.painter(), ir.shrink(7.0), Icon::Folder, ACCENT);
+                                .rect_filled(ir, 8.0, pal().accent.gamma_multiply(0.18));
+                            draw_icon(ui.painter(), ir.shrink(7.0), Icon::Folder, pal().accent);
                             ui.add_space(6.0);
                             ui.vertical(|ui| {
                                 ui.add(
@@ -1888,7 +2313,7 @@ impl App {
                                             plural(h.local + h.remote, "deletion")
                                         ))
                                         .size(12.0)
-                                        .color(WARN),
+                                        .color(pal().warn),
                                     );
                                 }
                             });
@@ -1923,7 +2348,7 @@ impl App {
                                         sync_one = Some(self.cfg.pairs[i].name.clone());
                                     }
                                     ui.add_space(4.0);
-                                    ui.label(RichText::new("Auto").size(12.0).color(DIM));
+                                    ui.label(RichText::new("Auto").size(12.0).color(pal().dim));
                                     if switch(ui, self.cfg.pairs[i].auto) {
                                         self.cfg.pairs[i].auto = !self.cfg.pairs[i].auto;
                                         changed = true;
@@ -1940,7 +2365,7 @@ impl App {
                                     ui,
                                     ui.available_width(),
                                     p.progress.fraction(),
-                                    ACCENT,
+                                    pal().accent,
                                     egui::Id::new(("pm", i)),
                                 );
                             }
@@ -1958,7 +2383,7 @@ impl App {
                             );
                             ui.add_space(2.0);
                             let (ar, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
-                            draw_icon(ui.painter(), ar, Icon::Arrow, ACCENT);
+                            draw_icon(ui.painter(), ar, Icon::Arrow, pal().accent);
                             ui.add_space(2.0);
                             chip(ui, Icon::Cloud, &self.cfg.pairs[i].remote.clone(), each);
                         });
@@ -2050,7 +2475,7 @@ impl App {
                  one was settled. Dismiss a row once you have looked at it.",
             )
             .size(13.0)
-            .color(DIM),
+            .color(pal().dim),
         );
         ui.add_space(12.0);
 
@@ -2078,20 +2503,25 @@ impl App {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
                             let (ir, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
-                            ui.painter().rect_filled(ir, 8.0, WARN.gamma_multiply(0.18));
-                            draw_icon(ui.painter(), ir.shrink(7.0), Icon::Conflict, WARN);
+                            ui.painter()
+                                .rect_filled(ir, 8.0, pal().warn.gamma_multiply(0.18));
+                            draw_icon(ui.painter(), ir.shrink(7.0), Icon::Conflict, pal().warn);
                             ui.add_space(6.0);
                             ui.vertical(|ui| {
                                 ui.add(
                                     egui::Label::new(
                                         RichText::new(&c.path)
                                             .font(FontId::new(14.0, ff_bold()))
-                                            .color(TEXT),
+                                            .color(pal().text),
                                     )
                                     .truncate(),
                                 )
                                 .on_hover_text(&c.path);
-                                ui.label(RichText::new(conflict_sentence(c)).size(12.5).color(DIM));
+                                ui.label(
+                                    RichText::new(conflict_sentence(c))
+                                        .size(12.5)
+                                        .color(pal().dim),
+                                );
                             });
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -2101,9 +2531,9 @@ impl App {
                                     } else {
                                         rel_time(c.last_ts)
                                     };
-                                    ui.label(RichText::new(when).size(11.5).color(DIM2));
+                                    ui.label(RichText::new(when).size(11.5).color(pal().dim2));
                                     ui.add_space(10.0);
-                                    ui.label(RichText::new(&c.pair).size(12.0).color(ACCENT));
+                                    ui.label(RichText::new(&c.pair).size(12.0).color(pal().accent));
                                 },
                             );
                         });
@@ -2196,10 +2626,10 @@ impl App {
                 ui.label(
                     RichText::new(format!("Delete {} from {name}?", plural(total, "file")))
                         .font(FontId::new(15.0, ff_bold()))
-                        .color(TEXT),
+                        .color(pal().text),
                 );
                 ui.add_space(4.0);
-                ui.label(RichText::new(body).size(12.5).color(DIM));
+                ui.label(RichText::new(body).size(12.5).color(pal().dim));
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2276,6 +2706,36 @@ impl App {
                         |ui| switch(ui, auto),
                     ) {
                         set_autostart(!auto, &self.cfg);
+                    }
+                    let notify = self.cfg.notifications;
+                    if setting_row(
+                        ui,
+                        "Show desktop notifications",
+                        "Files changed in two places, a sync problem that does not clear, \
+                         and a Proton sign-out.",
+                        |ui| switch(ui, notify),
+                    ) {
+                        self.cfg.notifications = !notify;
+                        self.dirty = true;
+                    }
+                    if setting_row(
+                        ui,
+                        "Appearance",
+                        "Follow the desktop's light or dark preference, or fix one.",
+                        |ui| combo_theme(ui, &mut self.cfg.theme),
+                    ) {
+                        self.dirty = true;
+                    }
+                    let marks = self.cfg.file_manager_bookmarks;
+                    if setting_row(
+                        ui,
+                        "Show synced folders in the file manager sidebar",
+                        "One bookmark per folder. Only bookmarks NeutronSync added are \
+                         ever removed; your own stay as they are.",
+                        |ui| switch(ui, marks),
+                    ) {
+                        self.cfg.file_manager_bookmarks = !marks;
+                        self.dirty = true;
                     }
                 });
 
@@ -2375,7 +2835,7 @@ impl App {
                         ui.label(
                             RichText::new("Proton Drive SDK (neutronsync-drive)")
                                 .size(12.5)
-                                .color(DIM),
+                                .color(pal().dim),
                         );
                         false
                     }) {
@@ -2421,15 +2881,15 @@ impl App {
         self.page_header(ui, "Account", |_ui, _app| {});
         let acc = &snap.account;
         let (col, label) = if !acc.checked || acc.checking {
-            (DIM, "Checking…")
+            (pal().dim, "Checking…")
         } else if acc.signed_in {
-            (OK, "Signed in")
+            (pal().ok, "Signed in")
         } else if acc.keyring_locked {
-            (WARN, "Keyring locked")
+            (pal().warn, "Keyring locked")
         } else if acc.backend_ready {
-            (DANGER, "Not signed in")
+            (pal().danger, "Not signed in")
         } else {
-            (WARN, "Sign-in service unavailable")
+            (pal().warn, "Sign-in service unavailable")
         };
         let checking = acc.checking;
         let name = if acc.account.is_empty() {
@@ -2455,17 +2915,17 @@ impl App {
                         .unwrap_or_default();
                     let p = ui.painter();
                     if acc.signed_in {
-                        p.circle_filled(ar.center(), 24.0, ACCENT);
+                        p.circle_filled(ar.center(), 24.0, pal().accent);
                         p.text(
                             ar.center(),
                             Align2::CENTER_CENTER,
                             initial,
                             FontId::new(20.0, ff_bold()),
-                            TEXT,
+                            pal().on_accent,
                         );
                     } else {
-                        p.circle_filled(ar.center(), 24.0, SEL);
-                        draw_icon(p, ar.shrink(13.0), Icon::User, DIM);
+                        p.circle_filled(ar.center(), 24.0, pal().sel);
+                        draw_icon(p, ar.shrink(13.0), Icon::User, pal().dim);
                     }
                     ui.add_space(12.0);
                     ui.vertical(|ui| {
@@ -2473,15 +2933,15 @@ impl App {
                         ui.label(
                             RichText::new(&name)
                                 .font(FontId::new(16.0, ff_bold()))
-                                .color(if acc.signed_in { TEXT } else { DIM }),
+                                .color(if acc.signed_in { pal().text } else { pal().dim }),
                         );
                         ui.add_space(3.0);
                         ui.horizontal(|ui| {
                             status_dot_small(ui, col);
-                            ui.label(RichText::new(label).size(12.5).color(DIM));
+                            ui.label(RichText::new(label).size(12.5).color(pal().dim));
                             if checking {
                                 ui.add_space(2.0);
-                                ui.add(egui::Spinner::new().size(12.0).color(DIM));
+                                ui.add(egui::Spinner::new().size(12.0).color(pal().dim));
                             }
                         });
                     });
@@ -2505,19 +2965,19 @@ impl App {
                     ui.add_space(12.0);
                     let (kcol, kicon, ktext) = if acc.keyring_locked {
                         (
-                            WARN,
+                            pal().warn,
                             Icon::Info,
                             "Session saved in the system keyring, which is locked",
                         )
                     } else {
-                        (OK, Icon::Check, "Session saved in the system keyring")
+                        (pal().ok, Icon::Check, "Session saved in the system keyring")
                     };
                     ui.horizontal(|ui| {
                         let (ir, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
                         ui.painter().rect_filled(ir, 6.0, kcol.gamma_multiply(0.16));
                         draw_icon(ui.painter(), ir.shrink(5.0), kicon, kcol);
                         ui.add_space(8.0);
-                        ui.label(RichText::new(ktext).size(13.0).color(TEXT));
+                        ui.label(RichText::new(ktext).size(13.0).color(pal().text));
                     });
                     ui.add_space(4.0);
                     ui.label(
@@ -2526,14 +2986,14 @@ impl App {
                              session from this computer; your files stay in Proton Drive.",
                         )
                         .size(12.0)
-                        .color(DIM),
+                        .color(pal().dim),
                     );
                     if !acc.version.is_empty() {
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("Helper").size(12.0).color(DIM2));
+                            ui.label(RichText::new("Helper").size(12.0).color(pal().dim2));
                             ui.add_space(6.0);
-                            ui.label(RichText::new(&acc.version).size(12.0).color(DIM));
+                            ui.label(RichText::new(&acc.version).size(12.0).color(pal().dim));
                         });
                     }
                 }
@@ -2556,7 +3016,7 @@ impl App {
                      NeutronSync will continue on its own.",
                 )
                 .size(12.5)
-                .color(DIM),
+                .color(pal().dim),
             );
         } else if acc.backend_ready && !acc.signed_in {
             ui.add_space(20.0);
@@ -2569,7 +3029,7 @@ impl App {
         ui.label(
             RichText::new(format!("NeutronSync {}", env!("CARGO_PKG_VERSION")))
                 .font(FontId::new(16.0, ff_bold()))
-                .color(TEXT),
+                .color(pal().text),
         );
         // The commit this binary was built from, selectable so a bug report
         // can carry it. Never part of the version comparison.
@@ -2577,32 +3037,32 @@ impl App {
             egui::Label::new(
                 RichText::new(format!("Build {}", env!("NEUTRONSYNC_BUILD_SHA")))
                     .size(12.0)
-                    .color(DIM),
+                    .color(pal().dim),
             )
             .selectable(true),
         );
         ui.add_space(6.0);
         ui.label(
             RichText::new("Bidirectional Proton Drive folder sync through the Proton Drive SDK.")
-                .color(DIM),
+                .color(pal().dim),
         );
         ui.add_space(12.0);
         ui.label(
             RichText::new(format!("Config   {}", self.config_path.display()))
                 .size(12.0)
-                .color(DIM2),
+                .color(pal().dim2),
         );
         ui.label(
             RichText::new(format!("State    {}", self.cfg.state_dir.display()))
                 .size(12.0)
-                .color(DIM2),
+                .color(pal().dim2),
         );
         if !self.config_loaded {
             ui.add_space(6.0);
             ui.label(
                 RichText::new("Config not yet saved — add folders and Save.")
                     .size(12.0)
-                    .color(WARN),
+                    .color(pal().warn),
             );
         }
 
@@ -2610,7 +3070,7 @@ impl App {
         ui.label(
             RichText::new("HOW IT WORKS")
                 .font(FontId::new(11.0, ff_bold()))
-                .color(ACCENT),
+                .color(pal().accent),
         );
         ui.add_space(8.0);
         ui.label(
@@ -2622,7 +3082,7 @@ impl App {
                  encryption and decryption, on this computer.",
             )
             .size(12.5)
-            .color(DIM),
+            .color(pal().dim),
         );
         ui.add_space(6.0);
         ui.label(
@@ -2631,14 +3091,14 @@ impl App {
                  \"Proton Drive\" are trademarks of Proton AG.",
             )
             .size(11.5)
-            .color(DIM2),
+            .color(pal().dim2),
         );
 
         ui.add_space(16.0);
         ui.label(
             RichText::new("DETECTING CHANGES")
                 .font(FontId::new(11.0, ff_bold()))
-                .color(ACCENT),
+                .color(pal().accent),
         );
         ui.add_space(8.0);
         ui.label(
@@ -2649,14 +3109,14 @@ impl App {
                  sync, when Proton asks for a refresh, and once a day as a safety net.",
             )
             .size(12.5)
-            .color(DIM),
+            .color(pal().dim),
         );
 
         ui.add_space(20.0);
         ui.label(
             RichText::new("UPDATES")
                 .font(FontId::new(11.0, ff_bold()))
-                .color(ACCENT),
+                .color(pal().accent),
         );
         ui.add_space(8.0);
         let channel = self.cfg.update_channel;
@@ -2680,11 +3140,11 @@ impl App {
                     ui.label(
                         RichText::new(format!("You're on {}.", updater::current_version()))
                             .size(12.0)
-                            .color(DIM),
+                            .color(pal().dim),
                     );
                 }
                 UpdateState::Checking => {
-                    ui.label(RichText::new("Checking…").size(12.0).color(DIM));
+                    ui.label(RichText::new("Checking…").size(12.0).color(pal().dim));
                 }
                 UpdateState::Done(Ok(info)) if info.newer => {
                     ui.label(
@@ -2693,21 +3153,21 @@ impl App {
                             info.latest, info.current
                         ))
                         .size(12.0)
-                        .color(ACCENT),
+                        .color(pal().accent),
                     );
                 }
                 UpdateState::Done(Ok(info)) => {
                     ui.label(
                         RichText::new(format!("Up to date ({}).", info.current))
                             .size(12.0)
-                            .color(DIM),
+                            .color(pal().dim),
                     );
                 }
                 UpdateState::Done(Err(e)) => {
                     ui.label(
                         RichText::new(format!("Couldn't check: {e}"))
                             .size(12.0)
-                            .color(WARN),
+                            .color(pal().warn),
                     );
                 }
                 UpdateState::Downloading { done, total } => {
@@ -2721,38 +3181,38 @@ impl App {
                     } else {
                         format!("Downloading… {}", human_bytes(*done))
                     };
-                    ui.label(RichText::new(text).size(12.0).color(ACCENT));
+                    ui.label(RichText::new(text).size(12.0).color(pal().accent));
                 }
                 UpdateState::Verifying => {
                     ui.label(
                         RichText::new("Verifying checksum…")
                             .size(12.0)
-                            .color(ACCENT),
+                            .color(pal().accent),
                     );
                 }
                 UpdateState::Installing => {
                     ui.label(
                         RichText::new("Installing… (confirm the password prompt)")
                             .size(12.0)
-                            .color(ACCENT),
+                            .color(pal().accent),
                     );
                 }
                 UpdateState::Installed { version } => {
                     ui.label(
                         RichText::new(format!("{version} installed. Restart to finish."))
                             .size(12.0)
-                            .color(ACCENT),
+                            .color(pal().accent),
                     );
                 }
                 UpdateState::Downloaded { path } => {
                     ui.label(
                         RichText::new(format!("Downloaded to {}", path.display()))
                             .size(12.0)
-                            .color(DIM),
+                            .color(pal().dim),
                     );
                 }
                 UpdateState::Failed(e) => {
-                    ui.label(RichText::new(e.clone()).size(12.0).color(WARN));
+                    ui.label(RichText::new(e.clone()).size(12.0).color(pal().warn));
                 }
             }
         });
@@ -2774,7 +3234,7 @@ impl App {
                     ui.label(
                         RichText::new("WHAT'S NEW")
                             .font(FontId::new(11.0, ff_bold()))
-                            .color(ACCENT),
+                            .color(pal().accent),
                     );
                     ui.add_space(6.0);
                     egui::ScrollArea::vertical()
@@ -2863,7 +3323,7 @@ impl App {
                  installed without you choosing to. {how}"
             ))
             .size(11.5)
-            .color(DIM2),
+            .color(pal().dim2),
         );
     }
 
@@ -2899,7 +3359,7 @@ impl App {
                     ui.label(
                         RichText::new(title)
                             .font(FontId::new(24.0, ff_bold()))
-                            .color(TEXT),
+                            .color(pal().text),
                     );
                     ui.add_space(10.0);
                     if locked {
@@ -2911,7 +3371,7 @@ impl App {
                                  sign in to Proton again.",
                             )
                             .size(13.5)
-                            .color(TEXT),
+                            .color(pal().text),
                         );
                     } else if ready {
                         ui.label(
@@ -2920,7 +3380,7 @@ impl App {
                                  session in the system keyring.",
                             )
                             .size(13.5)
-                            .color(TEXT),
+                            .color(pal().text),
                         );
                     }
                 });
@@ -2929,7 +3389,7 @@ impl App {
                     ui.vertical_centered(|ui| {
                         ui.spinner();
                         ui.add_space(8.0);
-                        ui.label(RichText::new("Waiting for the keyring…").color(DIM));
+                        ui.label(RichText::new("Waiting for the keyring…").color(pal().dim));
                     });
                 } else if ready {
                     ui.add_space(20.0);
@@ -2943,12 +3403,12 @@ impl App {
                         } else {
                             snap.account.version.as_str()
                         };
-                        ui.label(RichText::new(err).size(12.5).color(DANGER));
+                        ui.label(RichText::new(err).size(12.5).color(pal().danger));
                         ui.add_space(10.0);
                         ui.label(
                             RichText::new("Reinstall NeutronSync, or set [cli] sidecar.")
                                 .size(12.5)
-                                .color(DIM),
+                                .color(pal().dim),
                         );
                     });
                     ui.add_space(22.0);
@@ -3017,7 +3477,7 @@ impl App {
                     ui.label(
                         RichText::new("Complete human verification, then retry sign-in.")
                             .size(12.5)
-                            .color(TEXT),
+                            .color(pal().text),
                     );
                     ui.add_space(10.0);
                     if let Some(url) = form.step["url"]
@@ -3048,7 +3508,7 @@ impl App {
                             "Mailbox password"
                         })
                         .size(12.5)
-                        .color(DIM),
+                        .color(pal().dim),
                     );
                     ui.add_space(4.0);
                     ui.add(
@@ -3058,7 +3518,7 @@ impl App {
                             .margin(pad),
                     );
                 } else {
-                    ui.label(RichText::new("Username").size(12.5).color(DIM));
+                    ui.label(RichText::new("Username").size(12.5).color(pal().dim));
                     ui.add_space(4.0);
                     ui.add(
                         egui::TextEdit::singleline(&mut form.username)
@@ -3066,7 +3526,7 @@ impl App {
                             .margin(pad),
                     );
                     ui.add_space(10.0);
-                    ui.label(RichText::new("Password").size(12.5).color(DIM));
+                    ui.label(RichText::new("Password").size(12.5).color(pal().dim));
                     ui.add_space(4.0);
                     ui.add(
                         egui::TextEdit::singleline(&mut form.password)
@@ -3077,7 +3537,7 @@ impl App {
                 }
                 if let Some(error) = &form.error {
                     ui.add_space(10.0);
-                    ui.label(RichText::new(error).size(12.5).color(DANGER));
+                    ui.label(RichText::new(error).size(12.5).color(pal().danger));
                 }
                 ui.add_space(14.0);
                 let label = if hv { "Retry sign-in" } else { "Sign in" };
@@ -3162,13 +3622,13 @@ impl App {
                 ui.label(
                     RichText::new("Log out of Proton Drive?")
                         .font(FontId::new(15.0, ff_bold()))
-                        .color(TEXT),
+                        .color(pal().text),
                 );
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new("You'll need to sign in again before the next sync.")
                         .size(12.5)
-                        .color(DIM),
+                        .color(pal().dim),
                 );
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
@@ -3207,7 +3667,7 @@ impl App {
                 ui.label(
                     RichText::new("Reset NeutronSync?")
                         .font(FontId::new(15.0, ff_bold()))
-                        .color(TEXT),
+                        .color(pal().text),
                 );
                 ui.add_space(4.0);
                 ui.label(
@@ -3216,7 +3676,7 @@ impl App {
                          Your actual files are left untouched.",
                     )
                     .size(12.5)
-                    .color(DIM),
+                    .color(pal().dim),
                 );
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
@@ -3245,11 +3705,13 @@ impl App {
 
 fn daemon_banner(ui: &mut egui::Ui, kind: DaemonBanner) -> bool {
     let (col, title, action) = match kind {
-        DaemonBanner::Restarting => (DANGER, "Background sync stopped. Restarting…", None),
-        DaemonBanner::NotResponding => (WARN, "Background sync is not responding", None),
-        DaemonBanner::CouldNotStart => {
-            (DANGER, "Background sync could not start", Some("Try again"))
-        }
+        DaemonBanner::Restarting => (pal().danger, "Background sync stopped. Restarting…", None),
+        DaemonBanner::NotResponding => (pal().warn, "Background sync is not responding", None),
+        DaemonBanner::CouldNotStart => (
+            pal().danger,
+            "Background sync could not start",
+            Some("Try again"),
+        ),
     };
     activity_banner(ui, col, Icon::Info, title, "", false, action)
 }
@@ -3302,11 +3764,11 @@ fn activity_banner(
                     ui.label(
                         RichText::new(title)
                             .font(FontId::new(15.0, ff_bold()))
-                            .color(TEXT),
+                            .color(pal().text),
                     );
                     if !sub.is_empty() {
                         ui.add_space(1.0);
-                        ui.label(RichText::new(sub).size(12.0).color(DIM));
+                        ui.label(RichText::new(sub).size(12.0).color(pal().dim));
                     }
                 });
                 if let Some(label) = action {
@@ -3355,7 +3817,7 @@ fn held_banner(ui: &mut egui::Ui, hold: &HeldDeletes, enabled: bool) -> HeldActi
         held_where(hold)
     );
     let mut action = HeldAction::None;
-    let col = WARN;
+    let col = pal().warn;
     let frame = egui::Frame::default()
         .fill(col.gamma_multiply(0.11))
         .stroke(Stroke::new(1.0, col.gamma_multiply(0.34)))
@@ -3383,11 +3845,12 @@ fn held_banner(ui: &mut egui::Ui, hold: &HeldDeletes, enabled: bool) -> HeldActi
                             hold.pair
                         ))
                         .font(FontId::new(15.0, ff_bold()))
-                        .color(TEXT),
+                        .color(pal().text),
                     );
                     ui.add_space(1.0);
                     ui.add(
-                        egui::Label::new(RichText::new(sub.trim()).size(12.0).color(DIM)).wrap(),
+                        egui::Label::new(RichText::new(sub.trim()).size(12.0).color(pal().dim))
+                            .wrap(),
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3540,7 +4003,7 @@ fn release_notes(ui: &mut egui::Ui, notes: &str) {
             ui.label(
                 RichText::new(version.trim())
                     .font(FontId::new(14.0, ff_bold()))
-                    .color(TEXT),
+                    .color(pal().text),
             );
             ui.add_space(2.0);
         } else if let Some(section) = line.strip_prefix("### ") {
@@ -3548,19 +4011,23 @@ fn release_notes(ui: &mut egui::Ui, notes: &str) {
             ui.label(
                 RichText::new(section.trim().to_uppercase())
                     .font(FontId::new(10.5, ff_bold()))
-                    .color(DIM),
+                    .color(pal().dim),
             );
         } else if let Some(item) = line.trim_start().strip_prefix("- ") {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                ui.label(RichText::new("•").size(12.5).color(ACCENT));
-                ui.label(RichText::new(plain_markdown(item)).size(12.5).color(TEXT));
+                ui.label(RichText::new("•").size(12.5).color(pal().accent));
+                ui.label(
+                    RichText::new(plain_markdown(item))
+                        .size(12.5)
+                        .color(pal().text),
+                );
             });
         } else {
             ui.label(
                 RichText::new(plain_markdown(line.trim()))
                     .size(12.5)
-                    .color(DIM),
+                    .color(pal().dim),
             );
         }
         first = false;
@@ -3771,14 +4238,17 @@ fn active_row(ui: &mut egui::Ui, op: &ActivityOp) {
         "Syncing"
     };
     let name = op.path.rsplit('/').next().unwrap_or(&op.path).to_owned();
-    activity_cols(ui, &op.pair, DIM, "now", ACCENT, false, |ui| {
-        ui.add_sized([24.0, 24.0], egui::Spinner::new().size(16.0).color(ACCENT));
+    activity_cols(ui, &op.pair, pal().dim, "now", pal().accent, false, |ui| {
+        ui.add_sized(
+            [24.0, 24.0],
+            egui::Spinner::new().size(16.0).color(pal().accent),
+        );
         ui.add_space(8.0);
         ui.add(
             egui::Label::new(
                 RichText::new(format!("{verb} {name}"))
                     .size(13.0)
-                    .color(TEXT),
+                    .color(pal().text),
             )
             .truncate(),
         );
@@ -3807,43 +4277,53 @@ fn op_error_text(op: &ActivityOp, line: &str) -> Option<String> {
 fn activity_row(ui: &mut egui::Ui, op: &ActivityOp, ts: i64, line: &str) -> Option<Open> {
     let a = op.action.to_lowercase();
     let (icon, base) = if a.contains("rename") || a.contains("move") {
-        (Icon::Arrow, ACCENT)
+        (Icon::Arrow, pal().accent)
     } else if a.contains("upload") {
-        (Icon::Upload, ACCENT)
+        (Icon::Upload, pal().accent)
     } else if a.contains("download") {
-        (Icon::Download, ACCENT)
+        (Icon::Download, pal().accent)
     } else if a.contains("delete") || a.contains("trash") {
-        (Icon::Trash, WARN)
+        (Icon::Trash, pal().warn)
     } else {
-        (Icon::Check, OK)
+        (Icon::Check, pal().ok)
     };
-    let col = if op.ok { base } else { DANGER };
+    let col = if op.ok { base } else { pal().danger };
     let name = op.path.rsplit('/').next().unwrap_or(&op.path).to_owned();
     let mut name_clicked = false;
-    let folder_clicked = activity_cols(ui, &op.pair, DIM, &rel_time(ts), DIM2, true, |ui| {
-        let (ir, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
-        ui.painter().rect_filled(ir, 6.0, col.gamma_multiply(0.16));
-        draw_icon(ui.painter(), ir.shrink(5.0), icon, col);
-        ui.add_space(8.0);
-        let r = ui.add(
-            egui::Label::new(RichText::new(name).size(13.0).color(TEXT))
-                .truncate()
-                .sense(Sense::click()),
-        );
-        let r = r.on_hover_text(&op.path);
-        if r.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        name_clicked = r.clicked();
-        // A failed row says why on the row itself: the reason used to live only
-        // in sync.log, so the feed showed a red filename and nothing else.
-        if let Some(err) = op_error_text(op, line) {
-            ui.add_space(6.0);
-            let tip = err.clone();
-            ui.add(egui::Label::new(RichText::new(err).size(11.5).color(DANGER)).truncate())
+    let folder_clicked = activity_cols(
+        ui,
+        &op.pair,
+        pal().dim,
+        &rel_time(ts),
+        pal().dim2,
+        true,
+        |ui| {
+            let (ir, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
+            ui.painter().rect_filled(ir, 6.0, col.gamma_multiply(0.16));
+            draw_icon(ui.painter(), ir.shrink(5.0), icon, col);
+            ui.add_space(8.0);
+            let r = ui.add(
+                egui::Label::new(RichText::new(name).size(13.0).color(pal().text))
+                    .truncate()
+                    .sense(Sense::click()),
+            );
+            let r = r.on_hover_text(&op.path);
+            if r.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            name_clicked = r.clicked();
+            // A failed row says why on the row itself: the reason used to live only
+            // in sync.log, so the feed showed a red filename and nothing else.
+            if let Some(err) = op_error_text(op, line) {
+                ui.add_space(6.0);
+                let tip = err.clone();
+                ui.add(
+                    egui::Label::new(RichText::new(err).size(11.5).color(pal().danger)).truncate(),
+                )
                 .on_hover_text(tip);
-        }
-    });
+            }
+        },
+    );
     ui.add_space(4.0);
     if name_clicked {
         Some(Open::File)
@@ -3858,7 +4338,7 @@ fn pair_status(ui: &mut egui::Ui, ps: Option<&PairState>, watching: bool) {
     let first_run = ps.is_some_and(|p| p.last_synced.is_none());
     let (col, mut text) = match ps.map(|p| p.phase) {
         Some(Phase::Scanning) => (
-            ACCENT,
+            pal().accent,
             if first_run {
                 "Initializing…"
             } else {
@@ -3867,7 +4347,7 @@ fn pair_status(ui: &mut egui::Ui, ps: Option<&PairState>, watching: bool) {
             .to_string(),
         ),
         Some(Phase::Syncing) => (
-            ACCENT,
+            pal().accent,
             match ps.map(|p| p.progress) {
                 Some(pr) if pr.total > 0 && !first_run => {
                     format!(
@@ -3881,17 +4361,17 @@ fn pair_status(ui: &mut egui::Ui, ps: Option<&PairState>, watching: bool) {
             },
         ),
         Some(Phase::Error) => (
-            DANGER,
+            pal().danger,
             ps.and_then(|p| p.last_error.clone())
                 .unwrap_or_else(|| "Error".into()),
         ),
         Some(Phase::Synced) | Some(Phase::Idle) | None => {
             if watching {
-                (ACCENT, "Auto · watching".to_string())
+                (pal().accent, "Auto · watching".to_string())
             } else {
                 match ps.and_then(|p| p.last_synced) {
-                    Some(ts) => (OK, format!("Synced · {}", rel_time(ts))),
-                    None => (DIM, "Not synced yet".to_string()),
+                    Some(ts) => (pal().ok, format!("Synced · {}", rel_time(ts))),
+                    None => (pal().dim, "Not synced yet".to_string()),
                 }
             }
         }
@@ -3904,7 +4384,7 @@ fn pair_status(ui: &mut egui::Ui, ps: Option<&PairState>, watching: bool) {
     }
     ui.horizontal(|ui| {
         status_dot_small(ui, col);
-        ui.label(RichText::new(text).size(12.0).color(DIM));
+        ui.label(RichText::new(text).size(12.0).color(pal().dim));
     });
 }
 
@@ -3924,18 +4404,18 @@ fn chip(ui: &mut egui::Ui, icon: Icon, text: &str, max_w: f32) {
     let w = pad * 2.0 + icon_w + gap + tw;
     let (rect, resp) = ui.allocate_exact_size(vec2(w, 28.0), Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 7.0, NAV_BG);
+    painter.rect_filled(rect, 7.0, pal().nav_bg);
     let ir = Rect::from_center_size(
         pos2(rect.left() + pad + icon_w / 2.0, rect.center().y),
         vec2(icon_w, icon_w),
     );
-    draw_icon(painter, ir, icon, DIM);
+    draw_icon(painter, ir, icon, pal().dim);
     painter.text(
         pos2(rect.left() + pad + icon_w + gap, rect.center().y),
         Align2::LEFT_CENTER,
         &shown,
         font,
-        TEXT,
+        pal().text,
     );
     // full path on hover, since we elide
     if shown != text {
@@ -3947,14 +4427,14 @@ fn empty_state(ui: &mut egui::Ui, title: &str, sub: &str) {
     ui.add_space(40.0);
     ui.vertical_centered(|ui| {
         let (ir, _) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
-        draw_icon(ui.painter(), ir, Icon::Cloud, DIM2);
+        draw_icon(ui.painter(), ir, Icon::Cloud, pal().dim2);
         ui.add_space(10.0);
         ui.label(
             RichText::new(title)
                 .font(FontId::new(15.0, ff_bold()))
-                .color(DIM),
+                .color(pal().dim),
         );
-        ui.label(RichText::new(sub).size(12.5).color(DIM2));
+        ui.label(RichText::new(sub).size(12.5).color(pal().dim2));
     });
 }
 
@@ -3977,8 +4457,8 @@ impl App {
             .show(ctx, |ui| {
                 ui.multiply_opacity(alpha);
                 let frame = egui::Frame::default()
-                    .fill(SEL)
-                    .stroke(Stroke::new(1.0, line_col()))
+                    .fill(pal().sel)
+                    .stroke(Stroke::new(1.0, pal().line()))
                     .corner_radius(10.0)
                     .inner_margin(egui::Margin {
                         left: 14,
@@ -3988,8 +4468,8 @@ impl App {
                     });
                 frame.show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        status_dot_small(ui, if err { DANGER } else { OK });
-                        ui.label(RichText::new(msg).size(13.0).color(TEXT));
+                        status_dot_small(ui, if err { pal().danger } else { pal().ok });
+                        ui.label(RichText::new(msg).size(13.0).color(pal().text));
                     });
                 });
             });
@@ -4027,18 +4507,18 @@ impl App {
                     self.load_browser();
                 }
             }
-            ui.label(RichText::new(&self.browser_path).color(DIM));
+            ui.label(RichText::new(&self.browser_path).color(pal().dim));
         });
         ui.separator();
         if self.browser_loading {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(RichText::new("Loading…").color(DIM));
+                ui.label(RichText::new("Loading…").color(pal().dim));
             });
             return;
         }
         if let Some(err) = self.browser_error.clone() {
-            ui.label(RichText::new(err).color(DANGER));
+            ui.label(RichText::new(err).color(pal().danger));
             return;
         }
         let mut open_into: Option<String> = None;
@@ -4047,14 +4527,14 @@ impl App {
             .max_height(300.0)
             .show(ui, |ui| {
                 if self.browser_entries.is_empty() {
-                    ui.label(RichText::new("(no sub-folders here)").color(DIM));
+                    ui.label(RichText::new("(no sub-folders here)").color(pal().dim));
                 }
                 for e in &self.browser_entries {
                     let full = config::remote_join(&self.browser_path, &e.path);
                     ui.horizontal(|ui| {
                         let (ir, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                        draw_icon(ui.painter(), ir, Icon::Folder, ACCENT);
-                        if ui.link(RichText::new(&e.path).color(TEXT)).clicked() {
+                        draw_icon(ui.painter(), ir, Icon::Folder, pal().accent);
+                        if ui.link(RichText::new(&e.path).color(pal().text)).clicked() {
                             open_into = Some(full.clone());
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4083,7 +4563,7 @@ impl App {
             ui.label(
                 RichText::new("(pick a local folder next)")
                     .size(11.5)
-                    .color(DIM2),
+                    .color(pal().dim2),
             );
         });
         if let Some(p) = open_into {
@@ -4104,7 +4584,7 @@ fn settings_group(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::U
     ui.label(
         RichText::new(title)
             .font(FontId::new(11.0, ff_bold()))
-            .color(ACCENT),
+            .color(pal().accent),
     );
     ui.add_space(6.0);
     card_frame().show(ui, |ui| {
@@ -4125,9 +4605,11 @@ fn setting_row<R>(
     let mut out = None;
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
-            ui.label(RichText::new(title).size(13.5).color(TEXT));
+            ui.label(RichText::new(title).size(13.5).color(pal().text));
             if !desc.is_empty() {
-                ui.add(egui::Label::new(RichText::new(desc).size(11.5).color(DIM2)));
+                ui.add(egui::Label::new(
+                    RichText::new(desc).size(11.5).color(pal().dim2),
+                ));
             }
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4195,6 +4677,27 @@ fn combo_update_channel(ui: &mut egui::Ui, v: &mut UpdateChannel) -> bool {
         });
     changed
 }
+fn combo_theme(ui: &mut egui::Ui, v: &mut Theme) -> bool {
+    let text = match v {
+        Theme::System => "System",
+        Theme::Light => "Light",
+        Theme::Dark => "Dark",
+    };
+    let mut changed = false;
+    egui::ComboBox::from_id_salt("theme")
+        .selected_text(text)
+        .show_ui(ui, |ui| {
+            for (val, lbl) in [
+                (Theme::System, "System"),
+                (Theme::Light, "Light"),
+                (Theme::Dark, "Dark"),
+            ] {
+                changed |= ui.selectable_value(v, val, lbl).clicked();
+            }
+        });
+    changed
+}
+
 fn combo_compare(ui: &mut egui::Ui, v: &mut Compare) -> bool {
     let text = match v {
         Compare::Size => "Size",
@@ -4311,6 +4814,9 @@ fn starter_config(path: &Path) -> Config {
         check_on_launch: false,
         upload_limit_kbps: 0,
         download_limit_kbps: 0,
+        notifications: true,
+        theme: Theme::System,
+        file_manager_bookmarks: false,
         state_dir: {
             let base = std::env::var("XDG_STATE_HOME")
                 .map(PathBuf::from)
@@ -4533,10 +5039,17 @@ fn run_daemon() -> i32 {
         return 1;
     }
 
+    // The first line is the status, which cannot be clicked.
+    let first = ctrl.snapshot();
+    let mut last_state = tray_policy::tray_state(&first);
+    let mut last_status = tray_policy::tray_status_text(&first, now_secs());
     let menu = Menu::new();
+    let status_i = MenuItem::new(&last_status, false, None);
     let open_i = MenuItem::new("Open NeutronSync", true, None);
     let sync_i = MenuItem::new("Sync now", true, None);
     let quit_i = MenuItem::new("Quit", true, None);
+    let _ = menu.append(&status_i);
+    let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&open_i);
     let _ = menu.append(&sync_i);
     let _ = menu.append(&PredefinedMenuItem::separator());
@@ -4547,13 +5060,14 @@ fn run_daemon() -> i32 {
         quit_i.id().clone(),
     );
 
+    let icons = TrayIcons::build();
     let mut builder = TrayIconBuilder::new()
-        .with_tooltip("NeutronSync")
+        .with_tooltip(format!("NeutronSync — {last_status}"))
         .with_menu(Box::new(menu));
-    if let Some(icon) = tray_icon_image() {
-        builder = builder.with_icon(icon);
+    if let Some(icons) = &icons {
+        builder = builder.with_icon(icons.for_state(last_state).clone());
     }
-    let _tray = match builder.build() {
+    let tray = match builder.build() {
         Ok(t) => t,
         Err(e) => {
             eprintln!("neutronsync: system tray unavailable: {e}");
@@ -4562,6 +5076,14 @@ fn run_daemon() -> i32 {
         }
     };
     let quit = std::sync::Arc::new(AtomicBool::new(false));
+    // `NEUTRONSYNC_TRAY_TRACE=1` prints every icon, tooltip and status change
+    // to stderr, which is how the "only on change" rule is checked.
+    let trace = std::env::var_os("NEUTRONSYNC_TRAY_TRACE").is_some();
+    if trace {
+        eprintln!("neutronsync: tray starts as {last_state:?} with text {last_status:?}");
+    }
+    let mut notify_on = cfg.notifications;
+    let mut notifier = Notifier::new(&first);
 
     // Poll the menu-event channel from within the GTK loop, and hot-reload the
     // config file so added/removed folders and setting changes take effect
@@ -4603,6 +5125,8 @@ fn run_daemon() -> i32 {
             if let Ok(newcfg) = config::load(None) {
                 let pairs = newcfg.pairs.len();
                 want_watch = newcfg.auto_sync;
+                notify_on = newcfg.notifications;
+                reconcile_bookmarks(&newcfg);
                 ctrl_cb.commit_config(newcfg);
                 ctrl_cb.stop_watch();
                 pending_restart = true;
@@ -4619,6 +5143,32 @@ fn run_daemon() -> i32 {
                 }
             }
         }
+
+        // Icon, tooltip and status line follow the state, and are set only
+        // when something changed, never on every tick.
+        let snap = ctrl_cb.snapshot();
+        let state = tray_policy::tray_state(&snap);
+        if state != last_state {
+            last_state = state;
+            if let Some(icons) = &icons {
+                let _ = tray.set_icon(Some(icons.for_state(state).clone()));
+            }
+            if trace {
+                eprintln!("neutronsync: tray icon set to {state:?}");
+            }
+        }
+        let status = tray_policy::tray_status_text(&snap, now_secs());
+        if status != last_status {
+            status_i.set_text(&status);
+            let _ = tray.set_tooltip(Some(format!("NeutronSync — {status}")));
+            if trace {
+                eprintln!("neutronsync: tray text set to {status:?}");
+            }
+            last_status = status;
+        }
+
+        // Desktop notices come from this process alone (D1).
+        notifier.tick(&ctrl_cb, &snap, notify_on);
 
         // Publish our live state so an open window can display what the daemon
         // is doing (scanning, syncing, per-file ops) — the window has no other
@@ -4641,11 +5191,14 @@ fn run_daemon() -> i32 {
 // --screenshots: scripted scenes with made-up data, one PNG each
 // ============================================================================
 
-/// One documentation capture: which page, with which state.
+/// One documentation capture: which page, with which state and palette.
 struct Scene {
     file: &'static str,
     nav: Nav,
     state: fn() -> AppState,
+    /// `Theme::Light` for the light captures; `Theme::System` otherwise, which
+    /// falls back to dark under the headless X server.
+    theme: Theme,
 }
 
 struct Demo {
@@ -4907,41 +5460,61 @@ fn demo_scenes() -> Vec<Scene> {
             file: "activity-syncing.png",
             nav: Nav::Activity,
             state: demo_state_syncing,
+            theme: Theme::System,
         },
         Scene {
             file: "activity.png",
             nav: Nav::Activity,
             state: demo_state_synced,
+            theme: Theme::System,
         },
         Scene {
             file: "folders.png",
             nav: Nav::Folders,
             state: demo_state_syncing,
+            theme: Theme::System,
         },
         Scene {
             file: "settings.png",
             nav: Nav::Settings,
             state: demo_state_synced,
+            theme: Theme::System,
         },
         Scene {
             file: "account.png",
             nav: Nav::Account,
             state: demo_state_synced,
+            theme: Theme::System,
         },
         Scene {
             file: "sign-in.png",
             nav: Nav::Activity,
             state: demo_state_signed_out,
+            theme: Theme::System,
         },
         Scene {
             file: "keyring-locked.png",
             nav: Nav::Activity,
             state: demo_state_keyring_locked,
+            theme: Theme::System,
         },
         Scene {
             file: "about.png",
             nav: Nav::About,
             state: demo_state_synced,
+            theme: Theme::System,
+        },
+        Scene {
+            file: "activity-light.png",
+            nav: Nav::Activity,
+            state: demo_state_synced,
+            theme: Theme::Light,
+        },
+        Scene {
+            file: "settings-light.png",
+            nav: Nav::Settings,
+            state: demo_state_synced,
+            theme: Theme::Light,
         },
     ]
 }
@@ -4961,6 +5534,7 @@ impl App {
         cfg.pairs = demo_pairs();
         cfg.auto_sync = true;
         let ctrl = Controller::new(cfg.clone());
+        let notifier = Notifier::new(&ctrl.snapshot());
         let _ = std::fs::create_dir_all(&dir);
         App {
             ctrl,
@@ -5005,6 +5579,7 @@ impl App {
                 requested: false,
                 _scratch: scratch,
             }),
+            notifier,
         }
     }
 
@@ -5042,11 +5617,14 @@ impl App {
         };
         let now = ctx.input(|i| i.time);
         let nav = scene.nav;
+        let theme = scene.theme;
         let state = (scene.state)();
         if demo.since.is_none() {
             demo.since = Some(now);
             self.nav = nav;
             self.nav_t = 1.0;
+            self.cfg.theme = theme;
+            self.sync_theme(ctx);
         } else if !demo.requested && now - demo.since.unwrap_or(now) > 0.9 {
             demo.requested = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
@@ -5123,7 +5701,62 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{plain_markdown, speed_limit_label};
+    use super::{paint_state_dot, plain_markdown, speed_limit_label, Color32, DARK};
+
+    #[test]
+    fn state_dot_sits_in_the_lower_right_quarter_with_a_dark_outline() {
+        let (w, h) = (64u32, 64u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        paint_state_dot(&mut rgba, w, h, DARK.accent);
+        let px = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+        };
+        // Dot centre: the accent colour, fully opaque.
+        let c = px((w as f32 * 0.76) as u32, (h as f32 * 0.76) as u32);
+        assert_eq!(&c[..3], &[0x6D, 0x4A, 0xFF]);
+        assert_eq!(c[3], 255);
+        // Just outside the fill but inside the outline: dark and opaque.
+        let ring = px(
+            (w as f32 * 0.76 + w as f32 * 0.19) as u32,
+            (h as f32 * 0.76) as u32,
+        );
+        assert_eq!(ring[3], 255);
+        assert!(
+            ring[0] < 0x30 && ring[1] < 0x30 && ring[2] < 0x30,
+            "{ring:?}"
+        );
+        // The upper left of the image is untouched.
+        assert_eq!(px(8, 8), [0, 0, 0, 0]);
+        assert_eq!(px(w / 2, h / 4), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn owned_bookmarks_read_both_record_shapes() {
+        let new = br#"[{"path":"/home/alex/Documents","label":"Documents"}]"#;
+        let got = super::read_owned_bookmarks(new).unwrap();
+        assert_eq!(
+            got[0].path,
+            std::path::PathBuf::from("/home/alex/Documents")
+        );
+        assert_eq!(got[0].label.as_deref(), Some("Documents"));
+        let old = br#"["/home/alex/Documents"]"#;
+        let got = super::read_owned_bookmarks(old).unwrap();
+        assert_eq!(
+            got[0].path,
+            std::path::PathBuf::from("/home/alex/Documents")
+        );
+        assert_eq!(got[0].label, None);
+        assert!(super::read_owned_bookmarks(b"not json").is_none());
+    }
+
+    #[test]
+    fn blending_over_an_opaque_pixel_keeps_it_opaque() {
+        let mut px = [200u8, 200, 200, 255];
+        super::blend_over(&mut px, Color32::from_rgb(0, 0, 0), 0.5);
+        assert_eq!(px[3], 255);
+        assert_eq!(px[0], 100);
+    }
 
     #[test]
     fn speed_limit_labels_are_plain_words() {

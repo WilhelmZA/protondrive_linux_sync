@@ -22,9 +22,21 @@ One card per folder pair: the local folder, the Proton Drive folder, its current
 
 ## Settings
 
-Grouped cards for tray, X11 compatibility, launch at login, deletion policy, conflict handling, updates and the advanced backend options.
+Grouped cards for tray, X11 compatibility, launch at login, desktop notifications, appearance, the file manager sidebar, deletion policy, conflict handling, updates, change detection, network limits and the advanced backend options.
 
 ![Settings page](screenshots/settings.png)
+
+## Appearance
+
+The window follows the desktop's light or dark preference, or a fixed choice made under Settings → Appearance. These are the Activity and Settings pages in the light theme; every page keeps the same layout, only the colours change.
+
+![Activity page in the light theme](screenshots/activity-light.png)
+
+![Settings page in the light theme](screenshots/settings-light.png)
+
+## Tray and notifications
+
+Not pictured here, since they live in the desktop's own panel rather than in the window: the tray icon shows the sync state (the plain logo when up to date, a purple dot while syncing, amber when sync is waiting on you, red for a problem) and its menu opens with a one-line status such as "Syncing 37 of 120". Conflicts, a problem that does not clear and a sign-out arrive as desktop notifications.
 
 ## Account
 

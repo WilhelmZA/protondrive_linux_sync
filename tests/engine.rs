@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use std::sync::atomic::AtomicBool;
 
-use neutronsync::config::{Config, ConflictPolicy, LocalDelete, Pair, UpdateChannel};
+use neutronsync::config::{Config, ConflictPolicy, LocalDelete, Pair, Theme, UpdateChannel};
 use neutronsync::engine::Engine;
 use neutronsync::events::{EventSink, SyncEvent};
 use neutronsync::logger::Logger;
@@ -240,6 +240,9 @@ fn cfg(root: &Path) -> Config {
         check_on_launch: false,
         upload_limit_kbps: 0,
         download_limit_kbps: 0,
+        notifications: true,
+        theme: Theme::System,
+        file_manager_bookmarks: false,
         state_dir: root.join("state"),
         pairs: vec![Pair {
             name: "docs".into(),

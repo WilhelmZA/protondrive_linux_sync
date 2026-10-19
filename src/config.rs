@@ -35,6 +35,16 @@ pub enum UpdateChannel {
     Prerelease,
 }
 
+/// Which colours the window uses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Theme {
+    /// Follow the desktop's light or dark preference; dark when it reports none.
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
 #[derive(Clone, Debug)]
 pub struct Pair {
     pub name: String,
@@ -89,6 +99,12 @@ pub struct Config {
     pub upload_limit_kbps: u64,
     /// Download speed limit in KiB/s for the whole machine (0 = no limit).
     pub download_limit_kbps: u64,
+    /// Send desktop notifications for conflicts, lasting problems and a sign-out.
+    pub notifications: bool,
+    /// Light, dark, or follow the desktop.
+    pub theme: Theme,
+    /// Keep one file manager sidebar bookmark per synced folder.
+    pub file_manager_bookmarks: bool,
     pub state_dir: PathBuf,
     pub pairs: Vec<Pair>,
     pub source_path: Option<PathBuf>,
@@ -167,6 +183,9 @@ struct RawOptions {
     check_on_launch: Option<bool>,
     upload_limit_kbps: Option<u64>,
     download_limit_kbps: Option<u64>,
+    notifications: Option<bool>,
+    theme: Option<String>,
+    file_manager_bookmarks: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -362,6 +381,13 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
     let upload_limit_kbps = speed_limit("upload_limit_kbps", opts.upload_limit_kbps)?;
     let download_limit_kbps = speed_limit("download_limit_kbps", opts.download_limit_kbps)?;
 
+    let theme = match opts.theme.as_deref().unwrap_or("system") {
+        "system" => Theme::System,
+        "light" => Theme::Light,
+        "dark" => Theme::Dark,
+        other => bail!("options.theme must be system|light|dark, got {other:?}"),
+    };
+
     // Zero pairs is allowed: the app can come up clean and folders get added
     // from the GUI. The engine/watcher simply have nothing to do until then.
     let raw_pairs = raw.pair.unwrap_or_default();
@@ -405,6 +431,9 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         check_on_launch: opts.check_on_launch.unwrap_or(false),
         upload_limit_kbps,
         download_limit_kbps,
+        notifications: opts.notifications.unwrap_or(true),
+        theme,
+        file_manager_bookmarks: opts.file_manager_bookmarks.unwrap_or(false),
         state_dir,
         pairs,
         source_path: Some(path),
@@ -467,6 +496,9 @@ struct OutOptions {
     check_on_launch: bool,
     upload_limit_kbps: u64,
     download_limit_kbps: u64,
+    notifications: bool,
+    theme: String,
+    file_manager_bookmarks: bool,
     state_dir: String,
 }
 
@@ -517,6 +549,15 @@ fn update_channel_str(v: UpdateChannel) -> &'static str {
     }
 }
 
+/// The config spelling of a theme choice.
+pub fn theme_str(v: Theme) -> &'static str {
+    match v {
+        Theme::System => "system",
+        Theme::Light => "light",
+        Theme::Dark => "dark",
+    }
+}
+
 /// Serialise a Config back to TOML text.
 pub fn to_toml(cfg: &Config) -> Result<String> {
     let out = OutConfig {
@@ -543,6 +584,9 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
             check_on_launch: cfg.check_on_launch,
             upload_limit_kbps: cfg.upload_limit_kbps,
             download_limit_kbps: cfg.download_limit_kbps,
+            notifications: cfg.notifications,
+            theme: theme_str(cfg.theme).to_string(),
+            file_manager_bookmarks: cfg.file_manager_bookmarks,
             state_dir: cfg.state_dir.to_string_lossy().into_owned(),
         },
         pair: cfg
@@ -574,7 +618,7 @@ pub fn save(cfg: &Config, path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load, save};
+    use super::{load, save, Theme};
     use std::fs;
     use tempfile::TempDir;
 
@@ -707,6 +751,71 @@ state_dir = "/tmp/ns-test-state"
                 (loaded.upload_limit_kbps, loaded.download_limit_kbps),
                 (0, 0)
             );
+        }
+    }
+
+    #[test]
+    fn desktop_options_default_and_round_trip() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("cfg.toml");
+        let base = r#"
+[cli]
+backend = "api"
+[options]
+state_dir = "/tmp/ns-test-state"
+"#;
+        fs::write(&path, base).unwrap();
+        let mut cfg = load(path.to_str()).unwrap();
+        assert!(cfg.notifications, "notifications default on");
+        assert_eq!(cfg.theme, Theme::System);
+        assert!(!cfg.file_manager_bookmarks, "bookmarks default off");
+
+        for (notify, theme, bookmarks) in [
+            (false, Theme::Light, true),
+            (true, Theme::Dark, false),
+            (false, Theme::System, true),
+        ] {
+            cfg.notifications = notify;
+            cfg.theme = theme;
+            cfg.file_manager_bookmarks = bookmarks;
+            save(&cfg, &path).unwrap();
+            let text = fs::read_to_string(&path).unwrap();
+            assert!(
+                text.contains(&format!("notifications = {notify}")),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!("theme = \"{}\"", super::theme_str(theme))),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!("file_manager_bookmarks = {bookmarks}")),
+                "{text}"
+            );
+            let loaded = load(path.to_str()).unwrap();
+            assert_eq!(loaded.notifications, notify);
+            assert_eq!(loaded.theme, theme);
+            assert_eq!(loaded.file_manager_bookmarks, bookmarks);
+        }
+
+        fs::write(&path, format!("{base}theme = \"sepia\"\n")).unwrap();
+        let err = load(path.to_str()).unwrap_err().to_string();
+        assert!(err.contains("options.theme"), "{err}");
+        assert!(err.contains("system|light|dark"), "{err}");
+        assert!(err.contains("sepia"), "{err}");
+
+        for example in [
+            crate::EXAMPLE_CONFIG,
+            include_str!("../neutronsync.example.toml"),
+        ] {
+            assert!(example.contains("# notifications = true"));
+            assert!(example.contains("# theme = \"system\""));
+            assert!(example.contains("# file_manager_bookmarks = false"));
+            fs::write(&path, example).unwrap();
+            let loaded = load(path.to_str()).unwrap();
+            assert!(loaded.notifications);
+            assert_eq!(loaded.theme, Theme::System);
+            assert!(!loaded.file_manager_bookmarks);
         }
     }
 }

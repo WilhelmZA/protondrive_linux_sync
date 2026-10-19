@@ -80,6 +80,21 @@ pub fn epoch_to_stamp(secs: i64) -> String {
     format!("{y:04}{m:02}{d:02}-{h:02}{mi:02}{s:02}")
 }
 
+/// "just now", "5 minutes ago", "yesterday": how long before `now` (both in
+/// epoch seconds) `ts` was, in the words the window and the tray status use.
+pub fn relative_time(now: i64, ts: i64) -> String {
+    let d = (now - ts).max(0);
+    match d {
+        0..=44 => "just now".into(),
+        45..=119 => "1 minute ago".into(),
+        120..=3599 => format!("{} minutes ago", d / 60),
+        3600..=7199 => "1 hour ago".into(),
+        7200..=86399 => format!("{} hours ago", d / 3600),
+        86400..=172799 => "yesterday".into(),
+        _ => format!("{} days ago", d / 86400),
+    }
+}
+
 /// Current time in epoch seconds (0 on the impossible clock error).
 pub fn now_epoch() -> i64 {
     std::time::SystemTime::now()
@@ -103,5 +118,18 @@ mod tests {
     fn known_epoch() {
         assert_eq!(iso8601_to_epoch("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(iso8601_to_epoch("2000-01-01T00:00:00Z"), Some(946684800));
+    }
+
+    #[test]
+    fn relative_time_words() {
+        assert_eq!(relative_time(1000, 1000), "just now");
+        assert_eq!(relative_time(1000, 1100), "just now");
+        assert_eq!(relative_time(1000, 1000 - 44), "just now");
+        assert_eq!(relative_time(1000, 1000 - 45), "1 minute ago");
+        assert_eq!(relative_time(1000, 1000 - 300), "5 minutes ago");
+        assert_eq!(relative_time(10_000, 10_000 - 3600), "1 hour ago");
+        assert_eq!(relative_time(100_000, 100_000 - 7200), "2 hours ago");
+        assert_eq!(relative_time(200_000, 200_000 - 86400), "yesterday");
+        assert_eq!(relative_time(400_000, 400_000 - 3 * 86400), "3 days ago");
     }
 }

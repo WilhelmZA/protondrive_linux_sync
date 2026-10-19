@@ -37,6 +37,7 @@ The pictures use example folders and files. See [`docs/screenshots.md`](docs/scr
 - **Selective sync.** Exclude sub-folders per pair. Excluded paths are never touched on Proton; you can optionally free up local space by removing the local copy while the cloud copy stays.
 - **Live sync.** A watch daemon reconciles on local change (inotify, debounced) and follows Proton's change feed for remote edits.
 - **Native GUI or CLI.** An egui desktop app (single binary, optional system tray) or a lean command-line tool. Same engine, same config.
+- **Knows its place on the desktop.** The tray icon shows the sync state and its menu carries a one-line status. Conflicts, a problem that does not clear and a sign-out arrive as desktop notifications. The window follows the desktop's light or dark preference, and synced folders can sit in the file manager sidebar. See [On the desktop](#on-the-desktop).
 - **In-app updates.** Checks GitHub releases on a channel you choose (stable or pre-release), then downloads and installs the new version for you: it picks the asset matching how you installed (`.deb` or `.rpm`), installs it through your package manager so your package list stays correct, and restarts the app. A copy that no package manager owns is downloaded for you to install by hand.
 - **Signed releases.** Commits and tags are GPG-signed; releases ship `.deb`, `.rpm`, and a portable binary tarball.
 
@@ -171,6 +172,20 @@ When the background tray is doing the work, an open window mirrors its live stat
 
 Each pair can list sub-paths to exclude (in the GUI's "Choose folders to sync", or `exclude = [...]` in the config). Excluded paths are ignored entirely and never touched on Proton. Excluding an already-synced folder freezes both copies in place; when you exclude one, NeutronSync offers to remove the local copy (to the desktop trash) to free space while the cloud copy stays. Re-including a folder later re-downloads it from the cloud, so excluding can never delete remote data.
 
+## On the desktop
+
+**Tray.** With "Run in system tray" on, the tray icon tells you what sync is doing without the window: the plain logo when everything is up to date, and a dot in the corner while syncing (purple), when sync is waiting on you (amber: signed out, or the keyring is locked) or when a folder has a problem (red). The menu opens with a status line such as "Up to date · last sync 5 minutes ago", "Syncing 37 of 120" or "Problem in Documents", followed by Open NeutronSync, Sync now and Quit. The tooltip carries the same status.
+
+**Notifications.** Three things arrive as desktop notifications: files that changed in two places (one notice every five minutes at most, summing what arrived in between, with the folder named), a folder whose sync problem has lasted ten minutes (once, until it clears and comes back), and a Proton sign-out (once per sign-out; a locked keyring is not a sign-out). Only the process doing the sync sends them, so an open window never repeats what the tray already said. Turn them off with "Show desktop notifications" in Settings, or `notifications = false`.
+
+**Appearance.** The window follows the desktop's light or dark preference. Settings → Appearance fixes it to Light or Dark instead, and the change applies at once. When the desktop reports no preference, System means dark. The option is `theme = "system" | "light" | "dark"`.
+
+| Activity, light | Settings, light |
+| --- | --- |
+| [![Activity page in the light theme](docs/screenshots/activity-light.png)](docs/screenshots/activity-light.png) | [![Settings page in the light theme](docs/screenshots/settings-light.png)](docs/screenshots/settings-light.png) |
+
+**File manager sidebar.** "Show synced folders in the file manager sidebar" (or `file_manager_bookmarks = true`) keeps one bookmark per synced folder in `~/.config/gtk-3.0/bookmarks`, which Nautilus, Nemo, Thunar and the GTK file dialogs read. The bookmark is named as the folder is in NeutronSync. Adding a folder adds its bookmark, removing one removes it, and turning the switch off removes them all. NeutronSync only ever removes bookmarks it added itself; a bookmark you already had for the same folder is left alone and never claimed.
+
 ## Configuration
 
 TOML at `~/.config/neutronsync/neutronsync.toml` (override with `-c PATH` or `$NEUTRONSYNC_CONFIG`). See `neutronsync.example.toml` for the annotated template.
@@ -192,6 +207,9 @@ update_channel = "stable"     # stable | prerelease
 # check_on_launch = false     # GUI: check for updates on start (notify only)
 # upload_limit_kbps = 0       # upload speed limit in KB/s for all folders (0 = no limit)
 # download_limit_kbps = 0     # download speed limit in KB/s for all folders (0 = no limit)
+# notifications = true        # GUI: desktop notifications for conflicts, lasting problems, sign-out
+# theme = "system"            # GUI: system | light | dark
+# file_manager_bookmarks = false  # GUI: one file manager sidebar bookmark per synced folder
 
 [[pair]]
 name = "documents"

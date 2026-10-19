@@ -23,6 +23,8 @@ use crate::stats::{ConflictRecord, HeldDeletes, Stats};
 use crate::watcher;
 
 const ACTIVITY_CAP: usize = 500;
+/// Settled conflicts kept for the desktop notifier when nothing drains them.
+const SETTLED_CAP: usize = 1000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Phase {
@@ -192,11 +194,23 @@ fn op_text(op: &ActivityOp) -> String {
     }
 }
 
+/// A conflict the engine settled, queued for the desktop notifier (see
+/// [`Controller::take_settled_conflicts`]). Not part of the published state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettledConflict {
+    pub pair: String,
+    pub path: String,
+    pub outcome: crate::models::ConflictOutcome,
+}
+
+type SettledQueue = Arc<Mutex<Vec<SettledConflict>>>;
+
 /// Turns engine events into observable [`AppState`]. Thread-safe: `emit` may be
 /// called concurrently (scan workers), so it just locks briefly.
 pub struct StateSink {
     state: Arc<Mutex<AppState>>,
     stats: Option<Arc<Stats>>,
+    settled: SettledQueue,
 }
 
 impl EventSink for StateSink {
@@ -388,6 +402,16 @@ impl EventSink for StateSink {
                 copy,
             } => {
                 drop(s);
+                {
+                    let mut queue = self.settled.lock().unwrap();
+                    if queue.len() < SETTLED_CAP {
+                        queue.push(SettledConflict {
+                            pair: pair.clone(),
+                            path: path.clone(),
+                            outcome: *outcome,
+                        });
+                    }
+                }
                 if let Some(st) = &self.stats {
                     let _ = st.record_conflict(pair, path, *outcome, copy.as_deref(), now_epoch());
                 }
@@ -405,6 +429,7 @@ pub struct Controller {
     busy: Arc<AtomicBool>,
     watch_stop: Mutex<Option<Arc<AtomicBool>>>,
     stats: Option<Arc<Stats>>,
+    settled: SettledQueue,
 }
 
 impl Controller {
@@ -477,9 +502,16 @@ impl Controller {
             busy: Arc::new(AtomicBool::new(false)),
             watch_stop: Mutex::new(None),
             stats,
+            settled: Arc::new(Mutex::new(Vec::new())),
         };
         c.refresh_account(false);
         c
+    }
+
+    /// Conflicts settled since the last call, oldest first. The desktop
+    /// notifier drains this on every tick; nothing else reads it.
+    pub fn take_settled_conflicts(&self) -> Vec<SettledConflict> {
+        std::mem::take(&mut *self.settled.lock().unwrap())
     }
 
     /// A cheap clone of the current state - call this each frame.
@@ -603,10 +635,12 @@ impl Controller {
         let cancel = self.cancel.clone();
         let busy = self.busy.clone();
         let stats = self.stats.clone();
+        let settled = self.settled.clone();
         thread::spawn(move || {
             let sink = StateSink {
                 state: state.clone(),
                 stats,
+                settled,
             };
             let log = Logger::new(&cfg.state_dir.join("logs"), false, false);
             run_sync_with(
@@ -673,10 +707,12 @@ impl Controller {
         self.state.lock().unwrap().watching = true;
         let state = self.state.clone();
         let stats = self.stats.clone();
+        let settled = self.settled.clone();
         thread::spawn(move || {
             let sink = StateSink {
                 state: state.clone(),
                 stats,
+                settled,
             };
             let log = Logger::new(&cfg.state_dir.join("logs"), false, false);
             if let Err(e) = watcher::watch_with(&cfg, pairs, &log, &stop, Some(&sink)) {
@@ -809,6 +845,7 @@ mod tests {
         let sink = StateSink {
             state: st.clone(),
             stats: None,
+            settled: Default::default(),
         };
         sink.emit(&SyncEvent::PairStarted {
             pair: "docs".into(),
@@ -868,9 +905,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let stats = Arc::new(Stats::open(dir.path()).unwrap());
         let st = state_with(&["docs"]);
+        let settled: SettledQueue = Default::default();
         let sink = StateSink {
             state: st.clone(),
             stats: Some(stats.clone()),
+            settled: settled.clone(),
         };
         sink.emit(&SyncEvent::DeletesHeld {
             pair: "docs".into(),
@@ -907,6 +946,62 @@ mod tests {
         assert_eq!(skipped.seen, 3);
         let both = rows.iter().find(|r| r.path == "b.txt").unwrap();
         assert_eq!(both.copy.as_deref(), Some("b (conflict 1).txt"));
+        // Every settled conflict is queued once for the desktop notifier.
+        let queued = std::mem::take(&mut *settled.lock().unwrap());
+        assert_eq!(queued.len(), 4);
+        assert_eq!(queued[3].path, "b.txt");
+        assert_eq!(queued[3].outcome, crate::models::ConflictOutcome::KeptBoth);
+    }
+
+    #[test]
+    fn controller_hands_out_settled_conflicts_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config {
+            sidecar: Some(dir.path().join("no-such-sidecar")),
+            scan_threads: 0,
+            download_threads: 0,
+            remote_root: "/my-files".into(),
+            propagate_deletes: false,
+            max_delete_files: 200,
+            max_delete_percent: 30,
+            auto_sync: false,
+            run_in_tray: false,
+            x11_compat: false,
+            local_delete: crate::config::LocalDelete::Trash,
+            conflict: crate::config::ConflictPolicy::KeepBoth,
+            compare: crate::models::Compare::SizeMtime,
+            full_walk_interval: 86400,
+            scan_interval_secs: 120,
+            debounce_secs: 2,
+            update_channel: crate::config::UpdateChannel::Stable,
+            check_on_launch: false,
+            upload_limit_kbps: 0,
+            download_limit_kbps: 0,
+            notifications: true,
+            theme: crate::config::Theme::System,
+            file_manager_bookmarks: false,
+            state_dir: dir.path().to_path_buf(),
+            pairs: vec![],
+            source_path: None,
+        };
+        cfg.pairs.clear();
+        let ctrl = Controller::new(cfg);
+        assert!(ctrl.take_settled_conflicts().is_empty());
+        let sink = StateSink {
+            state: ctrl.state.clone(),
+            stats: None,
+            settled: ctrl.settled.clone(),
+        };
+        sink.emit(&SyncEvent::ConflictSettled {
+            pair: "docs".into(),
+            path: "a.txt".into(),
+            outcome: crate::models::ConflictOutcome::KeptBoth,
+            copy: Some("a (conflict 1).txt".into()),
+        });
+        let first = ctrl.take_settled_conflicts();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].pair, "docs");
+        assert!(ctrl.take_settled_conflicts().is_empty());
     }
 
     #[test]
@@ -934,6 +1029,9 @@ mod tests {
             check_on_launch: false,
             upload_limit_kbps: 0,
             download_limit_kbps: 0,
+            notifications: true,
+            theme: crate::config::Theme::System,
+            file_manager_bookmarks: false,
             state_dir: dir.path().to_path_buf(),
             pairs: vec![],
             source_path: None,
