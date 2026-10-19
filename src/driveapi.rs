@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use crate::changefeed::{FeedMessage, RemoteChangeFeed, Subscription};
 use crate::config::{remote_join, Config};
-use crate::models::{DownloadJob, Entry, TreeScan};
+use crate::models::{DownloadJob, Entry, TreeScan, Uploaded};
 use crate::protoncli::{is_safe_component, ListOutcome, Remote};
 
 pub const SIDECAR_NAME: &str = "neutronsync-drive";
@@ -561,7 +561,7 @@ impl Remote for DriveApi {
         client.call("node.create_folder", json!({"parent_uid":uid,"name":name}))?;
         Ok(())
     }
-    fn upload(&self, local: &str, parent: &str) -> Result<()> {
+    fn upload(&self, local: &str, parent: &str) -> Result<Option<Uploaded>> {
         let name = Path::new(local)
             .file_name()
             .and_then(|s| s.to_str())
@@ -571,11 +571,23 @@ impl Remote for DriveApi {
         }
         let client = shared(&self.binary)?;
         let uid = Self::resolve(&client, parent)?;
-        client.call(
+        let result = client.call(
             "file.upload",
             json!({"parent_uid":uid,"name":name,"local_path":local}),
         )?;
-        Ok(())
+        // The sidecar uploads an immutable snapshot and reports its size,
+        // mtime and sha1: exactly what is now on the remote.
+        Ok(result
+            .get("size")
+            .and_then(Value::as_u64)
+            .map(|size| Uploaded {
+                size,
+                mtime: result.get("mtime").and_then(Value::as_i64),
+                sha1: result
+                    .get("sha1")
+                    .and_then(Value::as_str)
+                    .map(str::to_lowercase),
+            }))
     }
     fn download(&self, remote: &str, dest: &str) -> Result<()> {
         let (_, name) = split_remote(remote)?;

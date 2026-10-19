@@ -5,7 +5,7 @@ use anyhow::{bail, Result};
 use crate::config::{Backend, Config};
 use crate::driveapi::DriveApi;
 use crate::logger::Logger;
-use crate::models::{DownloadJob, Entry, TreeScan};
+use crate::models::{DownloadJob, Entry, TreeScan, Uploaded};
 use crate::protoncli::{ListOutcome, ProtonCli, Remote};
 use std::sync::atomic::AtomicBool;
 
@@ -56,7 +56,7 @@ impl<R: Remote + ?Sized> Remote for Box<R> {
     fn create_folder(&self, parent: &str, name: &str) -> Result<()> {
         (**self).create_folder(parent, name)
     }
-    fn upload(&self, local: &str, parent: &str) -> Result<()> {
+    fn upload(&self, local: &str, parent: &str) -> Result<Option<Uploaded>> {
         (**self).upload(local, parent)
     }
     fn download(&self, remote: &str, dest: &str) -> Result<()> {

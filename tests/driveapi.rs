@@ -29,7 +29,7 @@ impl Remote for ReadOnly {
     fn create_folder(&self, _: &str, _: &str) -> anyhow::Result<()> {
         panic!("read-only write")
     }
-    fn upload(&self, _: &str, _: &str) -> anyhow::Result<()> {
+    fn upload(&self, _: &str, _: &str) -> anyhow::Result<Option<neutronsync::models::Uploaded>> {
         panic!("read-only write")
     }
     fn download(&self, _: &str, _: &str) -> anyhow::Result<()> {

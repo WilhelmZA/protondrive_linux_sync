@@ -19,6 +19,17 @@ pub struct Entry {
     pub remote_id: Option<String>,
 }
 
+/// What an upload actually sent: the metadata of the bytes now on the remote.
+/// Backends that snapshot the file before transfer report the snapshot, so the
+/// baseline can describe the remote copy exactly, however the local file moved
+/// meanwhile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Uploaded {
+    pub size: u64,
+    pub mtime: Option<i64>,
+    pub sha1: Option<String>,
+}
+
 /// How to decide whether two files differ.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Compare {

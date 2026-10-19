@@ -161,7 +161,7 @@ def mutable(request):
             path = Path(p['local_path'])
             data = path.read_bytes()
             tree[uid] = dict(name=p['name'], type='file', parent_uid=p['parent_uid'], data=data.hex(), size=len(data), mtime=int(path.stat().st_mtime), sha1=hashlib.sha1(data).hexdigest())
-            result = dict(uid=uid, revision_uid=str(uuid.uuid4()), sha1=tree[uid]['sha1'])
+            result = dict(uid=uid, revision_uid=str(uuid.uuid4()), sha1=tree[uid]['sha1'], size=tree[uid]['size'], mtime=tree[uid]['mtime'])
         elif method == 'file.download':
             n = node(p['uid'])
             def transfer():

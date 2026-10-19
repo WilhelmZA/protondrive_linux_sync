@@ -23,7 +23,9 @@ use crate::backend::{effective_dry_run, select};
 use crate::config::{remote_join, strip_root, Config, ConflictPolicy, LocalDelete, Pair};
 use crate::datefmt::{epoch_to_stamp, now_epoch};
 use crate::logger::Logger;
-use crate::models::{same_content, Action, Change, Compare, DownloadJob, Entry, Op, Plan};
+use crate::models::{
+    same_content, Action, Change, Compare, DownloadJob, Entry, Op, Plan, Uploaded,
+};
 use crate::protoncli::{ListOutcome, Remote};
 use crate::trash::trash_local;
 
@@ -1596,10 +1598,38 @@ impl<'a, R: Remote> Engine<'a, R> {
             Action::Upload => {
                 let parent = parent_rel(&op.path);
                 self.ensure_remote_dir(&pair.remote, parent)?;
-                self.remote.upload(
+                // The baseline must describe the bytes that reached the remote,
+                // not the file as the scan saw it: a file edited after the scan
+                // uploads its NEW content, and a stale plan-time size/mtime makes
+                // both sides look changed next run and raises a false conflict.
+                // Prefer what the backend reports it sent (a snapshot); fall back
+                // to a stat taken just before the upload.
+                let stat = std::fs::metadata(&local_full).ok();
+                let sent = self.remote.upload(
                     &local_full.to_string_lossy(),
                     &remote_join(&pair.remote, parent),
                 )?;
+                let sent = sent.or_else(|| {
+                    stat.map(|meta| Uploaded {
+                        size: meta.len(),
+                        mtime: meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64),
+                        sha1: None,
+                    })
+                });
+                if let (Some(sent), Some(e)) = (sent, new_base.get_mut(&op.path)) {
+                    if e.size != sent.size || e.mtime != sent.mtime {
+                        e.size = sent.size;
+                        e.mtime = sent.mtime;
+                        e.sha1 = None; // the scan-time hash is stale
+                    }
+                    if sent.sha1.is_some() {
+                        e.sha1 = sent.sha1;
+                    }
+                }
             }
             Action::Download => {
                 let dest_dir = local_full

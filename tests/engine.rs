@@ -13,7 +13,7 @@ use neutronsync::config::{Config, ConflictPolicy, LocalDelete, Pair, UpdateChann
 use neutronsync::engine::Engine;
 use neutronsync::events::{EventSink, SyncEvent};
 use neutronsync::logger::Logger;
-use neutronsync::models::{Compare, Entry};
+use neutronsync::models::{Compare, Entry, Uploaded};
 use neutronsync::protoncli::{ListOutcome, Remote};
 
 // --- in-memory fake remote --------------------------------------------------
@@ -21,11 +21,12 @@ use neutronsync::protoncli::{ListOutcome, Remote};
 struct Store {
     files: BTreeMap<String, Vec<u8>>, // absolute proton path -> bytes
     dirs: BTreeSet<String>,
-    moves: usize,                  // count of rename/move calls
-    fail_dir: Option<String>,      // absolute path whose listing should error
-    notfound_dir: Option<String>,  // absolute path whose probe reports NotFound
-    fail_download: Option<String>, // absolute file path whose download should error
-    fail_upload: Option<String>,   // absolute file path whose upload should error
+    moves: usize,                               // count of rename/move calls
+    fail_dir: Option<String>,                   // absolute path whose listing should error
+    notfound_dir: Option<String>,               // absolute path whose probe reports NotFound
+    fail_download: Option<String>,              // absolute file path whose download should error
+    fail_upload: Option<String>,                // absolute file path whose upload should error
+    edit_on_upload: Option<(PathBuf, Vec<u8>)>, // write this file when the next upload starts
 }
 
 struct FakeRemote {
@@ -94,7 +95,10 @@ impl Remote for FakeRemote {
         Ok(())
     }
 
-    fn upload(&self, local_path: &str, remote_parent: &str) -> anyhow::Result<()> {
+    fn upload(&self, local_path: &str, remote_parent: &str) -> anyhow::Result<Option<Uploaded>> {
+        if let Some((path, bytes)) = self.store.borrow_mut().edit_on_upload.take() {
+            std::fs::write(path, bytes)?;
+        }
         let data = std::fs::read(local_path)?;
         let key = format!(
             "{}/{}",
@@ -105,7 +109,7 @@ impl Remote for FakeRemote {
             anyhow::bail!("simulated upload failure for {key}");
         }
         self.store.borrow_mut().files.insert(key, data);
-        Ok(())
+        Ok(None)
     }
 
     fn download(&self, remote_path: &str, local_dest: &str) -> anyhow::Result<()> {
@@ -665,6 +669,52 @@ fn failed_upload_keeps_local_edit() {
         Some("v2-local-edit"),
         "the local edit should have uploaded on the retry"
     );
+}
+
+#[test]
+fn edit_after_plan_does_not_raise_false_conflict() {
+    // Regression: a file edited between the scan and its upload uploads the
+    // NEW content. The baseline must record that content, not the plan-time
+    // size, or the next local edit makes both sides look changed and raises a
+    // keep-both conflict.
+    let t = Tmp::new("editplan");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    let local = t.path().join("local/x.txt");
+    let other = t.path().join("local/a.txt");
+    write(&local, "v1");
+    write(&other, "a1");
+    run(&c, fake, false);
+
+    // Both change; while a.txt (sorted first) uploads, x.txt is edited again,
+    // so x.txt uploads content newer than the scan saw.
+    write(&local, "v2-edit");
+    write(&other, "a2-edit");
+    store.borrow_mut().edit_on_upload = Some((local.clone(), b"v3-before-its-upload".to_vec()));
+    let (fake2, _s) = reuse(&store);
+    run(&c, fake2, false);
+
+    write(&local, "v4-after-the-upload-finished");
+    let (fake3, _s) = reuse(&store);
+    run(&c, fake3, false);
+    assert_eq!(
+        remote_files(&store)
+            .get("/my-files/docs/x.txt")
+            .map(String::as_str),
+        Some("v4-after-the-upload-finished"),
+        "the later local edit must upload as a plain change"
+    );
+    let conflicts = std::fs::read_dir(t.path().join("local"))
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("(conflict")
+        })
+        .count();
+    assert_eq!(conflicts, 0, "no conflict copy may be created");
 }
 
 #[test]

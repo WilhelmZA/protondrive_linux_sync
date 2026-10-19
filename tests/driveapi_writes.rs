@@ -174,10 +174,15 @@ fn writes_round_trip_revisions_rename_move_and_trash_reresolve() {
         .remote_id
         .unwrap();
     h.local("file", "a replacement revision");
-    h.api
+    let sent = h
+        .api
         .upload(path.to_str().unwrap(), "/my-files/test")
-        .unwrap();
+        .unwrap()
+        .expect("the api backend reports what it uploaded");
     assert_eq!(h.tree()[&uid]["size"], 22);
+    assert_eq!(sent.size, 22);
+    assert_eq!(sent.sha1.as_deref(), h.tree()[&uid]["sha1"].as_str());
+    assert_eq!(sent.mtime, h.tree()[&uid]["mtime"].as_i64());
     h.api
         .rename("/my-files/test/file", "/my-files/test/renamed")
         .unwrap();

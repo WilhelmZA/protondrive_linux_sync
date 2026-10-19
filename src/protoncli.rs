@@ -30,7 +30,7 @@ use serde_json::Value;
 
 use crate::config::Config;
 use crate::datefmt::iso8601_to_epoch;
-use crate::models::{DownloadJob, Entry, TreeScan};
+use crate::models::{DownloadJob, Entry, TreeScan, Uploaded};
 
 /// The remote operations the engine needs. A fake implements this in tests.
 pub trait Remote {
@@ -55,7 +55,10 @@ pub trait Remote {
     }
 
     fn create_folder(&self, parent: &str, name: &str) -> Result<()>;
-    fn upload(&self, local_path: &str, remote_parent: &str) -> Result<()>;
+    /// Upload a local file into `remote_parent`. Returns what was actually
+    /// sent when the backend knows (it snapshots the file first); `None` means
+    /// the engine must describe the upload from its own stat of the file.
+    fn upload(&self, local_path: &str, remote_parent: &str) -> Result<Option<Uploaded>>;
     fn download(&self, remote_path: &str, local_dest: &str) -> Result<()>;
     fn trash(&self, remote_path: &str) -> Result<()>;
 
@@ -604,7 +607,7 @@ impl Remote for ProtonCli {
         Ok(())
     }
 
-    fn upload(&self, local_path: &str, remote_parent: &str) -> Result<()> {
+    fn upload(&self, local_path: &str, remote_parent: &str) -> Result<Option<Uploaded>> {
         let quoted = glob_quote_local(local_path);
         let mut args: Vec<&str> = vec!["filesystem", "upload"];
         args.extend(self.upload_flags.iter().map(|s| s.as_str()));
@@ -615,7 +618,7 @@ impl Remote for ProtonCli {
         if !ok {
             bail!("upload {local_path} failed: {}", first_nonempty(&err, &out));
         }
-        Ok(())
+        Ok(None) // the CLI streams the live file and reports nothing back
     }
 
     fn download(&self, remote_path: &str, local_dest: &str) -> Result<()> {
