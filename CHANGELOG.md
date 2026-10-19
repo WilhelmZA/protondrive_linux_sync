@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-19
+
 ### Added
 - Releases are signed. Each one ships `SHA256SUMS` and `SHA256SUMS.asc`, signed with a dedicated release key whose public half is built into the app. From 0.7.0 on the updater checks that signature before it installs anything and discards a download that fails it; the release workflow refuses to publish an unsigned release.
 - `neutronsync --version` and the About page show the commit the build was made from.
