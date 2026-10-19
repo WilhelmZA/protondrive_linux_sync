@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-19
+
 ### Fixed
 - Switching pages works again. 0.6.0 dropped the page-fade step, so a new page never finished fading in and the old one stayed on screen.
 
