@@ -52,7 +52,7 @@ RUN uv sync --locked --no-dev \
 # ----- final runtime image -----
 FROM python:3.12-slim-bookworm
 ARG NEUTRONSYNC_BUILD_SHA=unknown
-ARG VERSION=0.7.0
+ARG VERSION=dev
 ARG S6_OVERLAY_VERSION=3.2.3.2
 ARG S6_NOARCH_SHA256=5379750ed30a84bbd2e2dd74847ba6b5bd29cd0b2e3ea2ec58049b57eb2eda12
 ARG S6_X86_64_SHA256=e6befcc96a437a3831386ecfc51808c5d3e939dc5fe3c02ae9284599e8aa2408

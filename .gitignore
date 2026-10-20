@@ -27,3 +27,4 @@ logs/
 /web/**/__pycache__/
 /web/.pytest_cache/
 /web/*.egg-info/
+/.tools/

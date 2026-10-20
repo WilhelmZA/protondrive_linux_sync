@@ -297,6 +297,33 @@ jobs:
           echo "version=${ver}" >> "$GITHUB_OUTPUT"
           echo "sha_short=${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
 
+      # Build once locally and gate it before anything reaches the registry: no
+      # HIGH or CRITICAL finding with a fix, no secret. The push below reuses
+      # the build cache, so this costs one scan, not a second build.
+      - name: Build for the security gate
+        uses: docker/build-push-action@471d1dc4e07e5cdedd4c2171150001c434f0b7a4 # v6.15.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: neutronsync:gate
+          build-args: |
+            NEUTRONSYNC_BUILD_SHA=${{ steps.meta.outputs.sha_short }}
+            VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Security gate (Trivy)
+        run: |
+          set -euo pipefail
+          bash scripts/install-trivy.sh
+          .tools/bin/trivy image --quiet --scanners vuln,secret \
+            --ignorefile .trivyignore.yaml \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 \
+            neutronsync:gate
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@471d1dc4e07e5cdedd4c2171150001c434f0b7a4 # v6.15.0

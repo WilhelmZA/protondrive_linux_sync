@@ -1,0 +1,13 @@
+# Accepted Trivy findings. Every entry says why it does not apply and when to
+# look at it again. A finding with a fix is never listed here: fix it instead.
+
+misconfigurations:
+  - id: DS-0002
+    paths:
+      - "docker/Dockerfile"
+    statement: >-
+      No USER line by design. s6-overlay's /init starts as root only to apply
+      PUID/PGID and UMASK (the Unraid convention), then runs neutronsync
+      serve, the web app and the sidecar as that unprivileged user; only the
+      s6 supervisors stay root. Verified with docker top on 2026-10-20.
+      Revisit if the image drops PUID/PGID mapping.
