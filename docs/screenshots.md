@@ -36,6 +36,14 @@ The window follows the desktop's light or dark preference, or a fixed choice mad
 
 ## Tray and notifications
 
+The Conflicts page lists every conflict the sync settled, until it is dismissed:
+
+![Conflicts page: two settled conflicts with the folder, when, and what was kept](screenshots/conflicts.png)
+
+When a run would delete more than the guard allows, it holds the deletions back and asks:
+
+![Activity page with a banner: 1,640 deletions held back in Photos, with Restore them and Delete them](screenshots/held.png)
+
 Not pictured here, since they live in the desktop's own panel rather than in the window: the tray icon shows the sync state (the plain logo when up to date, a purple dot while syncing, amber when sync is waiting on you, red for a problem) and its menu opens with a one-line status such as "Syncing 37 of 120". Conflicts, a problem that does not clear and a sign-out arrive as desktop notifications.
 
 ## Account

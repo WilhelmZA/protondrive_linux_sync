@@ -5199,6 +5199,65 @@ struct Scene {
     /// `Theme::Light` for the light captures; `Theme::System` otherwise, which
     /// falls back to dark under the headless X server.
     theme: Theme,
+    /// Held deletions and settled conflicts, which the window reads from
+    /// stats.db rather than from `AppState`.
+    records: fn() -> (Vec<HeldDeletes>, Vec<ConflictRecord>),
+}
+
+fn no_records() -> (Vec<HeldDeletes>, Vec<ConflictRecord>) {
+    (Vec::new(), Vec::new())
+}
+
+/// Two conflicts the sync settled in the last day, both still listed.
+fn demo_conflicts() -> Vec<ConflictRecord> {
+    let now = now_secs();
+    let record = |id, pair: &str, path: &str, outcome, copy: Option<&str>, ago| ConflictRecord {
+        id,
+        pair: pair.into(),
+        path: path.into(),
+        outcome,
+        copy: copy.map(Into::into),
+        first_ts: now - ago,
+        last_ts: now - ago,
+        seen: 1,
+        dismissed: false,
+    };
+    vec![
+        record(
+            1,
+            "Documents",
+            "Finance/2026/Budget.xlsx",
+            ConflictOutcome::KeptBoth,
+            Some("Finance/2026/Budget (conflict 2026-10-19 0912).xlsx"),
+            40 * 60,
+        ),
+        record(
+            2,
+            "Work",
+            "Reports/Q3 review.docx",
+            ConflictOutcome::KeptLocal,
+            None,
+            5 * 3600,
+        ),
+    ]
+}
+
+fn demo_records_conflicts() -> (Vec<HeldDeletes>, Vec<ConflictRecord>) {
+    (Vec::new(), demo_conflicts())
+}
+
+/// The Photos folder was emptied on this computer; the sync held it back.
+fn demo_records_held() -> (Vec<HeldDeletes>, Vec<ConflictRecord>) {
+    let now = now_secs();
+    let hold = HeldDeletes {
+        pair: "Photos".into(),
+        local: 0,
+        remote: 1640,
+        tracked: 1712,
+        since: now - 20 * 60,
+        updated: now - 2 * 60,
+    };
+    (vec![hold], Vec::new())
 }
 
 struct Demo {
@@ -5461,60 +5520,84 @@ fn demo_scenes() -> Vec<Scene> {
             nav: Nav::Activity,
             state: demo_state_syncing,
             theme: Theme::System,
+            records: no_records,
         },
         Scene {
             file: "activity.png",
             nav: Nav::Activity,
             state: demo_state_synced,
             theme: Theme::System,
+            records: no_records,
         },
         Scene {
             file: "folders.png",
             nav: Nav::Folders,
             state: demo_state_syncing,
             theme: Theme::System,
+            records: no_records,
         },
         Scene {
             file: "settings.png",
             nav: Nav::Settings,
             state: demo_state_synced,
             theme: Theme::System,
+            records: no_records,
         },
         Scene {
             file: "account.png",
             nav: Nav::Account,
             state: demo_state_synced,
             theme: Theme::System,
+            records: no_records,
         },
         Scene {
             file: "sign-in.png",
             nav: Nav::Activity,
             state: demo_state_signed_out,
             theme: Theme::System,
+            records: no_records,
         },
         Scene {
             file: "keyring-locked.png",
             nav: Nav::Activity,
             state: demo_state_keyring_locked,
             theme: Theme::System,
+            records: no_records,
         },
         Scene {
             file: "about.png",
             nav: Nav::About,
             state: demo_state_synced,
             theme: Theme::System,
+            records: no_records,
+        },
+        Scene {
+            file: "conflicts.png",
+            nav: Nav::Conflicts,
+            state: demo_state_synced,
+            theme: Theme::System,
+            records: demo_records_conflicts,
+        },
+        Scene {
+            file: "held.png",
+            nav: Nav::Activity,
+            state: demo_state_synced,
+            theme: Theme::System,
+            records: demo_records_held,
         },
         Scene {
             file: "activity-light.png",
             nav: Nav::Activity,
             state: demo_state_synced,
             theme: Theme::Light,
+            records: no_records,
         },
         Scene {
             file: "settings-light.png",
             nav: Nav::Settings,
             state: demo_state_synced,
             theme: Theme::Light,
+            records: no_records,
         },
     ]
 }
@@ -5618,6 +5701,7 @@ impl App {
         let now = ctx.input(|i| i.time);
         let nav = scene.nav;
         let theme = scene.theme;
+        let records = scene.records;
         let state = (scene.state)();
         if demo.since.is_none() {
             demo.since = Some(now);
@@ -5625,6 +5709,7 @@ impl App {
             self.nav_t = 1.0;
             self.cfg.theme = theme;
             self.sync_theme(ctx);
+            (self.holds, self.conflicts) = records();
         } else if !demo.requested && now - demo.since.unwrap_or(now) > 0.9 {
             demo.requested = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));

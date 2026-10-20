@@ -64,6 +64,14 @@ A conflict (changed on both sides since the baseline) is settled by the `conflic
 
 `stats.db` carries `PRAGMA user_version` (2 in this build). A file saved by a newer NeutronSync is refused with a message saying so, unchanged. A file SQLite cannot read (random bytes, truncated, a damaged page) is an error, never an empty baseline, so it can never be mistaken for "nothing was ever synced" and turn into a mass change.
 
+## Transfers: retries and speed limits
+
+A transfer that fails for a temporary reason is retried in the same run instead of waiting for the next one. Retried: the sidecar's `transient` code (a network drop, a server error, a file still being written), its `rate_limited` code, and connection-level io errors (reset, aborted, broken pipe, timed out). Everything else is permanent and goes to the next run as before: not found, conflict, auth, disk full, a refused path, and any unknown code. (`classify` in `retry.rs`.)
+
+Each transfer gets at most 4 attempts. The wait before retry n is `min(2^n, 30)` seconds with equal jitter (a random value between half and all of it). A rate limit waits at least the server's `retry_after` (1 s when absent); one above 300 s is not retried in this run. Waits stop at once when the sync is cancelled. Uploads retry inline, in order, because later operations depend on them. Downloads retry in rounds after the pool drains, on the failed jobs only. `OpStarted` and `OpFinished` fire once per file whatever the number of attempts. A circuit breaker stops retrying for the rest of the run once 3 transfers in a row have used up their retries, so a dead network fails fast instead of stalling a long run.
+
+Speed limits (`upload_limit_kbps`, `download_limit_kbps`, KB/s with 1 KB = 1024 bytes, 0 = no limit) are enforced in the sidecar, which owns every byte stream: one token bucket per direction, shared by every transfer of the login session, so one limit caps the whole machine. The client sends them with `transfer.set_limits` before its first transfer, so a change in Settings applies from the next sync. Uploads and downloads have an idle timeout of 900 s rather than a total one: every progress message resets it, and the sidecar sends a keepalive each second while the limiter is holding a transfer, so a throttled large file is never cut off and a stalled network still times out.
+
 ## Config knobs
 
 | Key | Meaning |
@@ -79,3 +87,5 @@ A conflict (changed on both sides since the baseline) is settled by the `conflic
 | `local_delete` | `trash` (recoverable) or `remove` (permanent) for local deletes. |
 | `conflict` | `keep-both` (default), `newer`, or `skip`. |
 | `compare` | `size+mtime` (default), `size`, or `sha1`. |
+| `upload_limit_kbps` | Upload speed limit in KB/s for all transfers together (default 0 = no limit). |
+| `download_limit_kbps` | Download speed limit in KB/s for all transfers together (default 0 = no limit). |

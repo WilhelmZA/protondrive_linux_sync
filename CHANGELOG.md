@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Fixed
+- The release workflow runs git inside its container again. 0.7.0's first build stopped at the source tarball with "dubious ownership"; the workspace is now marked safe right after checkout.
+
+### Documentation
+- `docs/SYNC_MODEL.md` explains in-run retries and speed limits and lists the two new limit keys.
+- `CONTRIBUTING.md` lists the checks CI blocks on and describes the signed release flow.
+- Screenshots of the Conflicts page and of held-back deletions.
+
 ## [0.7.0] - 2026-10-19
 
 ### Added
