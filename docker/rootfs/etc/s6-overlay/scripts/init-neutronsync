@@ -1,0 +1,122 @@
+#!/command/with-contenv bash
+# Prepare /config, secrets, user mapping and the runtime directory.
+set -euo pipefail
+
+PUID="${PUID:-99}"
+PGID="${PGID:-100}"
+UMASK="${UMASK:-002}"
+umask "$UMASK"
+
+CONFIG_ROOT="${NEUTRONSYNC_CONFIG_ROOT:-/config}"
+SECRETS="${CONFIG_ROOT}/secrets"
+STATE="${XDG_STATE_HOME:-${CONFIG_ROOT}/state}"
+WEB_DATA="${NEUTRONSYNC_WEB_DATA:-${CONFIG_ROOT}/web}"
+RUNTIME="${XDG_RUNTIME_DIR:-/run/neutronsync}"
+STARTER="/defaults/neutronsync.toml"
+CONFIG_FILE="${NEUTRONSYNC_CONFIG:-${CONFIG_ROOT}/neutronsync.toml}"
+
+mkdir -p "$CONFIG_ROOT" "$SECRETS" "$STATE" "$WEB_DATA" /data \
+	"${XDG_DATA_HOME:-${CONFIG_ROOT}/data}"
+
+write_secret_token() {
+	local path="$1"
+	if [ -L "$path" ]; then
+		echo "refusing to write secret: ${path} is a symlink" >&2
+		exit 1
+	fi
+	local old
+	old="$(umask)"
+	umask 077
+	python3 -c 'import secrets; open("'"$path"'", "w").write(secrets.token_urlsafe(48)[:48])'
+	umask "$old"
+	chmod 600 "$path"
+}
+
+write_secret_key() {
+	local path="$1"
+	if [ -L "$path" ]; then
+		echo "refusing to write secret: ${path} is a symlink" >&2
+		exit 1
+	fi
+	local old
+	old="$(umask)"
+	umask 077
+	python3 -c 'import base64,os; open("'"$path"'","wb").write(base64.b64encode(os.urandom(32))+b"\n")'
+	umask "$old"
+	chmod 600 "$path"
+}
+
+secure_own() {
+	local path="$1"
+	if [ -L "$path" ]; then
+		echo "refusing to chown/chmod symlink: ${path}" >&2
+		exit 1
+	fi
+	if [ -f "$path" ]; then
+		chmod 600 "$path"
+		chown -h "${PUID}:${PGID}" "$path"
+	fi
+}
+
+# Running as a non-root --user: skip remapping; still seed config and secrets.
+if [ "$(id -u)" -ne 0 ]; then
+	# /run/neutronsync is often not writable without root; keep the socket under /config.
+	if [ ! -w "$(dirname "$RUNTIME")" ] 2>/dev/null || ! mkdir -p "$RUNTIME" 2>/dev/null; then
+		RUNTIME="${CONFIG_ROOT}/runtime"
+		mkdir -p "$RUNTIME"
+		# Tell later services (with-contenv) about the override.
+		if [ -d /run/s6/container_environment ]; then
+			printf '%s' "$RUNTIME" >/run/s6/container_environment/XDG_RUNTIME_DIR
+		fi
+		export XDG_RUNTIME_DIR="$RUNTIME"
+	fi
+	chmod 700 "$RUNTIME" 2>/dev/null || true
+	if [ ! -f "$CONFIG_FILE" ] && [ -f "$STARTER" ]; then
+		cp "$STARTER" "$CONFIG_FILE"
+	fi
+	if [ ! -f "${SECRETS}/api.token" ]; then
+		write_secret_token "${SECRETS}/api.token"
+	fi
+	if [ -z "${NEUTRONSYNC_SESSION_KEY:-}" ] && [ -z "${NEUTRONSYNC_SESSION_KEY_FILE:-}" ]; then
+		if [ ! -f "${SECRETS}/session.key" ]; then
+			write_secret_key "${SECRETS}/session.key"
+		fi
+	fi
+	exit 0
+fi
+
+if ! getent group abc >/dev/null 2>&1; then
+	groupadd -g "$PGID" abc 2>/dev/null || groupadd abc
+fi
+if ! getent passwd abc >/dev/null 2>&1; then
+	useradd -u "$PUID" -g abc -d "$CONFIG_ROOT" -s /usr/sbin/nologin abc 2>/dev/null || \
+		useradd -g abc -d "$CONFIG_ROOT" -s /usr/sbin/nologin abc
+fi
+
+groupmod -o -g "$PGID" abc 2>/dev/null || true
+usermod -o -u "$PUID" -g "$PGID" -d "$CONFIG_ROOT" abc 2>/dev/null || true
+
+mkdir -p "$RUNTIME"
+chmod 700 "$RUNTIME"
+chown "${PUID}:${PGID}" "$RUNTIME"
+
+if [ ! -f "$CONFIG_FILE" ] && [ -f "$STARTER" ]; then
+	cp "$STARTER" "$CONFIG_FILE"
+fi
+
+if [ ! -f "${SECRETS}/api.token" ]; then
+	write_secret_token "${SECRETS}/api.token"
+fi
+
+if [ -z "${NEUTRONSYNC_SESSION_KEY:-}" ] && [ -z "${NEUTRONSYNC_SESSION_KEY_FILE:-}" ]; then
+	if [ ! -f "${SECRETS}/session.key" ]; then
+		write_secret_key "${SECRETS}/session.key"
+	fi
+fi
+
+# Own /config (not /data mounts). Secrets stay mode 0600; never follow symlinks.
+chown -R "${PUID}:${PGID}" "$CONFIG_ROOT"
+secure_own "${SECRETS}/api.token"
+if [ -e "${SECRETS}/session.key" ] || [ -L "${SECRETS}/session.key" ]; then
+	secure_own "${SECRETS}/session.key"
+fi

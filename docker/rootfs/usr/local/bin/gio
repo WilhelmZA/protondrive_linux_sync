@@ -1,0 +1,56 @@
+#!/bin/sh
+# Prefer freedesktop per-volume trash for paths on mounted volumes.
+# Stock /usr/bin/gio often fails with EXDEV when /config and /data are bind
+# mounts on the same block device (common in Docker and on Unraid), then
+# refuses rather than using $mount/.Trash-$UID. This wrapper does that first
+# for `gio trash`, and otherwise hands off to the real binary.
+set -eu
+
+REAL=/usr/bin/gio
+
+if [ "${1:-}" != "trash" ]; then
+	exec "$REAL" "$@"
+fi
+shift
+if [ "${1:-}" = "--" ]; then
+	shift
+fi
+
+uid="$(id -u)"
+now="$(date -u +%Y-%m-%dT%H:%M:%S)"
+
+uri_escape() {
+	printf '%s' "$1" | sed 's/ /%20/g'
+}
+
+for f in "$@"; do
+	[ -e "$f" ] || continue
+	# Resolve only the parent for df; trash the path as given (symlink stays a link).
+	parent="$(dirname -- "$f")"
+	parent_abs="$(readlink -f "$parent" 2>/dev/null || printf '%s' "$parent")"
+	mp="$(df -P "$parent_abs" 2>/dev/null | awk 'NR==2 { print $6 }')"
+	if [ -z "$mp" ] || [ "$mp" = "/" ]; then
+		"$REAL" trash -- "$f" || true
+		continue
+	fi
+	trash="$mp/.Trash-$uid"
+	files="$trash/files"
+	info="$trash/info"
+	mkdir -p "$files" "$info"
+	base="$(basename -- "$f")"
+	dest="$files/$base"
+	infof="$info/${base}.trashinfo"
+	n=1
+	while [ -e "$dest" ] || [ -e "$infof" ]; do
+		dest="$files/${base}.${n}"
+		infof="$info/${base}.${n}.trashinfo"
+		n=$((n + 1))
+	done
+	abs_for_info="$(readlink -f "$f" 2>/dev/null || printf '%s' "$f")"
+	printf '[Trash Info]\nPath=%s\nDeletionDate=%s\n' "$(uri_escape "$abs_for_info")" "$now" >"$infof"
+	if ! mv -- "$f" "$dest"; then
+		rm -f "$infof"
+		"$REAL" trash -- "$f" || true
+		continue
+	fi
+done

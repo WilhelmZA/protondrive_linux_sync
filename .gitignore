@@ -1,5 +1,5 @@
-# Local config with paths / secrets
-neutronsync.toml
+# Local config with paths / secrets (repo root only; docker/neutronsync.toml is tracked)
+/neutronsync.toml
 
 # Rust
 /target/

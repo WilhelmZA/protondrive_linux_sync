@@ -1,0 +1,25 @@
+#!/command/with-contenv bash
+set -euo pipefail
+
+UMASK="${UMASK:-002}"
+umask "$UMASK"
+
+CONFIG_ROOT="${NEUTRONSYNC_CONFIG_ROOT:-/config}"
+export NEUTRONSYNC_API_TOKEN_FILE="${NEUTRONSYNC_API_TOKEN_FILE:-${CONFIG_ROOT}/secrets/api.token}"
+
+if [ -z "${NEUTRONSYNC_WEB_PASSWORD:-}" ] && [ -z "${NEUTRONSYNC_WEB_PASSWORD_FILE:-}" ]; then
+	echo "Set NEUTRONSYNC_WEB_PASSWORD (12 characters or more) before the web interface can start."
+	# Stay down long enough that s6 back-off, not a tight restart loop, applies.
+	sleep 5
+	exit 1
+fi
+
+run_web() {
+	exec neutronsync-web
+}
+
+if [ "$(id -u)" -eq 0 ]; then
+	exec s6-setuidgid abc neutronsync-web
+else
+	run_web
+fi

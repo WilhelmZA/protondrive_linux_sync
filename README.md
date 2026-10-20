@@ -248,6 +248,58 @@ NEUTRONSYNC_API_TOKEN=$(head -c 24 /dev/urandom | base64) \
 
 Listening on anything but loopback needs an API token of at least 32 characters. Only one NeutronSync may sync a state directory at a time, so stop the desktop tray first. Where there is no keyring, set `session_store = "file"` in `[cli]` and give a key; the Proton session is then kept encrypted in the state directory. [`docs/HTTP_API.md`](docs/HTTP_API.md) lists every endpoint.
 
+## Run on Unraid or Docker
+
+The container image runs `neutronsync serve` and the browser interface together. Config, state and the encrypted Proton session live under `/config`; synced folders go under `/data` (add more mounts if you need them). Port 8080 is the web UI; the API stays on loopback inside the container.
+
+### Unraid
+
+Until NeutronSync is listed in Community Applications, add this template repository under **Apps → Settings → Template Repositories**:
+
+```
+https://raw.githubusercontent.com/WilhelmZA/protondrive_linux_sync/rust/packaging/unraid/
+```
+
+Install from the template (`ghcr.io/wilhelmza/neutronsync:latest`). Set **Web Password** (`NEUTRONSYNC_WEB_PASSWORD`, at least 12 characters) before the first start — without it the health check stays unhealthy and the log says so in one line. Defaults map `/config` to `/mnt/user/appdata/neutronsync` and `/data` to `/mnt/user`; narrow `/data` to the shares you sync. See [`packaging/unraid/README.md`](packaging/unraid/README.md).
+
+### Plain Docker
+
+[`docker/compose.example.yml`](docker/compose.example.yml) uses the same settings and reads the web password and session key from Docker secrets (`*_FILE` variables). Build locally with:
+
+```sh
+docker build -f docker/Dockerfile -t neutronsync:dev .
+```
+
+### First-start password and where things live
+
+| Path | Purpose |
+| --- | --- |
+| `/config/neutronsync.toml` | Starter config on first start (no pairs; `auto_sync`, trash deletes, 6-hour full walk) |
+| `/config/secrets/api.token` | API bearer token shared by serve and the web UI (created on first start, mode 0600) |
+| `/config/secrets/session.key` | Encryption key for the Proton session file (created on first start unless you pass one) |
+| `/config/state/neutronsync/` | Sync state, `serve.lock`, and `session.enc` when signed in |
+| `/config/web/` | Web login data |
+
+### Session key trade-off
+
+A key stored next to the session under `/config` protects a copied `session.enc` alone, but not a copy of the whole `/config` folder. Pass `NEUTRONSYNC_SESSION_KEY` (or `NEUTRONSYNC_SESSION_KEY_FILE` / a Docker secret) to keep the key apart from appdata.
+
+### Unraid inotify and the 6-hour full walk
+
+`/mnt/user` is the `shfs` FUSE union. Changes through `/mnt/user` (SMB, other containers) raise inotify events; writes straight to `/mnt/diskN` or `/mnt/cache` do not. The starter config sets `full_walk_interval = 21600` (six hours) so the safety-net full walk catches those.
+
+### Where deleted files go
+
+With `local_delete = "trash"` (the default), a local file removed because it was deleted on Proton Drive lands in that mount's `.Trash-<uid>/files/` folder (freedesktop per-volume trash). The image wraps `gio trash` so that still works when `/config` and `/data` are bind mounts on the same disk (stock `gio` often fails with EXDEV there). It stays on the share. `XDG_DATA_HOME` points at `/config/data`, so the manual trash fallback never writes into the container's writable layer.
+
+### Behind a reverse proxy
+
+Set `NEUTRONSYNC_WEB_AUTH=proxy` and terminate TLS/login at Traefik or Caddy. In proxy mode remove the published `8080` port (or bind it to `127.0.0.1`) so the UI is not reachable on the LAN without the proxy's login — the compose example notes the same. In password mode (the default), keep port 8080 off the public internet or put it behind your own auth.
+
+### How updates arrive
+
+Every release tag builds and signs `ghcr.io/wilhelmza/neutronsync:<version>` and `:edge`. Promoting a release to stable moves `:latest` to that version. Unraid follows `latest`, so it picks up promoted releases only.
+
 ## Updates
 
 Releases come from GitHub. Every tag ships as a pre-release; a stable release is one that has been promoted after the build has proven itself, and its title says `(stable)`. The newest promoted release is the one GitHub marks "Latest". Point the updater at the `stable` or `prerelease` channel in Settings (or `update_channel` in the config): `stable` offers only promoted releases, `prerelease` offers every build as it lands. Checking never installs anything. When an update is available, "Download and install" verifies the download against the release's signed checksum list (every release from 0.7.0 on) and the checksum GitHub publishes, then installs it through your package manager (one `pkexec` prompt) and offers to restart. A download that fails either check is discarded. `neutronsync --version` and the About page show the commit a build was made from, so a bug report can name it.

@@ -96,6 +96,64 @@ jobs:
           uv run ruff format --check
           uv run pytest
 
+  image:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@6524bf65af31da8d45b59e8c27de4bd072b392f5 # v3.8.0
+
+      - name: Build the image (never push)
+        uses: docker/build-push-action@471d1dc4e07e5cdedd4c2171150001c434f0b7a4 # v6.15.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: neutronsync:ci
+          build-args: |
+            NEUTRONSYNC_BUILD_SHA=${{ github.sha }}
+
+      - name: Run until healthy
+        run: |
+          set -euo pipefail
+          cfg="$(mktemp -d)"
+          data="$(mktemp -d)"
+          cid=""
+          cleanup() {
+            if [ -n "$cid" ]; then docker rm -f "$cid" >/dev/null 2>&1 || true; fi
+            rm -rf "$cfg" "$data"
+          }
+          trap cleanup EXIT
+          cid="$(docker run -d \
+            --name "neutronsync-ci-$$" \
+            -e NEUTRONSYNC_WEB_PASSWORD='ci-test-password-xx' \
+            -e PUID="$(id -u)" \
+            -e PGID="$(id -g)" \
+            -v "$cfg:/config" \
+            -v "$data:/data" \
+            -p 127.0.0.1::8080 \
+            neutronsync:ci)"
+          deadline=$((SECONDS + 120))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            status="$(docker inspect -f '{{.State.Health.Status}}' "$cid" 2>/dev/null || echo starting)"
+            if [ "$status" = "healthy" ]; then
+              echo "healthy"
+              exit 0
+            fi
+            if [ "$status" = "unhealthy" ]; then
+              docker logs "$cid" || true
+            fi
+            sleep 3
+          done
+          echo "timed out waiting for healthy" >&2
+          docker logs "$cid" || true
+          docker inspect "$cid" || true
+          exit 1
+
   # Advisories, licences, bans and sources from deny.toml. Its own job so a new
   # advisory does not hide a test failure, and the only job on the weekly run.
   deny:

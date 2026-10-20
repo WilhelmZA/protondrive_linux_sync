@@ -1,0 +1,14 @@
+# Starter config for the NeutronSync container. Copied to
+# /config/neutronsync.toml on first start only. Add [[pair]] entries in the
+# web UI or edit this file.
+
+[cli]
+session_store = "file"
+
+[options]
+auto_sync = true
+propagate_deletes = true
+local_delete = "trash"
+# 6 hours: on Unraid, inotify misses writes that bypass /mnt/user (direct
+# /mnt/diskN or /mnt/cache). The safety-net full walk is what catches those.
+full_walk_interval = 21600

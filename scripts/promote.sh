@@ -61,4 +61,5 @@ else
 	echo "$tag is stable and now carries the \"Latest\" badge."
 	echo
 	echo "The updater's stable channel starts offering it immediately."
+	echo "The Docker image tag latest moves to this version in a few minutes."
 fi

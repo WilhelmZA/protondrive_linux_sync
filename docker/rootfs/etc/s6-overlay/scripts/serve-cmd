@@ -1,0 +1,30 @@
+#!/command/with-contenv bash
+# Invoked as the service user. Builds the neutronsync serve command line.
+set -euo pipefail
+
+UMASK="${UMASK:-002}"
+umask "$UMASK"
+
+CONFIG_ROOT="${NEUTRONSYNC_CONFIG_ROOT:-/config}"
+TOKEN_FILE="${NEUTRONSYNC_API_TOKEN_FILE:-${CONFIG_ROOT}/secrets/api.token}"
+LISTEN="${NEUTRONSYNC_API_LISTEN:-127.0.0.1:8090}"
+
+if [ -n "${NEUTRONSYNC_API_LISTEN:-}" ] && [ ! -f "$TOKEN_FILE" ]; then
+	echo "NEUTRONSYNC_API_LISTEN is set but ${TOKEN_FILE} is missing; refuse to start serve."
+	exit 1
+fi
+
+if [ -z "${NEUTRONSYNC_SESSION_KEY:-}" ] && [ -z "${NEUTRONSYNC_SESSION_KEY_FILE:-}" ]; then
+	export NEUTRONSYNC_SESSION_KEY_FILE="${CONFIG_ROOT}/secrets/session.key"
+fi
+
+args=(serve --listen "$LISTEN" --token-file "$TOKEN_FILE" --local-root /data)
+if [ -n "${NEUTRONSYNC_LOCAL_ROOTS:-}" ]; then
+	IFS=':' read -r -a extra <<<"${NEUTRONSYNC_LOCAL_ROOTS}"
+	for r in "${extra[@]}"; do
+		[ -n "$r" ] || continue
+		args+=(--local-root "$r")
+	done
+fi
+
+exec neutronsync "${args[@]}"

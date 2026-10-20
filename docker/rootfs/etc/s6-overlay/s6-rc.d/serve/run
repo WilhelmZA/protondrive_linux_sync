@@ -1,0 +1,7 @@
+#!/command/with-contenv bash
+set -euo pipefail
+
+if [ "$(id -u)" -eq 0 ]; then
+	exec s6-setuidgid abc /etc/s6-overlay/scripts/serve-cmd
+fi
+exec /etc/s6-overlay/scripts/serve-cmd

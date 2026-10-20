@@ -1,0 +1,40 @@
+# Plain Docker Compose example for NeutronSync.
+# Copy to compose.yml, set the secrets, then: docker compose up -d
+#
+# Behind Traefik or Caddy, set NEUTRONSYNC_WEB_AUTH=proxy and let the reverse
+# proxy handle login. In proxy mode also remove the ports: mapping below (or
+# bind it to 127.0.0.1) so the web UI is not open on the LAN without a login.
+# Leave NEUTRONSYNC_WEB_AUTH unset (password mode) when exposing the web UI
+# directly.
+
+services:
+  neutronsync:
+    image: ghcr.io/wilhelmza/neutronsync:latest
+    container_name: neutronsync
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      PUID: "99"
+      PGID: "100"
+      UMASK: "002"
+      TZ: UTC
+      NEUTRONSYNC_WEB_PASSWORD_FILE: /run/secrets/web_password
+      NEUTRONSYNC_SESSION_KEY_FILE: /run/secrets/session_key
+      # NEUTRONSYNC_WEB_AUTH: proxy
+    volumes:
+      - neutronsync-config:/config
+      - /path/to/synced/data:/data
+    secrets:
+      - web_password
+      - session_key
+    # healthcheck is built into the image
+
+secrets:
+  web_password:
+    file: ./secrets/web_password.txt
+  session_key:
+    file: ./secrets/session_key.txt
+
+volumes:
+  neutronsync-config:

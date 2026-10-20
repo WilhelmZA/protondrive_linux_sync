@@ -1,0 +1,27 @@
+.git
+.github
+.target
+target
+Plans
+reference
+docs/screenshots
+**/node_modules
+sidecar/node_modules
+sidecar/dist
+web/.venv
+web/.nicegui
+web/**/__pycache__
+web/.pytest_cache
+**/*.egg-info
+**/.pytest_cache
+**/__pycache__
+*.log
+logs
+.serena
+.vscode
+.idea
+*.swp
+.DS_Store
+# Repo-root local config only; docker/neutronsync.toml must stay in the build context.
+/neutronsync.toml
+docker/test-scratch

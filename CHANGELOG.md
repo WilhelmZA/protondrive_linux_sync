@@ -5,9 +5,13 @@ All notable changes to this project are documented here. The format follows [Kee
 ## [Unreleased]
 
 ### Added
+- A Docker image (`docker/Dockerfile`) that runs `neutronsync serve` and the browser interface under s6-overlay, with Unraid-style `PUID`/`PGID`, a persistent `/config`, encrypted file session store, and a health check on the web UI. Release tags publish `ghcr.io/wilhelmza/neutronsync:<version>` and `:edge` (signed with cosign); promoting a release moves `:latest`. An Unraid Community Applications template lives under `packaging/unraid/`. See the README section "Run on Unraid or Docker".
 - A browser interface under `web/`. It talks only to `neutronsync serve` and covers the same ground as the desktop window: live sync progress, held deletions and conflicts, folders and settings, and Proton sign-in (including two-factor, mailbox password and human verification). It runs as `neutronsync-web` and is meant for a phone as well as a desktop browser. See `web/README.md`.
 - A headless server, `neutronsync serve`. It runs the sync engine without a desktop and offers everything the window can do over an HTTP API under `/api/v1`: the live state, syncing and cancelling, auto sync, held-back deletions, conflicts, settings, synced folders, signing in and out, browsing Proton Drive and local folders, and the log. Changes arrive as a live event stream. It listens on `127.0.0.1:8090` by default; any other address needs an API token of at least 32 characters, and a token, once set, is needed on every request except the health check. Requests from web pages are refused, so a site open in your browser cannot drive a server that has no token. It refuses to start while the desktop tray or another server syncs the same state. Settings and folder changes are checked by the same rules as the config file before anything is saved, and removing a folder never deletes a file. See `docs/HTTP_API.md`. The release packages include it.
 - The Proton session can be kept in an encrypted file instead of the desktop keyring, for a container or a server without one. Set `session_store = "file"` in `[cli]` and give a 32-byte key in `session_key_file` or `NEUTRONSYNC_SESSION_KEY`. The file is `session.enc` in the state directory, readable only by you. With a wrong key the sign-in service does not start and the file is left as it was, so a typo cannot cost you the session.
+
+### Security
+- The Docker image installs pending Debian security updates on top of its base image, so fixes such as perl-base and libpcre2 ship without waiting for a new base image.
 
 ### Fixed
 - The release workflow runs git inside its container again. 0.7.0's first build stopped at the source tarball with "dubious ownership"; the workspace is now marked safe right after checkout.

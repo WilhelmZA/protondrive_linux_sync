@@ -1,0 +1,68 @@
+name: Image promote
+
+# Moves ghcr.io/wilhelmza/neutronsync:latest to the promoted release's digest.
+# Fires when scripts/promote.sh publishes a release as stable (release type
+# "released"). Pre-release version numbers (those with a "-") are skipped.
+# Because :latest points at the already signed digest, it needs no new signature.
+
+on:
+  release:
+    types: [released]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide whether latest moves
+        id: gate
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          ver="${TAG#v}"
+          case "$ver" in
+            *-*)
+              echo "::notice::${TAG} is a pre-release version; leaving :latest alone."
+              echo "go=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+          echo "go=true" >> "$GITHUB_OUTPUT"
+          echo "ver=${ver}" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        if: steps.gate.outputs.go == 'true'
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+
+      - name: Set up Docker Buildx
+        if: steps.gate.outputs.go == 'true'
+        uses: docker/setup-buildx-action@6524bf65af31da8d45b59e8c27de4bd072b392f5 # v3.8.0
+
+      - name: Log in to ghcr.io
+        if: steps.gate.outputs.go == 'true'
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify the version tag signature and point latest at it
+        if: steps.gate.outputs.go == 'true'
+        env:
+          VER: ${{ steps.gate.outputs.ver }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/wilhelmza/neutronsync"
+          echo "Verifying cosign signature for ${image}:${VER}"
+          cosign verify \
+            --certificate-identity-regexp "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${image}:${VER}"
+          echo "Pointing ${image}:latest at ${image}:${VER}"
+          docker buildx imagetools create \
+            -t "${image}:latest" \
+            "${image}:${VER}"
