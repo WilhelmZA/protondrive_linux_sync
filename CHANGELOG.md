@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-20
+
 ### Added
 - A Docker image (`docker/Dockerfile`) that runs `neutronsync serve` and the browser interface under s6-overlay, with Unraid-style `PUID`/`PGID`, a persistent `/config`, encrypted file session store, and a health check on the web UI. Release tags publish `ghcr.io/wilhelmza/neutronsync:<version>` and `:edge` (signed with cosign); promoting a release moves `:latest`. An Unraid Community Applications template lives under `packaging/unraid/`. See the README section "Run on Unraid or Docker".
 - A browser interface under `web/`. It talks only to `neutronsync serve` and covers the same ground as the desktop window: live sync progress, held deletions and conflicts, folders and settings, and Proton sign-in (including two-factor, mailbox password and human verification). It runs as `neutronsync-web` and is meant for a phone as well as a desktop browser. See `web/README.md`.
