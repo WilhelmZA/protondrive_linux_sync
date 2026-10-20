@@ -28,6 +28,10 @@ The pictures use example folders and files. See [`docs/screenshots.md`](docs/scr
 | --- | --- |
 | [![Account page: the signed-in Proton account, where the session is stored and the helper in use](docs/screenshots/account.png)](docs/screenshots/account.png) | [![Sign-in page: a centred card with username and password fields](docs/screenshots/sign-in.png)](docs/screenshots/sign-in.png) |
 
+| Web interface: Activity | Web interface: Folders |
+| --- | --- |
+| [![Web Activity page: a sidebar, the sync buttons and deletions held back in one folder](docs/screenshots/web-held.png)](docs/screenshots/web-held.png) | [![Web Folders page: a folder pair with its local and Proton paths](docs/screenshots/web-folders.png)](docs/screenshots/web-folders.png) |
+
 ## Features
 
 - **Proton Drive SDK sidecar.** The packaged `neutronsync-drive` helper talks to Proton through the official Drive SDK. You sign in inside NeutronSync; the session lives in your system keyring.
@@ -299,6 +303,8 @@ Set `NEUTRONSYNC_WEB_AUTH=proxy` and terminate TLS/login at Traefik or Caddy. In
 ### How updates arrive
 
 Every release tag builds and signs `ghcr.io/wilhelmza/neutronsync:<version>` and `:edge`. Promoting a release to stable moves `:latest` to that version. Unraid follows `latest`, so it picks up promoted releases only.
+
+The image is new in 0.8.0, which ships as a pre-release, so `:latest` does not exist until a release with the image is promoted. Until then, set the Unraid **Repository** field (or the compose `image:`) to `ghcr.io/wilhelmza/neutronsync:edge` to follow every release, or to `:0.8.0` to stay on one.
 
 ## Updates
 

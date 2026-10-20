@@ -64,6 +64,38 @@ The session is saved but the system keyring is locked, for example right after l
 
 ![Keyring locked page](screenshots/keyring-locked.png)
 
+## Web interface
+
+The browser interface for the Docker image and other headless installs. It has the same pages as the desktop window, with a sidebar on a wide screen and a menu button on a phone. These were captured from a scratch `neutronsync serve` with example folders.
+
+The Activity page with a sync button, a dry run and the recent feed:
+
+![Web Activity page](screenshots/web-activity.png)
+
+Deletions held back by the safety limits, with Restore and Delete:
+
+![Web Activity page with held-back deletions](screenshots/web-held.png)
+
+Folder pairs. Add folder opens a picker for local folders and Proton Drive folders, with breadcrumbs and a spinner while a folder loads:
+
+![Web Folders page](screenshots/web-folders.png)
+
+![Web Conflicts page](screenshots/web-conflicts.png)
+
+![Web Settings page](screenshots/web-settings.png)
+
+Proton sign-in, including the two-factor step:
+
+![Web Account page](screenshots/web-account.png)
+
+![Web Account page asking for a two-factor code](screenshots/web-account-2fa.png)
+
+The light theme, and the layout on a phone:
+
+![Web Activity page in the light theme](screenshots/web-activity-light.png)
+
+![Web Activity page on a phone](screenshots/web-activity-phone.png)
+
 ## Regenerating
 
 ```sh
@@ -72,3 +104,9 @@ scripts/screenshots.sh --no-build # reuse target/release/neutronsync-gui
 ```
 
 The script runs `neutronsync-gui --screenshots <dir>` under `xvfb-run` with `HOME` and the XDG directories pointed at a scratch folder, so it never reads your config, your state or your running sidecar. The scenes and example data live in `src/bin/gui.rs` next to `demo_scenes()`.
+
+The web pictures come from `web/scripts/screenshots.py`. It needs `target/debug/neutronsync` built with `--features serve` and Chromium for Playwright:
+
+```sh
+cd web && uv run python scripts/screenshots.py
+```

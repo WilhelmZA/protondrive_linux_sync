@@ -163,6 +163,25 @@ awk -v v="$ver" '
 grep -q "^version = \"$ver\"$" Cargo.lock ||
 	die "failed to update Cargo.lock; check it by hand"
 
+# One version for everything: the web interface carries it in three places.
+awk -v v="$ver" '
+	/^\[/                        { in_proj = ($0 == "[project]") }
+	in_proj && /^version *= *"/  { sub(/"[^"]*"/, "\"" v "\"") }
+	{ print }
+' web/pyproject.toml >web/pyproject.toml.new && mv web/pyproject.toml.new web/pyproject.toml
+
+awk -v v="$ver" '
+	/^name = "neutronsync-web"$/ { hit = 1; print; next }
+	hit && /^version = "/        { print "version = \"" v "\""; hit = 0; next }
+	{ print }
+' web/uv.lock >web/uv.lock.new && mv web/uv.lock.new web/uv.lock
+
+sed -i "s/^__version__ = \".*\"$/__version__ = \"$ver\"/" web/src/neutronsync_web/__init__.py
+
+grep -q "^__version__ = \"$ver\"$" web/src/neutronsync_web/__init__.py &&
+	grep -q "^version = \"$ver\"$" web/pyproject.toml ||
+	die "failed to update the web version; check it by hand"
+
 # ---------------------------------------------------------------- changelog
 
 awk -v v="$ver" -v d="$today" '
@@ -187,7 +206,7 @@ else
 fi
 printf '%s\n' "$notes" >>"$msg"
 
-git add -A -- Cargo.toml Cargo.lock CHANGELOG.md
+git add -A -- Cargo.toml Cargo.lock CHANGELOG.md web/pyproject.toml web/uv.lock web/src/neutronsync_web/__init__.py
 
 if [ -n "$subject" ]; then
 	git commit -q -F "$msg"

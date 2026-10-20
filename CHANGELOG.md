@@ -11,15 +11,19 @@ All notable changes to this project are documented here. The format follows [Kee
 - The Proton session can be kept in an encrypted file instead of the desktop keyring, for a container or a server without one. Set `session_store = "file"` in `[cli]` and give a 32-byte key in `session_key_file` or `NEUTRONSYNC_SESSION_KEY`. The file is `session.enc` in the state directory, readable only by you. With a wrong key the sign-in service does not start and the file is left as it was, so a typo cannot cost you the session.
 
 ### Security
+- A Security workflow scans the source tree and the Docker image with Trivy on every push and weekly, uploads the results to GitHub code scanning, and fails on a HIGH or CRITICAL finding that has a fix. The release workflow scans the image the same way and does not push an image that fails.
 - The Docker image installs pending Debian security updates on top of its base image, so fixes such as perl-base and libpcre2 ship without waiting for a new base image.
 
 ### Fixed
+- A serve API test that waited at most five seconds between state events no longer fails on a loaded machine.
 - The release workflow runs git inside its container again. 0.7.0's first build stopped at the source tarball with "dubious ownership"; the workspace is now marked safe right after checkout.
 
 ### Documentation
 - `docs/SYNC_MODEL.md` explains in-run retries and speed limits and lists the two new limit keys.
 - `CONTRIBUTING.md` lists the checks CI blocks on and describes the signed release flow.
 - Screenshots of the Conflicts page and of held-back deletions.
+- Screenshots of every page of the web interface, in `docs/screenshots.md` and the README.
+- The README and the Unraid notes say to use the `edge` or a version tag until a release with the image is promoted to stable, because `latest` does not exist before that.
 
 ## [0.7.0] - 2026-10-19
 

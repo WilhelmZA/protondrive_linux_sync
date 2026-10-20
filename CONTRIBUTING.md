@@ -33,6 +33,8 @@ cargo deny check                  # advisories, licences, bans, sources (deny.to
 
 `cargo deny` also runs weekly, so a new advisory can turn a quiet branch red. Fix it by upgrading the crate; add an `ignore` to `deny.toml` only with a reason.
 
+The Security workflow scans the source tree and the Docker image with Trivy on every push and weekly, and uploads the results to code scanning. It fails on a HIGH or CRITICAL finding that has a fix available. The release workflow runs the same image check before it pushes an image. `scripts/install-trivy.sh` installs the pinned Trivy version for a local run. Accept a finding in `.trivyignore.yaml` only with a reason.
+
 GUI build needs system libs (Debian/Ubuntu):
 
 ```sh

@@ -40,3 +40,5 @@ With `local_delete = "trash"` (the default), a local file removed because it was
 ## Updates
 
 Unraid follows the `latest` tag. That tag moves when a release is promoted to stable (`scripts/promote.sh`), not when a pre-release is published.
+
+The image first ships with 0.8.0, a pre-release, so `latest` does not exist yet. Change **Repository** to `ghcr.io/wilhelmza/neutronsync:edge` (every release) or `ghcr.io/wilhelmza/neutronsync:0.8.0` (one version) until a release with the image is promoted.
