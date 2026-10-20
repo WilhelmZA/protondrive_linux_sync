@@ -1,0 +1,50 @@
+[project]
+name = "neutronsync-web"
+version = "0.7.0"
+description = "Browser interface for NeutronSync"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "nicegui==3.18.0",
+    "httpx==0.28.1",
+    "httpx-sse==0.4.3",
+]
+
+[project.scripts]
+neutronsync-web = "neutronsync_web.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/neutronsync_web"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.14.0",
+    "pytest>=8.4.0",
+    "pytest-asyncio>=1.2.0",
+    "playwright>=1.55.0",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.pytest.ini_options]
+# strict: only @pytest.mark.asyncio tests get a loop. auto left a running loop
+# that blocked Playwright's sync API in e2e fixtures (R3-001 / pass-02).
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = [
+    "e2e: end-to-end tests that need neutronsync serve and Chromium",
+    "asyncio: async tests (pytest-asyncio)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "W"]

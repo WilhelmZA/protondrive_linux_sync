@@ -78,6 +78,24 @@ jobs:
             target/debug/neutronsync-gui \
             sidecar/dist/neutronsync-drive || true
 
+  web:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync, lint and test
+        run: |
+          uv sync --locked
+          uv run ruff check
+          uv run ruff format --check
+          uv run pytest
+
   # Advisories, licences, bans and sources from deny.toml. Its own job so a new
   # advisory does not hide a test failure, and the only job on the weekly run.
   deny:

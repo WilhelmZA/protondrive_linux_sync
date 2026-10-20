@@ -146,6 +146,10 @@ neutronsync watch                       # live sync: FS events + periodic rescan
 
 `login` prompts for username, password and any required TOTP or mailbox password. Human verification offers a browser link and waits for confirmation before retrying. `init` writes an empty config; add your own `[[pair]]` entries. `status` reports the account through `auth.status`. `doctor [REMOTE_PATH]` probes the selected backend. `logout` signs out through that backend. `sync` takes `--dry-run`, `--resync` and `--json`; passing pair names syncs only those.
 
+### Web interface
+
+A browser UI in [`web/`](web/) drives the same engine through `neutronsync serve`. It covers Activity, Folders, Conflicts, Settings, Account and About, including Proton sign-in. See [`web/README.md`](web/README.md) for environment variables and how to run it next to the server.
+
 ## How it works
 
 For each folder pair, NeutronSync keeps a baseline snapshot of the last state the two sides agreed on. On every run it scans the current local and remote trees and classifies each path against the baseline (created, modified, or deleted) independently per side. Combining the two verdicts decides the action and which side wins.

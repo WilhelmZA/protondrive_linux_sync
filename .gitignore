@@ -20,3 +20,10 @@ logs/
 # Standalone Phase 0 sidecar
 /sidecar/node_modules/
 /sidecar/dist/
+
+# Web interface
+/web/.venv/
+/web/.nicegui/
+/web/**/__pycache__/
+/web/.pytest_cache/
+/web/*.egg-info/
