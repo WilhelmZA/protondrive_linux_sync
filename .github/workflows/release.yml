@@ -109,8 +109,8 @@ jobs:
       - name: Record the commit being built
         run: echo "NEUTRONSYNC_BUILD_SHA=${GITHUB_SHA:0:12}" >> "$GITHUB_ENV"
 
-      - name: Build release binaries (CLI + GUI)
-        run: cargo build --release --features gui --bins
+      - name: Build release binaries (CLI with serve + GUI)
+        run: cargo build --release --features gui,serve --bins
 
       - name: Strip binaries
         run: strip target/release/neutronsync target/release/neutronsync-gui || true

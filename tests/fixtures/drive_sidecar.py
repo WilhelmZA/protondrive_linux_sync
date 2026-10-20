@@ -141,6 +141,8 @@ def mutable(request):
                 raise Failure('not_found')
             result = dict(path='/'.join(['/my-files', *reversed(parts)]))
         elif method == 'node.walk':
+            # `walk_delay` holds a scan open so a test can watch it run.
+            time.sleep(controls.get('walk_delay', 0))
             queue = [(p['uid'], '')]
             failed = []
             while queue:
@@ -240,6 +242,15 @@ def mutable(request):
         send(dict(id=rid, error=dict(code=-32000, message='scripted', data=dict(code=str(e), retry_after=controls.get('retry_after', 0)))))
 
 
+def finish_sign_in(reply):
+    """A finished sign-in: auth.status reports signed in again after a logout."""
+    controls = read_json("controls.json", {})
+    if controls.get("signed_in") is False:
+        controls["signed_in"] = True
+        (home / "controls.json").write_text(json.dumps(controls))
+    return reply
+
+
 def scripted_auth(method, params):
     """Scripted auth.* replies for GUI screenshots and sign-in tests.
 
@@ -264,16 +275,19 @@ def scripted_auth(method, params):
             raise Failure("auth")
         if script == "mailbox" or code == "mailbox":
             return dict(need_mailbox_password=True)
-        return dict(ok=True)
+        return finish_sign_in(dict(ok=True))
     if method == "auth.submit_mailbox_password":
         if params.get("password") == "bad":
             raise Failure("auth")
-        return dict(ok=True)
+        return finish_sign_in(dict(ok=True))
     if method == "auth.login":
         # Env script wins so GUI screenshot runs can force a step regardless of typed username.
         user = script or params.get("username") or "ok"
         if user in ("error", "bad"):
             raise Failure("auth")
+        # A retry with the verification token completes the human check.
+        if params.get("hv_token"):
+            return finish_sign_in(dict(ok=True))
         if user in ("totp", "need_2fa"):
             return dict(need_2fa=True)
         if user in ("mailbox", "need_mailbox_password"):
@@ -285,9 +299,7 @@ def scripted_auth(method, params):
                 methods=["captcha"],
                 url="https://verify.proton.me/?methods=captcha&token=hv-token",
             )
-        if user in ("ok", "normal", "signed_out") or params.get("hv_token"):
-            return dict(ok=True)
-        return dict(ok=True)
+        return finish_sign_in(dict(ok=True))
     raise Failure("fatal")
 
 

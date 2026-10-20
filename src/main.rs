@@ -120,6 +120,22 @@ enum Cmd {
         /// Pair name(s) to watch (default: all).
         pair: Vec<String>,
     },
+    /// Run the sync engine without a desktop and expose it over HTTP
+    /// (/api/v1, with live updates as server-sent events).
+    #[cfg(feature = "serve")]
+    Serve {
+        /// Address and port to listen on. Anything but loopback needs a token.
+        #[arg(long, default_value = "127.0.0.1:8090")]
+        listen: String,
+        /// File holding the API token (else NEUTRONSYNC_API_TOKEN). At least
+        /// 32 characters; required on every request except /api/v1/health.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        /// Folder the API may browse and add synced folders under. Repeat for
+        /// several. Without it, the home directory.
+        #[arg(long = "local-root")]
+        local_root: Vec<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -148,6 +164,17 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
             json,
         } => cmd_sync(cli, pair, *dry_run, *resync, *allow_mass_delete, *json),
         Cmd::Watch { pair } => cmd_watch(cli, pair),
+        #[cfg(feature = "serve")]
+        Cmd::Serve {
+            listen,
+            token_file,
+            local_root,
+        } => neutronsync::server::run(neutronsync::server::ServeOptions {
+            config: cli.config.clone(),
+            listen: listen.clone(),
+            token_file: token_file.clone(),
+            local_roots: local_root.clone(),
+        }),
     }
 }
 

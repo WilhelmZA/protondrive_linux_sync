@@ -1,5 +1,7 @@
 //! Core data types shared across the engine.
 
+use serde::Serialize;
+
 /// A single node (file or directory) at a path relative to a pair root.
 ///
 /// `path` is always POSIX-style and relative (no leading slash). Directories
@@ -114,8 +116,10 @@ impl Action {
     }
 }
 
-/// How the engine settled a file that changed on both sides.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// How the engine settled a file that changed on both sides. Serialises as
+/// `kept_both`, `kept_local`, `kept_remote` or `skipped` (the HTTP API).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConflictOutcome {
     /// Both versions kept; the local one renamed to a "(conflict …)" copy.
     KeptBoth,

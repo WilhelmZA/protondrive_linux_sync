@@ -7,6 +7,11 @@ const safeMessages = new Set([
   'Session storage unavailable', 'Event polling failed', 'Folder listing failed',
   'My-files event scope follows in events.batch',
   'Download signature issue accepted after digest verification',
+  'Session file store needs a 32-byte key (NEUTRONSYNC_SESSION_KEY or NEUTRONSYNC_SESSION_KEY_FILE).',
+  'Session file store needs NEUTRONSYNC_SESSION_FILE.',
+  'Unknown session store (NEUTRONSYNC_SESSION_STORE must be keyring or file).',
+  'The saved session cannot be decrypted: wrong key or damaged file.',
+  'Session file permissions tightened to 0600',
 ]);
 
 // NEUTRONSYNC_DRIVE_DEBUG=1 (local, opt-in): show the first 200 characters of string messages.

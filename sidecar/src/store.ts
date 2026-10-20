@@ -1,5 +1,8 @@
 import { Fault } from './errors';
 import legacySession from '../legacy-session.json';
+import { chmodSync, closeSync, constants, fsyncSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { basename, dirname, join } from 'node:path';
 
 export interface Session {
   uid: string;
@@ -124,4 +127,130 @@ export class SecretServiceStore implements SessionStore {
     const { status } = await this.run(['clear', ...this.attributes]);
     if (status !== 0 && status !== 1) throw new Fault('fatal');
   }
+}
+
+// ---- encrypted session file ------------------------------------------------
+
+export const sessionKeyMessage = 'Session file store needs a 32-byte key (NEUTRONSYNC_SESSION_KEY or NEUTRONSYNC_SESSION_KEY_FILE).';
+export const sessionFileMessage = 'Session file store needs NEUTRONSYNC_SESSION_FILE.';
+export const sessionStoreMessage = 'Unknown session store (NEUTRONSYNC_SESSION_STORE must be keyring or file).';
+export const undecryptableMessage = 'The saved session cannot be decrypted: wrong key or damaged file.';
+export const tightenedMessage = 'Session file permissions tightened to 0600';
+const additionalData = new TextEncoder().encode('neutronsync-session-v1');
+
+/** The session key is missing, unreadable or not 32 bytes. */
+export class SessionKeyError extends Error {
+  constructor() { super(sessionKeyMessage); }
+}
+
+/** 64 hex characters or base64 of exactly 32 bytes; surrounding whitespace ignored. */
+export function parseSessionKey(text: string): Uint8Array {
+  const value = text.trim();
+  let bytes: Uint8Array | null = null;
+  if (/^[0-9a-fA-F]{64}$/.test(value)) bytes = new Uint8Array(Buffer.from(value, 'hex'));
+  else if (/^[A-Za-z0-9+/]+={0,2}$/.test(value) && value.length % 4 === 0) bytes = new Uint8Array(Buffer.from(value, 'base64'));
+  if (!bytes || bytes.length !== 32) throw new SessionKeyError();
+  return bytes;
+}
+
+/** The key from NEUTRONSYNC_SESSION_KEY, else from the file NEUTRONSYNC_SESSION_KEY_FILE names. */
+export function sessionKeyFromEnv(env: Record<string, string | undefined>): Uint8Array {
+  if (env.NEUTRONSYNC_SESSION_KEY) return parseSessionKey(env.NEUTRONSYNC_SESSION_KEY);
+  const file = env.NEUTRONSYNC_SESSION_KEY_FILE;
+  if (!file) throw new SessionKeyError();
+  let text: string;
+  try { text = readFileSync(file, 'utf8'); } catch { throw new SessionKeyError(); }
+  return parseSessionKey(text);
+}
+
+const toBase64 = (bytes: Uint8Array) => Buffer.from(bytes).toString('base64');
+const fromBase64 = (text: unknown) => {
+  if (typeof text !== 'string' || !/^[A-Za-z0-9+/]*={0,2}$/.test(text)) throw new Error();
+  return new Uint8Array(Buffer.from(text, 'base64'));
+};
+
+/**
+ * The session in one file, AES-256-GCM through Web Crypto: `{"v":1,"iv","ct"}`
+ * with a fresh random IV on every save and `neutronsync-session-v1` as
+ * additional data. For machines with no Secret Service (a container). A file
+ * that does not decrypt is never overwritten or removed here: only `clear()`
+ * (an explicit sign-out) deletes it, so a mistyped key cannot destroy a good
+ * session.
+ */
+export class FileSessionStore implements SessionStore {
+  private key: Promise<CryptoKey>;
+  constructor(private path: string, rawKey: Uint8Array, private note: (message: string) => void = () => {}) {
+    if (rawKey.length !== 32) throw new SessionKeyError();
+    this.key = crypto.subtle.importKey('raw', new Uint8Array(rawKey), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+  }
+
+  async isLocked() { return false; }
+
+  async load(): Promise<Session | null> {
+    let mode: number;
+    try { mode = statSync(this.path).mode; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw new Fault('fatal');
+    }
+    if (mode & 0o077) {
+      try { chmodSync(this.path, 0o600); this.note(tightenedMessage); }
+      catch { throw new Fault('fatal'); }
+    }
+    let text: string;
+    try { text = readFileSync(this.path, 'utf8'); } catch { throw new Fault('fatal'); }
+    let plain: string;
+    try {
+      const file = JSON.parse(text);
+      if (file?.v !== 1) throw new Error();
+      const iv = fromBase64(file.iv);
+      if (iv.length !== 12) throw new Error();
+      const bytes = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData }, await this.key, fromBase64(file.ct));
+      plain = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    } catch {
+      this.note(undecryptableMessage);
+      throw new Fault('fatal');
+    }
+    return parseSession(plain);
+  }
+
+  async save(session: Session) {
+    const iv = randomBytes(12);
+    const ct = new Uint8Array(await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv, additionalData }, await this.key, new TextEncoder().encode(JSON.stringify(session)),
+    ));
+    const body = JSON.stringify({ v: 1, iv: toBase64(iv), ct: toBase64(ct) });
+    const temp = join(dirname(this.path), `.${basename(this.path)}.${process.pid}.${toBase64(randomBytes(6)).replace(/[+/=]/g, '_')}.tmp`);
+    let fd: number | undefined;
+    try {
+      fd = openSync(temp, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+      writeSync(fd, body);
+      fsyncSync(fd);
+      closeSync(fd); fd = undefined;
+      renameSync(temp, this.path);
+    } catch {
+      if (fd !== undefined) try { closeSync(fd); } catch {}
+      try { unlinkSync(temp); } catch {}
+      throw new Fault('fatal');
+    }
+  }
+
+  async clear() {
+    try { unlinkSync(this.path); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Fault('fatal'); }
+  }
+}
+
+/**
+ * Which store the sidecar uses, from NEUTRONSYNC_SESSION_STORE: the keyring
+ * (unset or `keyring`) or the encrypted file (`file`). Throws with a message
+ * fit for the log when the file store cannot be used.
+ */
+export function storeFromEnv(env: Record<string, string | undefined>, note: (message: string) => void): SessionStore {
+  const kind = env.NEUTRONSYNC_SESSION_STORE ?? 'keyring';
+  if (kind === 'keyring' || kind === '') return new SecretServiceStore();
+  if (kind !== 'file') throw new Error(sessionStoreMessage);
+  const key = sessionKeyFromEnv(env);
+  if (!env.NEUTRONSYNC_SESSION_FILE) throw new Error(sessionFileMessage);
+  return new FileSessionStore(env.NEUTRONSYNC_SESSION_FILE, key, note);
 }

@@ -45,6 +45,17 @@ pub enum Theme {
     Dark,
 }
 
+/// Where the sidecar keeps the Proton session.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SessionStore {
+    /// The desktop's Secret Service keyring (the default).
+    #[default]
+    Keyring,
+    /// An encrypted file under `state_dir`, for machines without a keyring
+    /// (a container or a headless server). See `session_key_file`.
+    File,
+}
+
 #[derive(Clone, Debug)]
 pub struct Pair {
     pub name: String,
@@ -62,6 +73,12 @@ pub struct Pair {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub sidecar: Option<PathBuf>,
+    /// Where the sidecar keeps the Proton session: the keyring or an
+    /// encrypted file.
+    pub session_store: SessionStore,
+    /// File holding the 32-byte key for the session file (base64 or hex).
+    /// Only read when `session_store` is `File`.
+    pub session_key_file: Option<PathBuf>,
     /// Concurrent folder reconciles during a full walk (0 = auto).
     pub scan_threads: usize,
     /// Concurrent file downloads during a sync (0 = auto). Bandwidth-bound, so
@@ -159,6 +176,8 @@ struct RawCli {
     /// message rather than silently switched.
     backend: Option<String>,
     sidecar: Option<String>,
+    session_store: Option<String>,
+    session_key_file: Option<String>,
     scan_threads: Option<u64>,
     download_threads: Option<u64>,
 }
@@ -373,6 +392,12 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         None => state_home().join("neutronsync"),
     };
 
+    let session_store = match cli.session_store.as_deref().unwrap_or("keyring") {
+        "keyring" => SessionStore::Keyring,
+        "file" => SessionStore::File,
+        other => bail!("cli.session_store must be keyring|file, got {other:?}"),
+    };
+
     let max_delete_percent = opts.max_delete_percent.unwrap_or(30);
     if max_delete_percent > 100 {
         bail!("options.max_delete_percent must be 0..=100, got {max_delete_percent}");
@@ -412,6 +437,8 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
 
     Ok(Config {
         sidecar: cli.sidecar.map(|p| expand(&p)),
+        session_store,
+        session_key_file: cli.session_key_file.map(|p| expand(&p)),
         scan_threads: cli.scan_threads.map(|n| n as usize).unwrap_or(0),
         download_threads: cli.download_threads.map(|n| n as usize).unwrap_or(0),
         remote_root,
@@ -473,6 +500,12 @@ pub fn strip_root<'a>(root: &str, p: &'a str) -> Option<&'a str> {
 struct OutCli {
     #[serde(skip_serializing_if = "Option::is_none")]
     sidecar: Option<PathBuf>,
+    /// Written only when it is not the default, so a desktop config that never
+    /// chose a store does not gain the key on its next save.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_store: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_key_file: Option<PathBuf>,
     scan_threads: usize,
     download_threads: usize,
 }
@@ -519,14 +552,16 @@ struct OutConfig {
     pair: Vec<OutPair>,
 }
 
-fn local_delete_str(v: LocalDelete) -> &'static str {
+/// The config spelling of a local delete choice.
+pub fn local_delete_str(v: LocalDelete) -> &'static str {
     match v {
         LocalDelete::Trash => "trash",
         LocalDelete::Remove => "remove",
     }
 }
 
-fn conflict_str(v: ConflictPolicy) -> &'static str {
+/// The config spelling of a conflict policy.
+pub fn conflict_str(v: ConflictPolicy) -> &'static str {
     match v {
         ConflictPolicy::KeepBoth => "keep-both",
         ConflictPolicy::Newer => "newer",
@@ -534,7 +569,8 @@ fn conflict_str(v: ConflictPolicy) -> &'static str {
     }
 }
 
-fn compare_str(v: Compare) -> &'static str {
+/// The config spelling of a compare mode.
+pub fn compare_str(v: Compare) -> &'static str {
     match v {
         Compare::Size => "size",
         Compare::SizeMtime => "size+mtime",
@@ -546,6 +582,14 @@ fn update_channel_str(v: UpdateChannel) -> &'static str {
     match v {
         UpdateChannel::Stable => "stable",
         UpdateChannel::Prerelease => "prerelease",
+    }
+}
+
+/// The config spelling of a session store choice.
+pub fn session_store_str(v: SessionStore) -> &'static str {
+    match v {
+        SessionStore::Keyring => "keyring",
+        SessionStore::File => "file",
     }
 }
 
@@ -563,6 +607,9 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
     let out = OutConfig {
         cli: OutCli {
             sidecar: cfg.sidecar.clone(),
+            session_store: (cfg.session_store != SessionStore::Keyring)
+                .then(|| session_store_str(cfg.session_store)),
+            session_key_file: cfg.session_key_file.clone(),
             scan_threads: cfg.scan_threads,
             download_threads: cfg.download_threads,
         },
@@ -618,9 +665,67 @@ pub fn save(cfg: &Config, path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load, save, Theme};
+    use super::{load, save, SessionStore, Theme};
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn session_store_defaults_round_trips_and_refuses_unknown_values() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("cfg.toml");
+        let base = r#"
+[cli]
+backend = "api"
+[options]
+state_dir = "/tmp/ns-test-state"
+"#;
+        fs::write(&path, base).unwrap();
+        let mut cfg = load(path.to_str()).unwrap();
+        assert_eq!(cfg.session_store, SessionStore::Keyring);
+        assert!(cfg.session_key_file.is_none());
+        // The default is not written back, so a desktop config stays as it was.
+        save(&cfg, &path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("session_store"), "{text}");
+        assert!(!text.contains("session_key_file"), "{text}");
+
+        cfg.session_store = SessionStore::File;
+        cfg.session_key_file = Some("/tmp/ns-test-state/session.key".into());
+        save(&cfg, &path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("session_store = \"file\""), "{text}");
+        assert!(
+            text.contains("session_key_file = \"/tmp/ns-test-state/session.key\""),
+            "{text}"
+        );
+        let loaded = load(path.to_str()).unwrap();
+        assert_eq!(loaded.session_store, SessionStore::File);
+        assert_eq!(
+            loaded.session_key_file.as_deref(),
+            Some(std::path::Path::new("/tmp/ns-test-state/session.key"))
+        );
+
+        fs::write(
+            &path,
+            "[cli]\nsession_store = \"vault\"\n[options]\nstate_dir = \"/tmp/ns-test-state\"\n",
+        )
+        .unwrap();
+        let err = load(path.to_str()).unwrap_err().to_string();
+        assert!(err.contains("cli.session_store"), "{err}");
+        assert!(err.contains("keyring|file"), "{err}");
+
+        for example in [
+            crate::EXAMPLE_CONFIG,
+            include_str!("../neutronsync.example.toml"),
+        ] {
+            assert!(example.contains("# session_store = \"keyring\""));
+            assert!(example.contains("# session_key_file ="));
+            fs::write(&path, example).unwrap();
+            let loaded = load(path.to_str()).unwrap();
+            assert_eq!(loaded.session_store, SessionStore::Keyring);
+            assert!(loaded.session_key_file.is_none());
+        }
+    }
 
     #[test]
     fn full_walk_interval_round_trip_gui_values() {

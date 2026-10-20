@@ -232,6 +232,18 @@ systemctl --user enable --now neutronsync.timer
 
 The packaged units target `/usr/bin/neutronsync`. If you installed with `cargo install`, edit `ExecStart` to `%h/.cargo/bin/neutronsync`. Proton Drive is rate-limited, so keep the sync set modest and the rescan interval sane.
 
+## Headless server
+
+`neutronsync serve` runs the sync engine without a desktop and exposes everything the window can do over a local HTTP API, with live updates as server-sent events. It is meant for a home server or a container, and for a web interface to drive.
+
+```sh
+neutronsync serve                                    # http://127.0.0.1:8090/api/v1
+NEUTRONSYNC_API_TOKEN=$(head -c 24 /dev/urandom | base64) \
+  neutronsync serve --listen 0.0.0.0:8090 --local-root /data
+```
+
+Listening on anything but loopback needs an API token of at least 32 characters. Only one NeutronSync may sync a state directory at a time, so stop the desktop tray first. Where there is no keyring, set `session_store = "file"` in `[cli]` and give a key; the Proton session is then kept encrypted in the state directory. [`docs/HTTP_API.md`](docs/HTTP_API.md) lists every endpoint.
+
 ## Updates
 
 Releases come from GitHub. Every tag ships as a pre-release; a stable release is one that has been promoted after the build has proven itself, and its title says `(stable)`. The newest promoted release is the one GitHub marks "Latest". Point the updater at the `stable` or `prerelease` channel in Settings (or `update_channel` in the config): `stable` offers only promoted releases, `prerelease` offers every build as it lands. Checking never installs anything. When an update is available, "Download and install" verifies the download against the release's signed checksum list (every release from 0.7.0 on) and the checksum GitHub publishes, then installs it through your package manager (one `pkexec` prompt) and offers to restart. A download that fails either check is discarded. `neutronsync --version` and the About page show the commit a build was made from, so a bug report can name it.

@@ -4817,6 +4817,8 @@ fn starter_config(path: &Path) -> Config {
         notifications: true,
         theme: Theme::System,
         file_manager_bookmarks: false,
+        session_store: Default::default(),
+        session_key_file: None,
         state_dir: {
             let base = std::env::var("XDG_STATE_HOME")
                 .map(PathBuf::from)

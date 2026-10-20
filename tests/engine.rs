@@ -243,6 +243,8 @@ fn cfg(root: &Path) -> Config {
         notifications: true,
         theme: Theme::System,
         file_manager_bookmarks: false,
+        session_store: Default::default(),
+        session_key_file: None,
         state_dir: root.join("state"),
         pairs: vec![Pair {
             name: "docs".into(),

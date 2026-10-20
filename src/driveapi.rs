@@ -14,7 +14,7 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 
 use crate::changefeed::{FeedMessage, RemoteChangeFeed, Subscription};
-use crate::config::{remote_join, Config};
+use crate::config::{remote_join, Config, SessionStore};
 use crate::logger::Logger;
 use crate::models::{DownloadJob, Entry, TreeScan, Uploaded};
 use crate::remote::{is_safe_component, ListOutcome, Remote};
@@ -103,10 +103,38 @@ struct Client {
     dead: AtomicBool,
 }
 
+/// Environment the spawned sidecar needs beyond what it inherits. With
+/// `session_store = "file"` it selects the encrypted session file under
+/// `state_dir` and, when configured, the key file. A variable already set on
+/// this process wins, so a container can choose the store with env alone.
+/// With `keyring` nothing is added and desktops behave as before.
+pub fn sidecar_env(cfg: &Config) -> Vec<(String, String)> {
+    if cfg.session_store != SessionStore::File {
+        return Vec::new();
+    }
+    let mut wanted = vec![
+        ("NEUTRONSYNC_SESSION_STORE".to_string(), "file".to_string()),
+        (
+            "NEUTRONSYNC_SESSION_FILE".to_string(),
+            cfg.state_dir.join("session.enc").display().to_string(),
+        ),
+    ];
+    if let Some(key) = &cfg.session_key_file {
+        wanted.push((
+            "NEUTRONSYNC_SESSION_KEY_FILE".to_string(),
+            key.display().to_string(),
+        ));
+    }
+    wanted
+        .into_iter()
+        .filter(|(name, _)| std::env::var_os(name).is_none())
+        .collect()
+}
+
 impl Client {
-    fn spawn(binary: &Path) -> Result<Arc<Self>> {
+    fn spawn(binary: &Path, env: &[(String, String)]) -> Result<Arc<Self>> {
         if std::env::var_os("NEUTRONSYNC_DRIVE_STDIO").is_none() {
-            let socket = connect_session(binary)?;
+            let socket = connect_session(binary, env)?;
             let read = socket.try_clone()?;
             let write = socket.try_clone()?;
             return Ok(Self::start(
@@ -119,6 +147,7 @@ impl Client {
         }
         // Explicit fixture/spike compatibility. Production clients use the socket.
         let mut child = Command::new(binary)
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -315,7 +344,7 @@ impl Drop for Client {
     }
 }
 
-fn shared(binary: &Path) -> Result<Arc<Client>> {
+fn shared(binary: &Path, env: &[(String, String)]) -> Result<Arc<Client>> {
     static SHARED: OnceLock<Mutex<Option<Arc<Client>>>> = OnceLock::new();
     let mut slot = SHARED.get_or_init(|| Mutex::new(None)).lock().unwrap();
     if let Some(client) = &*slot {
@@ -337,7 +366,7 @@ fn shared(binary: &Path) -> Result<Arc<Client>> {
         client.fail(); // Reap the old process before any replacement can start.
         std::thread::sleep(Duration::from_millis(100));
     }
-    let client = Client::spawn(binary)?;
+    let client = Client::spawn(binary, env)?;
     *slot = Some(Arc::clone(&client));
     Ok(client)
 }
@@ -363,7 +392,7 @@ fn session_socket() -> Result<PathBuf> {
     Ok(dir.join("session.sock"))
 }
 
-fn connect_session(binary: &Path) -> Result<UnixStream> {
+fn connect_session(binary: &Path, env: &[(String, String)]) -> Result<UnixStream> {
     let path = session_socket()?;
     let canonical = std::fs::canonicalize(binary)?;
     let started = Instant::now();
@@ -423,6 +452,7 @@ fn connect_session(binary: &Path) -> Result<UnixStream> {
         if launched.is_none() || exited {
             launched = Some(
                 Command::new(binary)
+                    .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                     .arg("--socket")
                     .arg(&path)
                     .stdin(Stdio::null())
@@ -501,6 +531,8 @@ fn to_entry(raw: &Value) -> Option<Entry> {
 
 pub struct DriveApi {
     binary: PathBuf,
+    /// Extra environment for the sidecar process (see [`sidecar_env`]).
+    env: Vec<(String, String)>,
     download_threads: usize,
     /// Upload and download limits in bytes per second (0 = no limit).
     limits: (u64, u64),
@@ -519,6 +551,7 @@ impl DriveApi {
         })?;
         Ok(Self {
             binary,
+            env: sidecar_env(cfg),
             download_threads: cfg.download_threads,
             limits: (
                 cfg.upload_limit_kbps.saturating_mul(1024),
@@ -527,6 +560,10 @@ impl DriveApi {
             limits_sent: Mutex::new(false),
             feed_client: Mutex::new(None),
         }) // Lazy session and process.
+    }
+
+    fn client(&self) -> Result<Arc<Client>> {
+        shared(&self.binary, &self.env)
     }
 
     /// Send the configured speed limits once, before this instance's first
@@ -557,7 +594,7 @@ impl DriveApi {
     }
 
     pub fn status(&self) -> Result<Value> {
-        shared(&self.binary)?.call("auth.status", json!({}))
+        self.client()?.call("auth.status", json!({}))
     }
 
     pub fn auth(&self, method: &str, params: Value) -> Result<Value> {
@@ -567,7 +604,7 @@ impl DriveApi {
         ) {
             bail!("unsupported authentication method");
         }
-        shared(&self.binary)?.call(method, params)
+        self.client()?.call(method, params)
     }
 
     fn resolve(client: &Client, path: &str) -> Result<String> {
@@ -593,7 +630,7 @@ impl DriveApi {
     }
 
     fn probe(&self, path: &str) -> Result<ListOutcome> {
-        let client = shared(&self.binary)?;
+        let client = self.client()?;
         let result = Self::resolve(&client, path)
             .and_then(|uid| client.call("node.list", json!({"uid":uid})));
         match result {
@@ -643,7 +680,7 @@ impl Remote for DriveApi {
         if !is_safe_component(name) {
             bail!("api backend: unsafe name");
         }
-        let client = shared(&self.binary)?;
+        let client = self.client()?;
         let uid = Self::resolve(&client, parent)?;
         client.call("node.create_folder", json!({"parent_uid":uid,"name":name}))?;
         Ok(())
@@ -656,7 +693,7 @@ impl Remote for DriveApi {
         if !is_safe_component(name) {
             bail!("api backend: unsafe name");
         }
-        let client = shared(&self.binary)?;
+        let client = self.client()?;
         self.ensure_limits(&client)?;
         let uid = Self::resolve(&client, parent)?;
         let result = client.call(
@@ -679,7 +716,7 @@ impl Remote for DriveApi {
     }
     fn download(&self, remote: &str, dest: &str) -> Result<()> {
         let (_, name) = split_remote(remote)?;
-        let client = shared(&self.binary)?;
+        let client = self.client()?;
         self.ensure_limits(&client)?;
         let uid = Self::node(&client, remote)?;
         client.call(
@@ -689,7 +726,7 @@ impl Remote for DriveApi {
         Ok(())
     }
     fn trash(&self, remote: &str) -> Result<()> {
-        let client = shared(&self.binary)?;
+        let client = self.client()?;
         let uid = Self::node(&client, remote)?;
         client.call("node.trash", json!({"uids":[uid]}))?;
         Ok(())
@@ -697,7 +734,7 @@ impl Remote for DriveApi {
     fn rename(&self, from: &str, to: &str) -> Result<()> {
         let (fp, fname) = split_remote(from)?;
         let (tp, tname) = split_remote(to)?;
-        let client = shared(&self.binary)?;
+        let client = self.client()?;
         let uid = Self::node(&client, from)?;
         if fp != tp {
             let parent = Self::resolve(&client, tp)?;
@@ -750,7 +787,7 @@ impl Remote for DriveApi {
         exclude: &(dyn Fn(&str) -> bool + Sync),
         progress: &(dyn Fn(&str) + Sync),
     ) -> Result<TreeScan> {
-        let client = shared(&self.binary)?;
+        let client = self.client()?;
         let root = match Self::resolve(&client, base) {
             Ok(root) => root,
             Err(e) if is_code(&e, "not_found") => {
@@ -832,7 +869,7 @@ impl Remote for DriveApi {
 
 impl RemoteChangeFeed for DriveApi {
     fn subscribe(&self, scope: &str, since: Option<&str>) -> Result<Subscription> {
-        let client = shared(&self.binary)?;
+        let client = self.client()?;
         client.feed.lock().unwrap().clear();
         *self.feed_client.lock().unwrap() = Some(Arc::clone(&client));
         let mut params = json!({"scope_id":scope,"ack_required":true});
@@ -860,14 +897,15 @@ impl RemoteChangeFeed for DriveApi {
         Ok(message)
     }
     fn ack(&self, scope: &str, event_id: &str) -> Result<()> {
-        shared(&self.binary)?.call("events.ack", json!({"scope_id":scope,"event_id":event_id}))?;
+        self.client()?
+            .call("events.ack", json!({"scope_id":scope,"event_id":event_id}))?;
         Ok(())
     }
     fn resolve_root(&self, path: &str) -> Result<String> {
-        Self::resolve(shared(&self.binary)?.as_ref(), path)
+        Self::resolve(self.client()?.as_ref(), path)
     }
     fn node_path(&self, uid: &str) -> Result<String> {
-        let result = shared(&self.binary)?.call("node.path", json!({"uid":uid}))?;
+        let result = self.client()?.call("node.path", json!({"uid":uid}))?;
         let path = result["path"]
             .as_str()
             .ok_or_else(|| anyhow!("missing node path"))?
@@ -912,6 +950,55 @@ mod tests {
             assert!(to_entry(&json!({"name":name,"type":"file","uid":"x"})).is_none());
         }
         assert!(to_entry(&json!({"name":"x","type":"album","uid":"x"})).is_none());
+    }
+
+    /// AC-20: the file store reaches the sidecar as three variables; the
+    /// keyring store adds nothing; a variable already set on this process
+    /// is left alone so a container can choose with env alone.
+    #[test]
+    fn sidecar_env_follows_the_session_store_setting() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg_path = temp.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[cli]\nsidecar = {:?}\n[options]\nstate_dir = {:?}\n",
+                temp.path().join("sidecar"),
+                temp.path().join("state")
+            ),
+        )
+        .unwrap();
+        let mut cfg = crate::config::load(cfg_path.to_str()).unwrap();
+        assert!(sidecar_env(&cfg).is_empty());
+
+        cfg.session_store = SessionStore::File;
+        let env = sidecar_env(&cfg);
+        assert_eq!(
+            env,
+            vec![
+                ("NEUTRONSYNC_SESSION_STORE".to_string(), "file".to_string()),
+                (
+                    "NEUTRONSYNC_SESSION_FILE".to_string(),
+                    temp.path().join("state/session.enc").display().to_string()
+                ),
+            ]
+        );
+        cfg.session_key_file = Some(temp.path().join("session.key"));
+        let env = sidecar_env(&cfg);
+        assert_eq!(env.len(), 3);
+        assert_eq!(
+            env[2],
+            (
+                "NEUTRONSYNC_SESSION_KEY_FILE".to_string(),
+                temp.path().join("session.key").display().to_string()
+            )
+        );
+
+        std::env::set_var("NEUTRONSYNC_SESSION_FILE", "/elsewhere/session.enc");
+        let env = sidecar_env(&cfg);
+        std::env::remove_var("NEUTRONSYNC_SESSION_FILE");
+        assert!(env.iter().all(|(k, _)| k != "NEUTRONSYNC_SESSION_FILE"));
+        assert_eq!(env.len(), 2);
     }
 
     #[test]

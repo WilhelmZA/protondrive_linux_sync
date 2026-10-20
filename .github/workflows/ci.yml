@@ -58,8 +58,8 @@ jobs:
       - name: Build (lib + CLI)
         run: cargo build --workspace --all-targets
 
-      - name: Build (with GUI)
-        run: cargo build --features gui --bin neutronsync-gui
+      - name: Build (with GUI and serve)
+        run: cargo build --features gui,serve --bins
 
       - name: Test
         run: cargo test --all-features

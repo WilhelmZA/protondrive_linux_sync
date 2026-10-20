@@ -24,6 +24,8 @@ pub mod notify_policy;
 pub mod process_lock;
 pub mod remote;
 pub mod retry;
+#[cfg(feature = "serve")]
+pub mod server;
 pub mod service;
 pub mod state;
 pub mod stats;
@@ -45,6 +47,13 @@ pub const EXAMPLE_CONFIG: &str = r#"# neutronsync configuration. See README.md.
 # scan_threads = 8
 # Concurrent file downloads (0 = auto, 4).
 # download_threads = 4
+# Where the sidecar keeps the Proton session: "keyring" (the desktop's Secret
+# Service, the default) or "file" (an encrypted file, session.enc, in the
+# state directory, for a container or a headless server). The file is locked
+# with a 32-byte key read from session_key_file (base64 or 64 hex characters)
+# or from the NEUTRONSYNC_SESSION_KEY environment variable.
+# session_store = "keyring"
+# session_key_file = "/path/to/session.key"
 
 [options]
 # Proton's per-user root. Remote paths in [[pair]] resolve under this unless

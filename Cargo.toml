@@ -50,6 +50,12 @@ sha2 = { version = "0.10", optional = true }
 pgp = { version = "0.21", optional = true, default-features = false }
 # PNG encoder for `neutronsync-gui --screenshots <dir>` (documentation captures).
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
+# `neutronsync serve` (serve feature only): the HTTP API and its event stream.
+# Nothing else from these crates is used; auth, body limits and error mapping
+# live in src/server. Without the feature none of them is compiled in.
+axum = { version = "0.8", optional = true, default-features = false, features = ["json", "query", "http1", "tokio"] }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "macros", "signal", "time", "sync"] }
+tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
 
 [profile.release]
 opt-level = "z"   # optimise for size ("lite")
@@ -74,6 +80,11 @@ gui = [
     "dep:pgp",
     "dep:image",
 ]
+# `neutronsync serve`: the headless HTTP API. Opt-in for the same reason as
+# the GUI; the release build enables it so the packages ship a CLI that can
+# serve:
+#   cargo build --features serve
+serve = ["dep:axum", "dep:tokio", "dep:tokio-stream"]
 
 [[bin]]
 name = "neutronsync-gui"

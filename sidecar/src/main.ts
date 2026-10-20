@@ -3,7 +3,7 @@ import { Auth, type AuthCrypto } from './auth';
 import { Account } from './account';
 import { Drive, sdkClient, type ReadClient } from './drive';
 import { SafeLog } from './log';
-import { SecretServiceStore, type SessionStore } from './store';
+import { storeFromEnv, type SessionStore } from './store';
 import { AuthQueue, notifications, serve } from './rpc';
 import { claimSocket, listenSocket } from './socket';
 import { realpathSync } from 'node:fs';
@@ -16,6 +16,15 @@ async function main() {
   const args = process.argv.slice(2);
   const socketPath = args[0] === '--socket' ? args[1] : undefined;
   if (socketPath) args.splice(0, 2);
+  // The session store is chosen before the socket is claimed or opened: a
+  // file store that cannot be used stops the sidecar here, with a plain line.
+  let store: SessionStore;
+  try { store = storeFromEnv(process.env, message => log.write('warn', message)); }
+  catch (error) {
+    log.write('error', error instanceof Error ? error.message : 'Diagnostic suppressed');
+    process.exitCode = 1;
+    return;
+  }
   // Ownership precedes the first keyring read, including automatic migration.
   if (socketPath && claimSocket(socketPath) === null) return;
   const outputs = new Set<(value: unknown) => void>();
@@ -24,7 +33,6 @@ async function main() {
   const wasm = Bun.embeddedFiles.find(file => (file as File).name.endsWith('proton_drive_sdk_search_bg.wasm'));
   if (!wasm) throw new Error();
   await WebAssembly.compile(await wasm.arrayBuffer());
-  let store: SessionStore = new SecretServiceStore();
   let crypto: AuthCrypto = { proof: getSrp, keyPassword: computeKeyPassword, unlock: async (_auth, password) => { await account.unlock(password); } };
   let fakeClient: ((auth: Auth) => ReadClient) | undefined;
   if (args.length) {
