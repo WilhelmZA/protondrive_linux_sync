@@ -3026,6 +3026,14 @@ impl App {
 
     fn page_about(&mut self, ui: &mut egui::Ui) {
         self.page_header(ui, "About", |_ui, _app| {});
+        // The release notes alone can be taller than the window.
+        egui::ScrollArea::vertical()
+            .id_salt("about_page")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.about_body(ui));
+    }
+
+    fn about_body(&mut self, ui: &mut egui::Ui) {
         ui.label(
             RichText::new(format!("NeutronSync {}", env!("CARGO_PKG_VERSION")))
                 .font(FontId::new(16.0, ff_bold()))

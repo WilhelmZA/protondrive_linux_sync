@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Fixed
+- The About page in the desktop window scrolls again. Long release notes under "What's new" no longer hide the rest of the page (#23).
+
 ## [0.8.0] - 2026-10-20
 
 ### Added
