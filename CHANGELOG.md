@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+0.8.1 was tagged but never published: its release build failed. This release carries every 0.8.1 change listed below, plus these.
+
+### Security
+- Updated rustls-webpki to 0.103.16 and webpki-roots to 1.0.10 for RUSTSEC-2026-0382 and RUSTSEC-2026-0381 (distrusted certificate intermediates).
+
+### Fixed
+- The .deb, .rpm and tarball builds send the release version to Proton, not a `-dev` label; 0.8.1 fixed this only for the Docker image (#37).
+- The sidecar tests no longer hard-code the version, which broke the 0.8.1 release build.
+
+### Known issues
+- A config that this version refuses, such as two pairs on overlapping folders that 0.8.0 accepted, stops the engine at start. Nothing syncs, so no file is at risk, but the web interface says only that it cannot reach the engine; the reason is in the container log. Remove one of the overlapping pairs from `neutronsync.toml` to recover (#42).
+
 ## [0.8.1] - 2026-10-21
 
 ### Fixed
@@ -29,9 +41,6 @@ All notable changes to this project are documented here. The format follows [Kee
 - Scan and download thread counts above 64, a relative Proton root, and folder paths with empty, `.` or `..` steps are refused in settings and synced folders (#28).
 - Downloaded files and conflict copies use your umask instead of always being private to you (#39).
 - The sync state database is created readable only by you (#33).
-
-### Security
-- Updated rustls-webpki to 0.103.16 and webpki-roots to 1.0.10 for RUSTSEC-2026-0382 and RUSTSEC-2026-0381 (distrusted certificate intermediates).
 
 ### Known issues
 - A config that this version refuses, such as two pairs on overlapping folders that 0.8.0 accepted, stops the engine at start. Nothing syncs, so no file is at risk, but the web interface says only that it cannot reach the engine; the reason is in the container log. Remove one of the overlapping pairs from `neutronsync.toml` to recover (#42).
