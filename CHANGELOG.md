@@ -28,6 +28,9 @@ All notable changes to this project are documented here. The format follows [Kee
 - Downloaded files and conflict copies use your umask instead of always being private to you (#39).
 - The sync state database is created readable only by you (#33).
 
+### Known issues
+- A config that this version refuses, such as two pairs on overlapping folders that 0.8.0 accepted, stops the engine at start. Nothing syncs, so no file is at risk, but the web interface says only that it cannot reach the engine; the reason is in the container log. Remove one of the overlapping pairs from `neutronsync.toml` to recover (#42).
+
 ## [0.8.0] - 2026-10-20
 
 ### Added
