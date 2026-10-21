@@ -1,7 +1,8 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>neutronsync</Name>
-  <Repository>ghcr.io/wilhelmza/neutronsync:latest</Repository>
+  <!-- Switch to :latest after a release image has been promoted to stable. -->
+  <Repository>ghcr.io/wilhelmza/neutronsync:edge</Repository>
   <Registry>https://ghcr.io/</Registry>
   <Network>bridge</Network>
   <MyIP/>
@@ -28,6 +29,7 @@
   <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group id that owns files under /config" Type="Variable" Display="always" Required="false" Mask="false"/>
   <Config Name="UMASK" Target="UMASK" Default="002" Mode="" Description="File creation mask" Type="Variable" Display="advanced" Required="false" Mask="false"/>
   <Config Name="Web Password" Target="NEUTRONSYNC_WEB_PASSWORD" Default="" Mode="" Description="Required on first start. At least 12 characters. Protects the web login." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="Web auth mode" Target="NEUTRONSYNC_WEB_AUTH" Default="" Mode="" Description="Leave empty for password login. Set to proxy only behind a reverse proxy that logs people in (disables the web login page)." Type="Variable" Display="advanced" Required="false" Mask="false"/>
   <Config Name="Session Key" Target="NEUTRONSYNC_SESSION_KEY" Default="" Mode="" Description="Optional. 32-byte key (base64) for the encrypted Proton session. Pass this separately from /config so a copied appdata folder alone cannot decrypt the session." Type="Variable" Display="advanced" Required="false" Mask="true"/>
   <Config Name="Timezone" Target="TZ" Default="UTC" Mode="" Description="Container timezone" Type="Variable" Display="always" Required="false" Mask="false"/>
 </Container>

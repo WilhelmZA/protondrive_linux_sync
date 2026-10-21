@@ -5,6 +5,11 @@ All notable changes to this project are documented here. The format follows [Kee
 ## [Unreleased]
 
 ### Fixed
+- The container web service starts in proxy mode without a web password when `NEUTRONSYNC_WEB_AUTH=proxy` (#24).
+- The web interface keeps theme and login state on disk under `NEUTRONSYNC_WEB_DATA` instead of the service working directory (#25).
+- Container starter config and secrets use safe file modes on every start (#33).
+- The compose example, Unraid template and package README default to the `edge` image tag and document proxy auth (#34).
+- Proton sign-in requests from the drive helper report the release version instead of a stale dev label (#37).
 - The About page in the desktop window scrolls again. Long release notes under "What's new" no longer hide the rest of the page (#23).
 - A local file is no longer overwritten when the sync state forgot it but the file is still on disk; both copies are kept instead (#35).
 - Remembered file rows are only dropped when both sides are gone after a full scan of the pair, not during a partial or scoped run (#35).

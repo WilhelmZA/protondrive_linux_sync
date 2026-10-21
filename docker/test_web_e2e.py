@@ -14,6 +14,8 @@ import os
 import re
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -25,6 +27,7 @@ DATA_PHOTOS = Path(os.environ.get("DATA_PHOTOS", "/tmp/ns-photos"))
 CONTAINER_PHOTOS = os.environ.get("CONTAINER_PHOTOS", "/data/photos")
 PHASE = os.environ.get("PHASE", "ac8")
 EXPECT_TRASH = Path(os.environ["EXPECT_TRASH"]) if os.environ.get("EXPECT_TRASH") else None
+AC2_STATE = os.environ.get("AC2_STATE")
 
 
 def _login(page) -> None:
@@ -38,6 +41,20 @@ def _wait_live(page, timeout: float = 20000) -> None:
     page.locator(".ns-header.ns-live-ready").first.wait_for(state="attached", timeout=timeout)
 
 
+def _wait_http_ok(url: str, timeout: float = 120.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(url, timeout=3)
+            return
+        except urllib.error.HTTPError:
+            return
+        except (urllib.error.URLError, TimeoutError):
+            pass
+        time.sleep(1)
+    raise SystemExit(f"timed out waiting for {url}")
+
+
 def _fill_synced(page, locator, text: str) -> None:
     locator.click()
     locator.fill("")
@@ -46,15 +63,19 @@ def _fill_synced(page, locator, text: str) -> None:
     page.wait_for_timeout(200)
 
 
+def _picker_row(picker, text: str):
+    return picker.locator(".ns-picker .q-item").filter(has=picker.page.get_by_text(text, exact=True))
+
+
 def _pick_folder(page, *, local_path: str | None = None, remote_name: str | None = None) -> None:
     picker = page.locator(".q-dialog").last
     picker.get_by_role("button", name=re.compile("use this folder", re.I)).wait_for(timeout=15000)
     if local_path is not None:
         root = str(Path(local_path).parent)
-        picker.get_by_role("button", name=root).click()
-        picker.get_by_role("button", name=Path(local_path).name).click()
+        _picker_row(picker, root).click()
+        _picker_row(picker, Path(local_path).name).click()
     elif remote_name is not None:
-        picker.get_by_role("button", name=remote_name).click()
+        _picker_row(picker, remote_name).click()
     picker.get_by_role("button", name=re.compile("use this folder", re.I)).click()
 
 
@@ -84,6 +105,42 @@ def _click_sync_and_wait(page, *, timeout: float = 90.0) -> None:
                 return
         page.wait_for_timeout(500)
     raise SystemExit("timed out waiting for Sync now to finish")
+
+
+def _set_theme_dark(page) -> None:
+    page.goto(f"{WEB_URL}/settings", wait_until="domcontentloaded")
+    _wait_live(page)
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    page.wait_for_timeout(400)
+    appearance = page.locator(".ns-card").filter(has_text="Appearance")
+    appearance.wait_for(timeout=15000)
+    select = appearance.locator(".q-select")
+    select.scroll_into_view_if_needed()
+    select.click()
+    page.locator(".q-item").filter(has_text=re.compile("^Dark$")).click()
+    page.wait_for_timeout(500)
+
+
+def phase_ac2_set(page) -> None:
+    """Choose Dark theme so NiceGUI writes user storage under /config/web/.nicegui."""
+    _login(page)
+    _set_theme_dark(page)
+    print("ac2_set_ok")
+
+
+def phase_ac2_check(page) -> None:
+    """After a container restart, the theme choice should still be Dark (AC-2)."""
+    _wait_http_ok(f"{WEB_URL}/login")
+    page.goto(f"{WEB_URL}/settings", wait_until="domcontentloaded")
+    _wait_live(page)
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    page.wait_for_timeout(400)
+    appearance = page.locator(".ns-card").filter(has_text="Appearance")
+    appearance.wait_for(timeout=15000)
+    label = appearance.locator(".q-field__native").inner_text()
+    if "dark" not in label.lower():
+        raise SystemExit(f"theme not persisted after restart (label={label!r})")
+    print("ac2_ok")
 
 
 def phase_ac8(page) -> None:
@@ -225,9 +282,22 @@ def phase_ac9_assert(page) -> None:
 def main() -> int:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page(viewport={"width": 1280, "height": 900})
+        context_kwargs: dict = {"viewport": {"width": 1280, "height": 900}}
+        if PHASE == "ac2-check":
+            if not AC2_STATE:
+                raise SystemExit("AC2_STATE required for PHASE=ac2-check")
+            context_kwargs["storage_state"] = AC2_STATE
+        context = browser.new_context(**context_kwargs)
+        page = context.new_page()
         try:
-            if PHASE == "ac8":
+            if PHASE == "ac2-set":
+                phase_ac2_set(page)
+                if not AC2_STATE:
+                    raise SystemExit("AC2_STATE required for PHASE=ac2-set")
+                context.storage_state(path=AC2_STATE)
+            elif PHASE == "ac2-check":
+                phase_ac2_check(page)
+            elif PHASE == "ac8":
                 phase_ac8(page)
             elif PHASE == "ac9-prepare":
                 phase_ac9_prepare(page)

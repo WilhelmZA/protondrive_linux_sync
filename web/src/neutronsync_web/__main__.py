@@ -6,6 +6,10 @@ import logging
 from pathlib import Path
 from urllib.parse import quote
 
+from neutronsync_web.nicegui_path import ensure_nicegui_storage_path
+
+ensure_nicegui_storage_path()
+
 from fastapi.responses import JSONResponse, RedirectResponse
 from nicegui import app, ui
 

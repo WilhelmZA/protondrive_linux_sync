@@ -50,7 +50,8 @@ def load_settings() -> Settings:
     if not (1 <= web_port <= 65535):
         raise ConfigError(f"NEUTRONSYNC_WEB_PORT must be between 1 and 65535, got {web_port}.")
 
-    web_auth = os.environ.get("NEUTRONSYNC_WEB_AUTH", "password").strip().lower()
+    web_auth_raw = os.environ.get("NEUTRONSYNC_WEB_AUTH", "password")
+    web_auth = (web_auth_raw or "password").strip().lower()
     if web_auth not in ("password", "proxy"):
         raise ConfigError(f"NEUTRONSYNC_WEB_AUTH must be 'password' or 'proxy', got {web_auth!r}.")
 

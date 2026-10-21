@@ -7,11 +7,23 @@ umask "$UMASK"
 CONFIG_ROOT="${NEUTRONSYNC_CONFIG_ROOT:-/config}"
 export NEUTRONSYNC_API_TOKEN_FILE="${NEUTRONSYNC_API_TOKEN_FILE:-${CONFIG_ROOT}/secrets/api.token}"
 
-if [ -z "${NEUTRONSYNC_WEB_PASSWORD:-}" ] && [ -z "${NEUTRONSYNC_WEB_PASSWORD_FILE:-}" ]; then
-	echo "Set NEUTRONSYNC_WEB_PASSWORD (12 characters or more) before the web interface can start."
-	# Stay down long enough that s6 back-off, not a tight restart loop, applies.
-	sleep 5
-	exit 1
+WEB_AUTH="${NEUTRONSYNC_WEB_AUTH:-password}"
+case "$WEB_AUTH" in
+	password | proxy) ;;
+	*)
+		echo "NEUTRONSYNC_WEB_AUTH must be 'password' or 'proxy', got ${WEB_AUTH}."
+		sleep 5
+		exit 1
+		;;
+esac
+
+if [ "$WEB_AUTH" != "proxy" ]; then
+	if [ -z "${NEUTRONSYNC_WEB_PASSWORD:-}" ] && [ -z "${NEUTRONSYNC_WEB_PASSWORD_FILE:-}" ]; then
+		echo "Set NEUTRONSYNC_WEB_PASSWORD (12 characters or more) before the web interface can start."
+		# Stay down long enough that s6 back-off, not a tight restart loop, applies.
+		sleep 5
+		exit 1
+	fi
 fi
 
 run_web() {

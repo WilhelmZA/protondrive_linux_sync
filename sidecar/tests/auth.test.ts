@@ -19,7 +19,7 @@ describe('authentication over fake HTTP', () => {
     expect(await h.auth.login('normal', 'password-secret')).toEqual({ ok: true });
     expect(h.auth.status()).toEqual({ signed_in: true, account: 'normal', keyring_locked: false });
     expect(h.store.value?.keyPassphrase).toBe('salted-password-secret');
-    expect(h.backend.requests.every(r => r.version === 'external-drive-neutronsync@0.1.0-dev')).toBe(true);
+    expect(h.backend.requests.every(r => r.version === 'external-drive-neutronsync@0.8.0-dev')).toBe(true);
     const restored = new Auth(h.store, fakeCrypto, () => {}, h.log, h.backend.fetch);
     await restored.init();
     expect(restored.status().signed_in).toBe(true);

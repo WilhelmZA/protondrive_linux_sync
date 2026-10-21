@@ -21,11 +21,14 @@ CID_NOPW=""
 CID_API=""
 CID_FAKE=""
 CID_USER=""
+CID_PROXY=""
+CID_AC2=""
+CID_UNRAID=""
 FAKE_IMAGE=""
 
 cleanup() {
 	set +e
-	for id in "$CID" "$CID_NOPW" "$CID_API" "$CID_FAKE" "$CID_USER"; do
+	for id in "$CID" "$CID_NOPW" "$CID_API" "$CID_FAKE" "$CID_USER" "$CID_PROXY" "$CID_AC2" "$CID_UNRAID"; do
 		[ -n "$id" ] || continue
 		docker rm -f "$id" >/dev/null 2>&1
 	done
@@ -116,12 +119,19 @@ log "  mapped web port ${PORT_WEB}"
 
 [ -f "${CFG}/neutronsync.toml" ] || die "config missing"
 diff -u "${ROOT}/docker/neutronsync.toml" "${CFG}/neutronsync.toml" || die "config differs from starter"
-[ -f "${CFG}/secrets/api.token" ] || die "api.token missing"
-[ -f "${CFG}/secrets/session.key" ] || die "session.key missing"
+docker exec "$CID" test -f /config/secrets/api.token || die "api.token missing"
+docker exec "$CID" test -f /config/secrets/session.key || die "session.key missing"
 tok_meta="$(docker exec "$CID" stat -c '%a %u %g' /config/secrets/api.token)"
 key_meta="$(docker exec "$CID" stat -c '%a %u %g' /config/secrets/session.key)"
 echo "$tok_meta" | grep -q "^600 ${PUID} ${PGID}$" || die "api.token mode/owner wrong: ${tok_meta}"
 echo "$key_meta" | grep -q "^600 ${PUID} ${PGID}$" || die "session.key mode/owner wrong: ${key_meta}"
+cfg_mode="$(docker exec "$CID" stat -c '%a' /config/neutronsync.toml)"
+sec_dir_mode="$(docker exec "$CID" stat -c '%a' /config/secrets)"
+[ "$cfg_mode" = "644" ] || die "neutronsync.toml mode wrong: ${cfg_mode}"
+[ "$sec_dir_mode" = "700" ] || die "/config/secrets mode wrong: ${sec_dir_mode}"
+docker exec "$CID" test -d /config/web/.nicegui || die "/config/web/.nicegui missing"
+ng_mode="$(docker exec "$CID" stat -c '%a' /config/web/.nicegui)"
+[ "$ng_mode" = "700" ] || die "/config/web/.nicegui mode wrong: ${ng_mode}"
 
 # python:slim has no ps; read UIDs from /proc.
 uids="$(docker exec -i "$CID" python3 - <<'PY'
@@ -243,6 +253,44 @@ printf '  health=%s\n' "$status"
 docker rm -f "$CID_NOPW" >/dev/null
 CID_NOPW=""
 
+# ----- proxy mode without password -----
+log "proxy mode starts without web password"
+CFG_PROXY="${SCRATCH}/config-proxy"
+DATA_PROXY="${SCRATCH}/data-proxy"
+mkdir -p "$CFG_PROXY" "$DATA_PROXY"
+chmod 777 "$DATA_PROXY"
+CID_PROXY="$(docker run -d --name "${PREFIX}-proxy" \
+	-e "PUID=${PUID}" -e "PGID=${PGID}" \
+	-e "NEUTRONSYNC_WEB_AUTH=proxy" \
+	-v "${CFG_PROXY}:/config" -v "${DATA_PROXY}:/data" \
+	-p 127.0.0.1::8080 \
+	"$IMAGE")"
+wait_healthy "$CID_PROXY" 90
+PORT_PROXY="$(host_port "$CID_PROXY" 8080)"
+code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT_PROXY}/")"
+[ "$code" = "200" ] || die "proxy mode / returned ${code}, expected 200"
+proxy_logs="$(docker logs "$CID_PROXY" 2>&1 || true)"
+echo "$proxy_logs" | grep -qi PermissionError && die "proxy container log has PermissionError"
+docker rm -f "$CID_PROXY" >/dev/null
+CID_PROXY=""
+
+# ----- Unraid-style empty NEUTRONSYNC_WEB_AUTH -----
+log "empty NEUTRONSYNC_WEB_AUTH with password (Unraid template default)"
+CFG_UNRAID="${SCRATCH}/config-unraid"
+DATA_UNRAID="${SCRATCH}/data-unraid"
+mkdir -p "$CFG_UNRAID" "$DATA_UNRAID"
+chmod 777 "$DATA_UNRAID"
+CID_UNRAID="$(docker run -d --name "${PREFIX}-unraid" \
+	-e "PUID=${PUID}" -e "PGID=${PGID}" \
+	-e "NEUTRONSYNC_WEB_PASSWORD=${WEB_PASSWORD}" \
+	-e "NEUTRONSYNC_WEB_AUTH=" \
+	-v "${CFG_UNRAID}:/config" -v "${DATA_UNRAID}:/data" \
+	-p 127.0.0.1::8080 \
+	"$IMAGE")"
+wait_healthy "$CID_UNRAID" 90
+docker rm -f "$CID_UNRAID" >/dev/null
+CID_UNRAID=""
+
 # ----- D3 --user (non-root) -----
 log "D3 --user mode starts healthy"
 CFG_USER="${SCRATCH}/config-user"
@@ -260,6 +308,37 @@ CID_USER="$(docker run -d --name "${PREFIX}-user" \
 wait_healthy "$CID_USER" 120
 docker rm -f "$CID_USER" >/dev/null
 CID_USER=""
+
+# ----- AC-2 theme survives container restart -----
+log "AC-2 theme persistence across container restart"
+CFG_AC2="${SCRATCH}/config-ac2"
+DATA_AC2="${SCRATCH}/data-ac2"
+mkdir -p "$CFG_AC2" "$DATA_AC2"
+chmod 777 "$DATA_AC2"
+CID_AC2="$(docker run -d --name "${PREFIX}-ac2" \
+	-e "PUID=${PUID}" -e "PGID=${PGID}" \
+	-e "NEUTRONSYNC_WEB_PASSWORD=${WEB_PASSWORD}" \
+	-v "${CFG_AC2}:/config" -v "${DATA_AC2}:/data" \
+	-p 127.0.0.1::8080 \
+	"$IMAGE")"
+wait_healthy "$CID_AC2" 90
+PORT_AC2="$(host_port "$CID_AC2" 8080)"
+AC2_STATE="${SCRATCH}/ac2-storage.json"
+PYWEB="${ROOT}/web/.venv/bin/python"
+[ -x "$PYWEB" ] || die "web/.venv missing; need Playwright for AC-2"
+export WEB_URL="http://127.0.0.1:${PORT_AC2}"
+export WEB_PASSWORD
+export AC2_STATE
+PHASE=ac2-set "$PYWEB" "${ROOT}/docker/test_web_e2e.py" || die "AC-2 set theme failed"
+docker exec "$CID_AC2" sh -c 'grep -rq dark /config/web/.nicegui/' \
+	|| die "AC-2 theme not written under .nicegui"
+docker restart "$CID_AC2" >/dev/null
+wait_healthy "$CID_AC2" 120
+PORT_AC2="$(host_port "$CID_AC2" 8080)"
+export WEB_URL="http://127.0.0.1:${PORT_AC2}"
+PHASE=ac2-check "$PYWEB" "${ROOT}/docker/test_web_e2e.py" || die "AC-2 theme persistence failed"
+docker rm -f "$CID_AC2" >/dev/null
+CID_AC2=""
 
 # ----- AC-8 / AC-9 through the web UI + fake remote delete -----
 log "AC-8/AC-9 web UI + fake sidecar remote delete"

@@ -1,6 +1,6 @@
 import { timingSafeEqual } from 'node:crypto';
 import { getSrp, computeKeyPassword } from '@protontech/crypto/srp';
-import { version } from '../package.json';
+import { neutronsyncDriveVersion } from './build-version';
 import { Fault, httpFault } from './errors';
 import type { Notify, SafeLog } from './log';
 import { InvalidStoredSession, KeyringLocked, type Session, type SessionStore } from './store';
@@ -14,7 +14,7 @@ function debugApi(response: Response, code: unknown) {
   process.stderr.write(JSON.stringify({ debug: 'api', path, status: response.status, code: typeof code === 'number' ? code : null }) + '\n');
 }
 
-export const appVersion = `external-drive-neutronsync@${version}-dev`;
+export const appVersion = `external-drive-neutronsync@${neutronsyncDriveVersion}`;
 export type Fetch = (url: string, init: RequestInit) => Promise<Response>;
 export interface AuthCrypto {
   proof: typeof getSrp;

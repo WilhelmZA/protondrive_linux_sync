@@ -71,7 +71,7 @@ test('compiled binary implements the complete RPC contract against fake HTTP', a
     expect(notifications.some(n => n.method === 'log')).toBe(true);
     const output = JSON.stringify(protocol) + stderr;
     for (const secret of ['password-secret', 'mailbox-secret', '123456', 'access-secret', 'refresh-secret', 'salted-mailbox-secret']) expect(output).not.toContain(secret);
-    expect(backend.requests.every(r => r.version === 'external-drive-neutronsync@0.1.0-dev')).toBe(true);
+    expect(backend.requests.every(r => r.version === 'external-drive-neutronsync@0.8.0-dev')).toBe(true);
     child.stdin.end();
     expect(await exited).toBe(0);
   } finally {

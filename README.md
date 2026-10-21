@@ -12,6 +12,8 @@
 
 NeutronSync keeps local folders and their Proton Drive counterparts in sync through a three-way-merge engine. Its CLI and native GUI share one core library. The bundled `neutronsync-drive` sidecar uses Proton's SDK and owns the API session.
 
+For a headless install with a browser interface, use the Docker image (`ghcr.io/wilhelmza/neutronsync:edge`). See [Run on Unraid or Docker](#run-on-unraid-or-docker).
+
 <p align="center">
   <img src="docs/screenshots/activity-syncing.png" width="840" alt="NeutronSync Activity page during a sync: a status banner, files in flight and the recent file feed">
 </p>
@@ -264,7 +266,7 @@ Until NeutronSync is listed in Community Applications, add this template reposit
 https://raw.githubusercontent.com/WilhelmZA/protondrive_linux_sync/rust/packaging/unraid/
 ```
 
-Install from the template (`ghcr.io/wilhelmza/neutronsync:latest`). Set **Web Password** (`NEUTRONSYNC_WEB_PASSWORD`, at least 12 characters) before the first start — without it the health check stays unhealthy and the log says so in one line. Defaults map `/config` to `/mnt/user/appdata/neutronsync` and `/data` to `/mnt/user`; narrow `/data` to the shares you sync. See [`packaging/unraid/README.md`](packaging/unraid/README.md).
+Install from the template (`ghcr.io/wilhelmza/neutronsync:edge` until `:latest` exists after a promoted release). Set **Web Password** (`NEUTRONSYNC_WEB_PASSWORD`, at least 12 characters) before the first start — without it the health check stays unhealthy and the log says so in one line. Defaults map `/config` to `/mnt/user/appdata/neutronsync` and `/data` to `/mnt/user`; narrow `/data` to the shares you sync. See [`packaging/unraid/README.md`](packaging/unraid/README.md).
 
 ### Plain Docker
 

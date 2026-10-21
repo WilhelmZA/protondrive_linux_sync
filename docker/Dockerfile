@@ -31,10 +31,12 @@ RUN cargo build --release --features serve --bin neutronsync \
 # ----- sidecar: Bun-compiled neutronsync-drive -----
 FROM oven/bun:1.4.0 AS sidecar
 WORKDIR /src/sidecar
+COPY Cargo.toml /src/Cargo.toml
 COPY sidecar/package.json sidecar/bun.lock sidecar/tsconfig.json sidecar/legacy-session.json ./
 COPY sidecar/src ./src
 COPY sidecar/tests ./tests
 COPY sidecar/build.sh ./
+ENV NEUTRONSYNC_RELEASE_BUILD=1
 RUN bun install --frozen-lockfile \
 	&& ./build.sh \
 	&& bun test tests/file-store.test.ts
@@ -92,7 +94,8 @@ COPY --from=sidecar --chmod=755 /src/sidecar/dist/neutronsync-drive /usr/local/b
 COPY --from=web /app/web /app/web
 RUN ln -sf /app/web/.venv/bin/neutronsync-web /usr/local/bin/neutronsync-web
 
-COPY --chmod=755 docker/neutronsync.toml /defaults/neutronsync.toml
+COPY --chmod=644 docker/neutronsync.toml /defaults/neutronsync.toml
+RUN chmod 755 /defaults
 COPY --chmod=755 docker/rootfs/ /
 # Ensure the per-volume trash wrapper wins over /usr/bin/gio.
 RUN chmod 755 /usr/local/bin/gio

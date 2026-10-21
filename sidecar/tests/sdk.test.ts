@@ -16,7 +16,7 @@ test('actual SDK propagates missing and unauthorized My-files reads without crea
       const path = new URL(url).pathname;
       if (path.startsWith('/drive/')) {
         sdkRequests.push({ path, method: init.method ?? 'GET' });
-        expect(new Headers(init.headers).get('x-pm-appversion')).toBe('external-drive-neutronsync@0.1.0-dev');
+        expect(new Headers(init.headers).get('x-pm-appversion')).toBe('external-drive-neutronsync@0.8.0-dev');
         return Response.json({ Code: 2501 }, { status });
       }
       return backend.fetch(url, init);

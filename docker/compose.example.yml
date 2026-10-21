@@ -9,7 +9,8 @@
 
 services:
   neutronsync:
-    image: ghcr.io/wilhelmza/neutronsync:latest
+    # Use :latest after a release image has been promoted to stable; until then use :edge or a version tag.
+    image: ghcr.io/wilhelmza/neutronsync:edge
     container_name: neutronsync
     restart: unless-stopped
     ports:

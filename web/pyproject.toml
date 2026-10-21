@@ -48,3 +48,6 @@ src = ["src", "tests", "scripts"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/neutronsync_web/__main__.py" = ["E402"]

@@ -25,3 +25,10 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     assert s.web_host == "127.0.0.1"
     assert s.web_port == 8080
     assert s.web_auth == "password"
+
+
+def test_empty_web_auth_means_password(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.setenv("NEUTRONSYNC_WEB_AUTH", "")
+    monkeypatch.setenv("NEUTRONSYNC_WEB_DATA", str(tmp_path))
+    s = load_settings()
+    assert s.web_auth == "password"
