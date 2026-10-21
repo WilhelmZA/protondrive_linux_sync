@@ -1170,9 +1170,11 @@ fn pairs_are_added_renamed_and_removed_without_touching_files() {
         text.contains("name = \"papers\"") && !text.contains("name = \"docs\""),
         "{text}"
     );
+    let other = lab.path("other");
+    fs::create_dir_all(&other).unwrap();
     let r = server.put(
         "/api/v1/pairs/nope",
-        json!({"name":"x","local":docs,"remote":"x"}),
+        json!({"name":"x","local":other,"remote":"Other"}),
     );
     assert_eq!(r.status, 404);
 
@@ -1215,6 +1217,66 @@ fn pairs_are_added_renamed_and_removed_without_touching_files() {
         json!({"name":"in","local":allowed.join("inside"),"remote":"x"}),
     );
     assert_eq!(r.status, 201, "{}", r.body);
+    assert_eq!(server.stop().0, 0);
+}
+
+#[test]
+fn settings_and_pairs_reject_invalid_limits_and_overlap() {
+    let lab = Lab::new();
+    let server = lab.serve(&[]);
+    let r = server.put("/api/v1/settings", json!({"scan_threads": 9999}));
+    assert_eq!((r.status, r.code().as_str()), (422, "invalid_config"));
+    assert!(r.json()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("scan_threads"));
+    let r = server.put("/api/v1/settings", json!({"scan_threads": 64}));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let r = server.put("/api/v1/settings", json!({"remote_root": "relative"}));
+    assert_eq!((r.status, r.code().as_str()), (422, "invalid_config"));
+    assert!(r.json()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("remote_root"));
+
+    let a = lab.path("a");
+    let nested = a.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    let r = server.post(
+        "/api/v1/pairs",
+        json!({"name":"outer","local":a,"remote":"/my-files/Outer"}),
+    );
+    assert_eq!(r.status, 201);
+    let r = server.post(
+        "/api/v1/pairs",
+        json!({"name":"inner","local":nested,"remote":"/my-files/Other"}),
+    );
+    assert_eq!((r.status, r.code().as_str()), (422, "invalid_config"));
+    assert!(r.json()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("outer"));
+    let r = server.post(
+        "/api/v1/pairs",
+        json!({"name":"bad","local":a,"remote":"/my-files/../x"}),
+    );
+    assert_eq!((r.status, r.code().as_str()), (422, "invalid_config"));
+    let r = server.put(
+        "/api/v1/settings",
+        json!({"remote_root": "/my-files//Shared"}),
+    );
+    assert_eq!((r.status, r.code().as_str()), (422, "invalid_config"));
+    assert!(r.json()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("remote_root"));
+    let other = lab.path("other");
+    fs::create_dir_all(&other).unwrap();
+    let r = server.post(
+        "/api/v1/pairs",
+        json!({"name":"root","local":other,"remote":"/"}),
+    );
+    assert_eq!((r.status, r.code().as_str()), (422, "invalid_config"));
     assert_eq!(server.stop().0, 0);
 }
 

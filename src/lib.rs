@@ -17,6 +17,7 @@ pub mod datefmt;
 pub mod driveapi;
 pub mod engine;
 pub mod events;
+pub mod fs_mode;
 pub mod ignore;
 pub mod logger;
 pub mod models;

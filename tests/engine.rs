@@ -2704,6 +2704,186 @@ fn rate_limited_retry_after_raises_the_wait() {
 }
 
 #[test]
+fn local_and_remote_without_baseline_keeps_both() {
+    let t = Tmp::new("no-base-conflict");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/readme.txt"), "local-B");
+    store
+        .borrow_mut()
+        .files
+        .insert("/my-files/docs/readme.txt".into(), b"remote-A".to_vec());
+    run(&c, fake, false);
+    let on_disk: Vec<String> = std::fs::read_dir(t.path().join("local"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .collect();
+    assert!(
+        on_disk.iter().any(|s| s.contains("local-B")),
+        "local bytes must survive on disk: {on_disk:?}"
+    );
+    assert_eq!(
+        remote_files(&store)
+            .get("/my-files/docs/readme.txt")
+            .map(String::as_str),
+        Some("remote-A")
+    );
+}
+
+#[test]
+fn newer_policy_keeps_local_bytes_when_sync_state_forgot_the_file() {
+    let t = Tmp::new("no-base-newer");
+    let mut c = cfg(t.path());
+    c.conflict = ConflictPolicy::Newer;
+    let (_fake, store) = FakeRemote::new();
+    write(&t.path().join("local/readme.txt"), "local-B");
+    store
+        .borrow_mut()
+        .files
+        .insert("/my-files/docs/readme.txt".into(), b"remote-A".to_vec());
+    set_mtime(&t.path().join("local/readme.txt"), 100);
+    store
+        .borrow_mut()
+        .mtimes
+        .insert("/my-files/docs/readme.txt".into(), 200);
+    let mut gone = std::collections::HashSet::new();
+    gone.insert("readme.txt".to_string());
+    neutronsync::state::commit_baseline(&c.state_dir, "docs", &BTreeMap::new(), &gone).unwrap();
+    let (fake, _s) = reuse(&store);
+    run(&c, fake, false);
+    let on_disk: Vec<String> = std::fs::read_dir(t.path().join("local"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .collect();
+    assert!(
+        on_disk.iter().any(|s| s.contains("local-B")),
+        "newer policy must not overwrite a local file with no remembered row: {on_disk:?}"
+    );
+}
+
+#[test]
+fn explicit_sync_picks_up_local_change_without_watcher() {
+    let t = Tmp::new("explicit-local");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/note.txt"), "v1");
+    run(&c, fake, false);
+    write(&t.path().join("local/note.txt"), "v2-edited");
+    let (fake2, _s) = reuse(&store);
+    run(&c, fake2, false);
+    assert_eq!(
+        remote_files(&store)
+            .get("/my-files/docs/note.txt")
+            .map(String::as_str),
+        Some("v2-edited")
+    );
+}
+
+#[test]
+fn incomplete_remote_listing_does_not_prune_stale_rows() {
+    let t = Tmp::new("no-prune-blind");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/a.txt"), "a");
+    write(&t.path().join("local/sub/b.txt"), "b");
+    run(&c, fake, false);
+    store.borrow_mut().fail_dir = Some("/my-files/docs/sub".to_string());
+    std::fs::remove_file(t.path().join("local/sub/b.txt")).unwrap();
+    {
+        let mut s = store.borrow_mut();
+        s.files.remove("/my-files/docs/sub/b.txt");
+    }
+    let (fake2, _s) = reuse(&store);
+    run(&c, fake2, false);
+    assert!(
+        baseline(&c).contains_key("sub/b.txt"),
+        "blind listing must not prune rows: {:?}",
+        baseline(&c)
+    );
+}
+
+#[test]
+fn two_pairs_one_remote_local_edit_survives() {
+    // Reproduces #35: a stale baseline row is dropped while the local file still
+    // exists, then a sync must not treat the local copy as missing and download
+    // over it.
+    let t = Tmp::new("issue-35");
+    let mut c = cfg(t.path());
+    c.pairs[0].name = "primary".into();
+    c.pairs[0].local = t.path().join("primary");
+    c.pairs[0].remote = "/my-files/shared".into();
+    c.pairs.push(Pair {
+        name: "mirror".into(),
+        local: t.path().join("mirror"),
+        remote: "/my-files/shared".into(),
+        auto: false,
+        exclude: vec![],
+    });
+    let (fake, store) = FakeRemote::new();
+    store
+        .borrow_mut()
+        .dirs
+        .insert("/my-files/shared".to_string());
+    std::fs::create_dir_all(t.path().join("primary/Mirror")).unwrap();
+    write(&t.path().join("primary/Mirror/readme.txt"), "A");
+    let log = Logger::silent();
+    let mut eng = Engine::new(&c, fake, &log, false);
+    eng.sync_pair(&c.pairs[0], false).unwrap();
+    write(&t.path().join("primary/Mirror/readme.txt"), "B");
+    store.borrow_mut().files.insert(
+        "/my-files/shared/Mirror/readme.txt".into(),
+        b"A-from-remote".to_vec(),
+    );
+    let mut gone = std::collections::HashSet::new();
+    gone.insert("Mirror/readme.txt".to_string());
+    neutronsync::state::commit_baseline(&c.state_dir, "primary", &BTreeMap::new(), &gone).unwrap();
+    let (fake2, _s) = reuse(&store);
+    let mut eng = Engine::new(&c, fake2, &log, false);
+    eng.sync_pair(&c.pairs[0], false).unwrap();
+    let primary = t.path().join("primary/Mirror");
+    let on_disk: Vec<String> = std::fs::read_dir(&primary)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .collect();
+    assert!(
+        on_disk.iter().any(|s| s.contains('B')),
+        "local edit must survive as the file or a conflict copy: {on_disk:?}"
+    );
+}
+
+fn download_with_umask(mask: u32, want: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let old = unsafe { libc::umask(mask) };
+    let t = Tmp::new(&format!("umask-{mask:o}"));
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    store
+        .borrow_mut()
+        .files
+        .insert("/my-files/docs/f.txt".into(), b"data".to_vec());
+    run(&c, fake, false);
+    let mode = std::fs::metadata(t.path().join("local/f.txt"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, want,
+        "umask {mask:o} should yield {want:o}, got {mode:o}"
+    );
+    unsafe { libc::umask(old) };
+}
+
+#[test]
+fn download_mode_respects_umask_022_and_002() {
+    download_with_umask(0o022, 0o644);
+    download_with_umask(0o002, 0o664);
+}
+
+#[test]
 fn rate_limited_pause_above_five_minutes_is_left_for_the_next_run() {
     let t = Tmp::new("retry-after-long");
     let c = cfg(t.path());

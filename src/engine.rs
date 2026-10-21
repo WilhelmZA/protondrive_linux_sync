@@ -1150,6 +1150,7 @@ impl<'a, R: Remote> Engine<'a, R> {
         baseline: &BTreeMap<String, Entry>,
         pair: &Pair,
         scope: Option<&str>,
+        local_incomplete: &mut bool,
     ) -> BTreeMap<String, Entry> {
         let mut out = BTreeMap::new();
         if !root.exists() {
@@ -1211,6 +1212,8 @@ impl<'a, R: Remote> Engine<'a, R> {
                     Err(_) => {
                         if let Some(b) = baseline.get(&rel) {
                             out.insert(rel.clone(), b.clone());
+                        } else {
+                            *local_incomplete = true;
                         }
                         continue;
                     }
@@ -1356,9 +1359,10 @@ impl<'a, R: Remote> Engine<'a, R> {
             );
         }
 
-        let local = self.scan_local(&pair.local, &base, pair, scope);
+        let mut local_incomplete = false;
+        let local = self.scan_local(&pair.local, &base, pair, scope, &mut local_incomplete);
         let (remote, remote_failed, remote_root_missing) = self.scan_remote(pair, scope)?;
-        let mut incomplete = !remote_failed.is_empty();
+        let mut incomplete = !remote_failed.is_empty() || local_incomplete;
         if incomplete {
             self.log.warn(&format!(
                 "remote scan incomplete for {:?}: {} folder(s) could not be listed; \
@@ -1436,10 +1440,11 @@ impl<'a, R: Remote> Engine<'a, R> {
             }
             let lc = *ls.get(path).unwrap_or(&Change::Absent);
             let rc = *rs.get(path).unwrap_or(&Change::Absent);
-            if lc == Change::Deleted && rc == Change::Deleted && !incomplete {
+            if lc == Change::Deleted && rc == Change::Deleted && !incomplete && scope.is_none() {
                 gone.insert(path.clone());
             }
             self.decide(
+                pair,
                 path,
                 lc,
                 rc,
@@ -1487,6 +1492,7 @@ impl<'a, R: Remote> Engine<'a, R> {
     #[allow(clippy::too_many_arguments)]
     fn decide(
         &self,
+        pair: &Pair,
         path: &str,
         lc: Change,
         rc: Change,
@@ -1533,7 +1539,7 @@ impl<'a, R: Remote> Engine<'a, R> {
         }
 
         if is_dir {
-            self.decide_dir(path, lc, rc, le, re, plan, new_base);
+            self.decide_dir(pair, path, lc, rc, le, re, plan, new_base);
             return;
         }
 
@@ -1556,6 +1562,14 @@ impl<'a, R: Remote> Engine<'a, R> {
             return;
         }
         if rc == Created && lc == Absent {
+            if let Ok(local_full) = safe_join(&pair.local, path) {
+                if local_full.is_file() {
+                    // D1: bytes on disk with no remembered row — keep both, never
+                    // Newer/Skip that would overwrite or drop the local copy.
+                    self.emit_conflict_keep_both(path, re.or(be), plan, new_base);
+                    return;
+                }
+            }
             self.emit_download(path, re, plan, new_base, "new remote");
             return;
         }
@@ -1586,7 +1600,7 @@ impl<'a, R: Remote> Engine<'a, R> {
                     }
                 }
             }
-            self.emit_conflict(path, le, re, plan, new_base);
+            self.emit_conflict(pair, path, le, re, be, plan, new_base);
             return;
         }
         // deletions
@@ -1631,6 +1645,7 @@ impl<'a, R: Remote> Engine<'a, R> {
     #[allow(clippy::too_many_arguments)]
     fn decide_dir(
         &self,
+        _pair: &Pair,
         path: &str,
         lc: Change,
         rc: Change,
@@ -1705,14 +1720,26 @@ impl<'a, R: Remote> Engine<'a, R> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_conflict(
         &self,
+        pair: &Pair,
         path: &str,
         le: Option<&Entry>,
         re: Option<&Entry>,
+        be: Option<&Entry>,
         plan: &mut Plan,
         nb: &mut BTreeMap<String, Entry>,
     ) {
+        // D1: no remembered row but the file is still on disk — keep both.
+        if be.is_none() {
+            if let Ok(local_full) = safe_join(&pair.local, path) {
+                if local_full.is_file() {
+                    self.emit_conflict_keep_both(path, re, plan, nb);
+                    return;
+                }
+            }
+        }
         // Every op here carries its outcome, so `apply` can report which way
         // the conflict went once the op has really succeeded.
         match self.cfg.conflict {
@@ -2107,7 +2134,9 @@ impl<'a, R: Remote> Engine<'a, R> {
             match r {
                 Ok(()) => {
                     applied.fetch_add(1, Ordering::Relaxed);
-                    match_mtime(&local_root.join(&j.rel), j.mtime);
+                    let local_path = local_root.join(&j.rel);
+                    match_mtime(&local_path, j.mtime);
+                    crate::fs_mode::set_sync_file_permissions(&local_path);
                     done_rels.lock().unwrap().push(j.rel.clone());
                     if let (Some(outcome), Some(s)) = (settles.get(j.rel.as_str()), events) {
                         s.emit(&SyncEvent::ConflictSettled {
@@ -2394,6 +2423,7 @@ impl<'a, R: Remote> Engine<'a, R> {
                 std::fs::create_dir_all(&dest_dir)?;
                 self.remote
                     .download(&remote_full, &dest_dir.to_string_lossy())?;
+                crate::fs_mode::set_sync_file_permissions(&local_full);
                 if let Some(e) = new_base.get(&op.path) {
                     match_mtime(&local_full, e.mtime);
                 }
@@ -2447,6 +2477,8 @@ impl<'a, R: Remote> Engine<'a, R> {
         std::fs::create_dir_all(&dest_dir)?;
         self.remote
             .download(&remote_join(&pair.remote, rel), &dest_dir.to_string_lossy())?;
+        crate::fs_mode::set_sync_file_permissions(&local_full);
+        crate::fs_mode::set_sync_file_permissions(&conflict_full);
         // push the renamed local copy up so both versions exist on both sides
         let parent = parent_rel(&conflict_rel);
         self.ensure_remote_dir(&pair.remote, parent)?;
@@ -2907,6 +2939,7 @@ impl<'a, R: Remote> Engine<'a, R> {
                 gone.push((path.clone(), is_dir));
             }
             self.decide(
+                pair,
                 path,
                 lc,
                 rc,

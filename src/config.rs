@@ -13,6 +13,9 @@ use crate::models::Compare;
 
 pub const DEFAULT_REMOTE_ROOT: &str = "/my-files";
 
+/// Highest allowed value for `scan_threads` and `download_threads` (0 means auto).
+pub const MAX_SYNC_THREADS: usize = 64;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LocalDelete {
     Trash,
@@ -292,6 +295,139 @@ fn expand_vars(s: &str) -> String {
     out
 }
 
+/// A Proton folder path must be absolute and every segment must be a real name.
+pub fn validate_proton_path(field: &str, path: &str) -> Result<()> {
+    if !path.starts_with('/') {
+        bail!("{field} must start with /.");
+    }
+    let body = path.trim_end_matches('/');
+    if body.len() > 1 {
+        for seg in body[1..].split('/') {
+            if seg.is_empty() {
+                bail!("{field} must not contain empty path steps.");
+            }
+            if seg == "." || seg == ".." {
+                bail!("{field} must not contain . or .. steps.");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_remote_path(path: &str) -> String {
+    let parts: Vec<&str> = path
+        .trim_end_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", parts.join("/"))
+    }
+}
+
+fn normalize_local_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        if let Ok(c) = std::fs::canonicalize(path) {
+            return Ok(c);
+        }
+    }
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::Prefix(p) => out.push(p.as_os_str()),
+            std::path::Component::RootDir => out.push(std::path::MAIN_SEPARATOR_STR),
+            std::path::Component::Normal(n) => out.push(n),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                bail!("local folder paths must not contain .. steps");
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn remote_paths_overlap(a: &str, b: &str) -> bool {
+    let a = normalize_remote_path(a);
+    let b = normalize_remote_path(b);
+    if a == "/" || b == "/" {
+        return true;
+    }
+    a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+}
+
+fn local_paths_overlap(a: &Path, b: &Path) -> Result<bool> {
+    let a = normalize_local_path(a)?;
+    let b = normalize_local_path(b)?;
+    Ok(a == b || a.starts_with(&b) || b.starts_with(&a))
+}
+
+/// Rules shared by the config file, the HTTP API and the desktop window.
+pub fn validate_config(cfg: &Config) -> Result<()> {
+    if cfg.scan_threads > MAX_SYNC_THREADS {
+        bail!(
+            "scan_threads must be 0 (automatic) to {MAX_SYNC_THREADS}, got {0}.",
+            cfg.scan_threads
+        );
+    }
+    if cfg.download_threads > MAX_SYNC_THREADS {
+        bail!(
+            "download_threads must be 0 (automatic) to {MAX_SYNC_THREADS}, got {0}.",
+            cfg.download_threads
+        );
+    }
+    validate_proton_path("remote_root", &cfg.remote_root)?;
+    for p in &cfg.pairs {
+        validate_proton_path("remote folder", &p.remote)?;
+        for other in &cfg.pairs {
+            if other.name == p.name {
+                continue;
+            }
+            if local_paths_overlap(&p.local, &other.local)? {
+                bail!(
+                    "{} already syncs {}; one folder cannot be in two pairs.",
+                    other.name,
+                    other.local.display()
+                );
+            }
+            if remote_paths_overlap(&p.remote, &other.remote) {
+                bail!(
+                    "{} already syncs {}; one folder cannot be in two pairs.",
+                    other.name,
+                    other.remote
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Check a new or updated pair against the rest of the config.
+pub fn validate_pair(cfg: &Config, pair: &Pair, replacing: Option<&str>) -> Result<()> {
+    validate_proton_path("remote folder", &pair.remote)?;
+    for other in &cfg.pairs {
+        if replacing == Some(other.name.as_str()) || other.name == pair.name {
+            continue;
+        }
+        if local_paths_overlap(&pair.local, &other.local)? {
+            bail!(
+                "{} already syncs {}; one folder cannot be in two pairs.",
+                other.name,
+                other.local.display()
+            );
+        }
+        if remote_paths_overlap(&pair.remote, &other.remote) {
+            bail!(
+                "{} already syncs {}; one folder cannot be in two pairs.",
+                other.name,
+                other.remote
+            );
+        }
+    }
+    Ok(())
+}
+
 fn join_remote(root: &str, remote: &str) -> String {
     let remote = remote.trim();
     if remote.starts_with('/') {
@@ -435,12 +571,24 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         });
     }
 
-    Ok(Config {
+    let scan_threads = cli.scan_threads.map(|n| n as usize).unwrap_or(0);
+    let download_threads = cli.download_threads.map(|n| n as usize).unwrap_or(0);
+    if scan_threads > MAX_SYNC_THREADS {
+        bail!("scan_threads must be 0 (automatic) to {MAX_SYNC_THREADS}, got {scan_threads}");
+    }
+    if download_threads > MAX_SYNC_THREADS {
+        bail!(
+            "download_threads must be 0 (automatic) to {MAX_SYNC_THREADS}, got {download_threads}"
+        );
+    }
+    validate_proton_path("remote_root", &remote_root)?;
+
+    let config = Config {
         sidecar: cli.sidecar.map(|p| expand(&p)),
         session_store,
         session_key_file: cli.session_key_file.map(|p| expand(&p)),
-        scan_threads: cli.scan_threads.map(|n| n as usize).unwrap_or(0),
-        download_threads: cli.download_threads.map(|n| n as usize).unwrap_or(0),
+        scan_threads,
+        download_threads,
         remote_root,
         propagate_deletes: opts.propagate_deletes.unwrap_or(false),
         max_delete_files: opts.max_delete_files.unwrap_or(200) as usize,
@@ -464,7 +612,9 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         state_dir,
         pairs,
         source_path: Some(path),
-    })
+    };
+    validate_config(&config)?;
+    Ok(config)
 }
 
 /// Highest speed limit accepted, in KiB/s: 1 GiB/s. Anything above it is a typo.

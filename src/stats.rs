@@ -284,6 +284,12 @@ impl Stats {
             .with_context(|| format!("preparing sync state {}", path.display()))?;
         let now = crate::datefmt::now_epoch();
         let _ = stats.prune_conflicts(now - CONFLICT_KEEP_SECS);
+        for suffix in ["", "-wal", "-shm"] {
+            let p = state_dir.join(format!("stats.db{suffix}"));
+            if p.exists() {
+                crate::fs_mode::set_private_file_permissions(&p);
+            }
+        }
         Ok(stats)
     }
 
@@ -1008,6 +1014,25 @@ mod tests {
         assert_eq!(digest_of(&path), before, "a refused file must not change");
         // The read-only path refuses it too, never returning an empty baseline.
         assert!(Stats::copied_baseline(dir.path(), "docs").is_err());
+    }
+
+    #[test]
+    fn stats_db_is_private_on_disk() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let _ = Stats::open(dir.path()).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let path = dir.path().join(format!("stats.db{suffix}"));
+            if path.exists() {
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(
+                    mode,
+                    0o600,
+                    "{} should be 0600, was {mode:o}",
+                    path.display()
+                );
+            }
+        }
     }
 
     #[test]

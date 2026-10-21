@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Fixed
 - The About page in the desktop window scrolls again. Long release notes under "What's new" no longer hide the rest of the page (#23).
+- A local file is no longer overwritten when the sync state forgot it but the file is still on disk; both copies are kept instead (#35).
+- Remembered file rows are only dropped when both sides are gone after a full scan of the pair, not during a partial or scoped run (#35).
+- An explicit sync always walks the local folder again, even when auto sync is off (#35).
+- Overlapping local or Proton folders in two pairs are refused when you add them or load the config (#26).
+- Scan and download thread counts above 64, a relative Proton root, and folder paths with empty, `.` or `..` steps are refused in settings and synced folders (#28).
+- Downloaded files and conflict copies use your umask instead of always being private to you (#39).
+- The sync state database is created readable only by you (#33).
 
 ## [0.8.0] - 2026-10-20
 

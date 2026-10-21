@@ -1,6 +1,7 @@
 //! The `/api/v1` routes. See `docs/HTTP_API.md` for the contract.
 
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -606,11 +607,22 @@ fn yes() -> bool {
 }
 
 impl PairIn {
-    fn check(&self, ctx: &Ctx) -> ApiResult<()> {
+    fn check(&self, ctx: &Ctx, replacing: Option<&str>) -> ApiResult<()> {
         if self.name.trim().is_empty() {
             return Err(ApiError::invalid_config("A synced folder needs a name."));
         }
         files::check_pair_local(&ctx.pair_roots, &self.local)?;
+        let cfg = ctx.ctrl.config();
+        let remote = config::remote_join(&cfg.remote_root, &self.remote);
+        let pair = config::Pair {
+            name: self.name.trim().to_string(),
+            local: PathBuf::from(&self.local),
+            remote,
+            auto: self.auto,
+            exclude: self.exclude.clone(),
+        };
+        config::validate_pair(&cfg, &pair, replacing)
+            .map_err(|e| ApiError::invalid_config(format!("{e:#}")))?;
         Ok(())
     }
 
@@ -664,7 +676,7 @@ async fn pairs_get(State(ctx): Ctl) -> Json<Vec<PairOut>> {
 }
 
 async fn pairs_add(State(ctx): Ctl, Body(pair): Body<PairIn>) -> ApiResult<impl IntoResponse> {
-    pair.check(&ctx)?;
+    pair.check(&ctx, None)?;
     let name = pair.name.trim().to_string();
     let next = edit_config(&ctx, move |doc| {
         let list = pair_list(doc);
@@ -686,7 +698,7 @@ async fn pairs_replace(
     Path(old): Path<String>,
     Body(pair): Body<PairIn>,
 ) -> ApiResult<Json<Vec<PairOut>>> {
-    pair.check(&ctx)?;
+    pair.check(&ctx, Some(old.as_str()))?;
     let new_name = pair.name.trim().to_string();
     let old2 = old.clone();
     let next = edit_config(&ctx, move |doc| {

@@ -2427,15 +2427,20 @@ impl App {
                     .unwrap_or("folder")
                     .to_string();
                 let remote = config::remote_join(&self.cfg.remote_root, &name);
-                self.cfg.pairs.push(Pair {
+                let pair = Pair {
                     name: name.clone(),
                     local: dir,
                     remote,
                     auto: true,
                     exclude: Vec::new(),
-                });
-                changed = true;
-                sync_one = Some(name); // auto-initialize: scan both sides + first sync
+                };
+                if let Err(e) = config::validate_pair(&self.cfg, &pair, None) {
+                    self.toast(ui.ctx(), format!("{e:#}"), true);
+                } else {
+                    self.cfg.pairs.push(pair);
+                    changed = true;
+                    sync_one = Some(name); // auto-initialize: scan both sides + first sync
+                }
             }
         }
         if do_browse {

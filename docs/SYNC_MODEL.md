@@ -26,7 +26,7 @@ First start subscribes before walking and stores the starting cursor only after 
 
 For each folder pair NeutronSync keeps a **baseline**: the last state the two sides agreed on, stored per file in SQLite (`stats.db`, table `baseline`, keyed by `(pair, rel)`). A sync classifies every path on each side against the baseline as Created, Modified, Deleted, Unchanged, or Absent, then combines the two verdicts to pick an action (`decide` / `decide_dir` in `engine.rs`).
 
-The baseline commit is **additive**: `commit_baseline` writes the rows that synced this run and deletes the rows explicitly marked removed. It never rewrites the whole pair. This is what makes a partial or scoped sync safe: it only ever touches the rows it actually reconciled.
+The baseline commit is **additive**: `commit_baseline` writes the rows that synced this run and deletes the rows explicitly marked removed. It never rewrites the whole pair. This is what makes a partial or scoped sync safe: it only ever touches the rows it actually reconciled. Rows are dropped as gone on both sides only after a **full** walk of the pair with complete local and remote listings; a scoped run or a blind listing never prunes outside what it fully saw. If the baseline forgot a path but the local file is still there, the next sync treats it as a conflict instead of downloading over it.
 
 ## Detecting changes: shallow, folder-scoped syncs
 
