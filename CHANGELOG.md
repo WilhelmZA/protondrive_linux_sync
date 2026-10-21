@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Changed
+- The Unraid template moved to its own repository, [WilhelmZA/unraid-templates](https://github.com/WilhelmZA/unraid-templates), for Community Applications. It and the compose example use `:latest` now that a release with the image is stable.
+
 ## [0.8.2] - 2026-10-21
 
 0.8.1 was tagged but never published: its release build failed. This release carries every 0.8.1 change listed below, plus these.

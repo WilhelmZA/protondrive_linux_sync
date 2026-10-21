@@ -2,10 +2,10 @@
 
 ## Community Applications
 
-Until NeutronSync is listed in Community Applications, add this repository URL under **Apps → Settings → Template Repositories**:
+The template lives in [WilhelmZA/unraid-templates](https://github.com/WilhelmZA/unraid-templates), the repository submitted to Community Applications. Until NeutronSync is listed there, add it under **Apps → Settings → Template Repositories**:
 
 ```
-https://raw.githubusercontent.com/WilhelmZA/protondrive_linux_sync/rust/packaging/unraid/
+https://github.com/WilhelmZA/unraid-templates
 ```
 
 Then search for NeutronSync and install from the template. The template pulls `ghcr.io/wilhelmza/neutronsync:latest`.
@@ -41,4 +41,4 @@ With `local_delete = "trash"` (the default), a local file removed because it was
 
 Unraid follows the `latest` tag. That tag moves when a release is promoted to stable (`scripts/promote.sh`), not when a pre-release is published.
 
-The image first ships with 0.8.0, a pre-release, so `latest` does not exist yet. Change **Repository** to `ghcr.io/wilhelmza/neutronsync:edge` (every release) or `ghcr.io/wilhelmza/neutronsync:0.8.0` (one version) until a release with the image is promoted.
+To follow every pre-release, change **Repository** to `ghcr.io/wilhelmza/neutronsync:edge`; to stay on one version, use a version tag such as `ghcr.io/wilhelmza/neutronsync:0.8.2`.

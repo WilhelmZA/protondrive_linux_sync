@@ -12,7 +12,7 @@
 
 NeutronSync keeps local folders and their Proton Drive counterparts in sync through a three-way-merge engine. Its CLI and native GUI share one core library. The bundled `neutronsync-drive` sidecar uses Proton's SDK and owns the API session.
 
-For a headless install with a browser interface, use the Docker image (`ghcr.io/wilhelmza/neutronsync:edge`). See [Run on Unraid or Docker](#run-on-unraid-or-docker).
+For a headless install with a browser interface, use the Docker image (`ghcr.io/wilhelmza/neutronsync:latest`). See [Run on Unraid or Docker](#run-on-unraid-or-docker).
 
 <p align="center">
   <img src="docs/screenshots/activity-syncing.png" width="840" alt="NeutronSync Activity page during a sync: a status banner, files in flight and the recent file feed">
@@ -263,10 +263,10 @@ The container image runs `neutronsync serve` and the browser interface together.
 Until NeutronSync is listed in Community Applications, add this template repository under **Apps → Settings → Template Repositories**:
 
 ```
-https://raw.githubusercontent.com/WilhelmZA/protondrive_linux_sync/rust/packaging/unraid/
+https://github.com/WilhelmZA/unraid-templates
 ```
 
-Install from the template (`ghcr.io/wilhelmza/neutronsync:edge` until `:latest` exists after a promoted release). Set **Web Password** (`NEUTRONSYNC_WEB_PASSWORD`, at least 12 characters) before the first start — without it the health check stays unhealthy and the log says so in one line. Defaults map `/config` to `/mnt/user/appdata/neutronsync` and `/data` to `/mnt/user`; narrow `/data` to the shares you sync. See [`packaging/unraid/README.md`](packaging/unraid/README.md).
+Install from the template (`ghcr.io/wilhelmza/neutronsync:latest`). The template lives in [WilhelmZA/unraid-templates](https://github.com/WilhelmZA/unraid-templates). Set **Web Password** (`NEUTRONSYNC_WEB_PASSWORD`, at least 12 characters) before the first start — without it the health check stays unhealthy and the log says so in one line. Defaults map `/config` to `/mnt/user/appdata/neutronsync` and `/data` to `/mnt/user`; narrow `/data` to the shares you sync. See [`packaging/unraid/README.md`](packaging/unraid/README.md).
 
 ### Plain Docker
 
@@ -306,7 +306,7 @@ Set `NEUTRONSYNC_WEB_AUTH=proxy` and terminate TLS/login at Traefik or Caddy. In
 
 Every release tag builds and signs `ghcr.io/wilhelmza/neutronsync:<version>` and `:edge`. Promoting a release to stable moves `:latest` to that version. Unraid follows `latest`, so it picks up promoted releases only.
 
-The image is new in 0.8.0, which ships as a pre-release, so `:latest` does not exist until a release with the image is promoted. Until then, set the Unraid **Repository** field (or the compose `image:`) to `ghcr.io/wilhelmza/neutronsync:edge` to follow every release, or to `:0.8.0` to stay on one.
+To follow every pre-release instead, set the Unraid **Repository** field (or the compose `image:`) to `ghcr.io/wilhelmza/neutronsync:edge`, or to a version tag such as `:0.8.2` to stay on one.
 
 ## Updates
 
