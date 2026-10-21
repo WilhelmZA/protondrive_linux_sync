@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test';
 import { createInterface } from 'node:readline';
 import { spawn } from 'node:child_process';
 import { binary } from './compiled';
+import { appVersion } from '../src/auth';
 import { fixture } from './fixture';
 
 test('compiled binary implements the complete RPC contract against fake HTTP', async () => {
@@ -71,7 +72,7 @@ test('compiled binary implements the complete RPC contract against fake HTTP', a
     expect(notifications.some(n => n.method === 'log')).toBe(true);
     const output = JSON.stringify(protocol) + stderr;
     for (const secret of ['password-secret', 'mailbox-secret', '123456', 'access-secret', 'refresh-secret', 'salted-mailbox-secret']) expect(output).not.toContain(secret);
-    expect(backend.requests.every(r => r.version === 'external-drive-neutronsync@0.8.0-dev')).toBe(true);
+    expect(backend.requests.every(r => r.version === appVersion)).toBe(true);
     child.stdin.end();
     expect(await exited).toBe(0);
   } finally {

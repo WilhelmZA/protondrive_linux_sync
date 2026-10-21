@@ -102,6 +102,8 @@ jobs:
           bun test
 
       - name: Build sidecar
+        env:
+          NEUTRONSYNC_RELEASE_BUILD: "1"
         run: sidecar/build.sh
 
       # build.rs reads this first, so a container checkout that git refuses to

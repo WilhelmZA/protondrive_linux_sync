@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { Auth } from '../src/auth';
+import { Auth, appVersion } from '../src/auth';
 import { SafeLog } from '../src/log';
 import { MemoryStore, fakeCrypto } from './binary-backend';
 import { fixture } from './fixture';
@@ -19,7 +19,7 @@ describe('authentication over fake HTTP', () => {
     expect(await h.auth.login('normal', 'password-secret')).toEqual({ ok: true });
     expect(h.auth.status()).toEqual({ signed_in: true, account: 'normal', keyring_locked: false });
     expect(h.store.value?.keyPassphrase).toBe('salted-password-secret');
-    expect(h.backend.requests.every(r => r.version === 'external-drive-neutronsync@0.8.0-dev')).toBe(true);
+    expect(h.backend.requests.every(r => r.version === appVersion)).toBe(true);
     const restored = new Auth(h.store, fakeCrypto, () => {}, h.log, h.backend.fetch);
     await restored.init();
     expect(restored.status().signed_in).toBe(true);

@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { Auth } from '../src/auth';
+import { Auth, appVersion } from '../src/auth';
 import { Account } from '../src/account';
 import { Drive, sdkClient } from '../src/drive';
 import { classify } from '../src/errors';
@@ -16,7 +16,7 @@ test('actual SDK propagates missing and unauthorized My-files reads without crea
       const path = new URL(url).pathname;
       if (path.startsWith('/drive/')) {
         sdkRequests.push({ path, method: init.method ?? 'GET' });
-        expect(new Headers(init.headers).get('x-pm-appversion')).toBe('external-drive-neutronsync@0.8.0-dev');
+        expect(new Headers(init.headers).get('x-pm-appversion')).toBe(appVersion);
         return Response.json({ Code: 2501 }, { status });
       }
       return backend.fetch(url, init);
