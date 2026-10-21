@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-10-21
+
 ### Fixed
 - Settings no longer send negative numbers to the engine; invalid values show a plain message beside the field (#27).
 - Sync now and dry run are disabled with a hint when no folders are configured, and the API refuses an empty sync the same way (#29).

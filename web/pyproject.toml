@@ -1,6 +1,6 @@
 [project]
 name = "neutronsync-web"
-version = "0.8.0"
+version = "0.8.1"
 description = "Browser interface for NeutronSync"
 requires-python = ">=3.12,<3.13"
 dependencies = [
