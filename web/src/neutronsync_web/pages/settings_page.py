@@ -11,6 +11,9 @@ from neutronsync_web.fmt import (
     CONFLICT_LABELS,
     LOCAL_DELETE_LABELS,
     SPEED_PRESETS,
+    THREAD_MAX,
+    THREAD_MIN,
+    WHOLE_NUMBER_RANGE,
     speed_limit_label,
 )
 from neutronsync_web.pages.layout import page_shell
@@ -34,6 +37,53 @@ def _draft_for_client() -> dict:
 
 def _err(exc: Exception) -> None:
     ui.notify(exc.message if isinstance(exc, ApiError) else str(exc), type="negative")
+
+
+def _whole_number(value, *, lo: int = 0, hi: int | None = None) -> int | None:
+    if value is None or value == "":
+        return 0
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    if n < lo or (hi is not None and n > hi):
+        return None
+    return n
+
+
+def _validate_settings_keys(draft: dict, keys: list[str]) -> bool:
+    s = draft["settings"]
+    errors = draft["errors"]
+    ok = True
+    thread_keys = {"scan_threads", "download_threads"}
+    for key in keys:
+        errors.pop(key, None)
+        val = getattr(s, key, None)
+        if key in thread_keys:
+            n = _whole_number(val, lo=THREAD_MIN, hi=THREAD_MAX)
+            if n is None:
+                errors[key] = WHOLE_NUMBER_RANGE
+                ok = False
+            continue
+        if key == "max_delete_percent":
+            n = _whole_number(val, lo=0, hi=100)
+            if n is None:
+                errors[key] = "max_delete_percent must be a whole number from 0 to 100."
+                ok = False
+            continue
+        if key in {
+            "max_delete_files",
+            "full_walk_interval",
+            "scan_interval",
+            "debounce",
+            "upload_limit_kbps",
+            "download_limit_kbps",
+        }:
+            n = _whole_number(val, lo=0)
+            if n is None:
+                errors[key] = "Enter a whole number from 0 upward."
+                ok = False
+    return ok
 
 
 def render() -> None:
@@ -62,6 +112,16 @@ def render() -> None:
                             draft["settings"].max_delete_percent = int(
                                 draft["_pct_input"].value or 0
                             )
+                        for key, widget in draft.get("_adv_inputs", {}).items():
+                            if key in keys:
+                                setattr(
+                                    draft["settings"],
+                                    key,
+                                    int(widget.value or 0),
+                                )
+                        if not _validate_settings_keys(draft, keys):
+                            form.refresh()
+                            return
                         patch = {k: getattr(draft["settings"], k) for k in keys}
                         try:
                             draft["settings"] = await ctx.get_api().put_settings(patch)
@@ -107,6 +167,7 @@ def render() -> None:
                 files = ui.number(
                     "Most files one run may delete",
                     value=s.max_delete_files,
+                    min=0,
                     on_change=lambda e: setattr(
                         draft["settings"], "max_delete_files", int(e.value or 0)
                     ),
@@ -114,6 +175,7 @@ def render() -> None:
                 pct = ui.number(
                     "Most percent one run may delete",
                     value=s.max_delete_percent,
+                    min=0,
                     on_change=lambda e: setattr(
                         draft["settings"], "max_delete_percent", int(e.value or 0)
                     ),
@@ -164,6 +226,7 @@ def render() -> None:
                     ).props("flat")
 
             def group_advanced() -> None:
+                draft["_adv_inputs"] = {}
                 for label, key in [
                     ("Scan threads", "scan_threads"),
                     ("Download threads", "download_threads"),
@@ -171,11 +234,21 @@ def render() -> None:
                     ("Scan interval (seconds)", "scan_interval"),
                     ("Debounce (seconds)", "debounce"),
                 ]:
-                    ui.number(
-                        label,
-                        value=getattr(s, key),
-                        on_change=lambda e, k=key: setattr(draft["settings"], k, int(e.value or 0)),
-                    ).classes("w-full")
+                    props = ""
+                    if key in ("scan_threads", "download_threads"):
+                        props = f"min={THREAD_MIN} max={THREAD_MAX}"
+                    num = (
+                        ui.number(
+                            label,
+                            value=getattr(s, key),
+                            on_change=lambda e, k=key: setattr(
+                                draft["settings"], k, int(e.value or 0)
+                            ),
+                        )
+                        .props(props)
+                        .classes("w-full")
+                    )
+                    draft["_adv_inputs"][key] = num
                 ui.input(
                     "Remote root",
                     value=s.remote_root,

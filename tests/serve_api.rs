@@ -1757,3 +1757,55 @@ fn simultaneous_starts_give_one_run_and_busy_for_the_rest() {
     assert_eq!(server.stop().0, 0);
     lab.wait_for_sidecars();
 }
+
+#[test]
+fn sync_with_no_configured_pairs_is_refused() {
+    let lab = Lab::new();
+    let cfg = lab.config_text();
+    let trimmed = cfg.split("[[pair]]").next().unwrap_or(&cfg);
+    fs::write(lab.path("config.toml"), trimmed).unwrap();
+    let server = lab.serve(&[]);
+    let r = server.post("/api/v1/sync", json!({"dry_run": true}));
+    assert_eq!((r.status, r.code().as_str()), (409, "conflict"));
+    assert!(r.json()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Add a folder"));
+    assert_eq!(server.stop().0, 0);
+}
+
+#[test]
+fn sync_while_signed_out_does_not_change_pair_phase() {
+    let lab = Lab::new();
+    lab.both("a.txt", "alpha");
+    let server = lab.serve(&[]);
+    lab.controls(json!({"signed_in": false}));
+    wait_for("signed out", Duration::from_secs(15), || {
+        server.state()["state"]["signed_out"] == true
+    });
+    let before = server.state()["state"]["pairs"][0]["phase"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let r = server.post("/api/v1/sync", json!({"pairs": [PAIR]}));
+    assert_eq!((r.status, r.code().as_str()), (409, "signed_out"));
+    let snap = server.state();
+    let after = snap["state"]["pairs"][0]["phase"].as_str().unwrap();
+    assert_eq!(after, before);
+    assert_eq!(server.stop().0, 0);
+    lab.wait_for_sidecars();
+}
+
+#[test]
+fn settings_put_rejects_negative_numbers_with_field_name() {
+    let lab = Lab::new();
+    let server = lab.serve(&[]);
+    let r = server.put("/api/v1/settings", json!({"max_delete_files": -5}));
+    assert_eq!((r.status, r.code().as_str()), (400, "bad_request"));
+    let body = r.json();
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("max_delete_files"));
+    assert!(!msg.contains("serde"));
+    assert!(!msg.contains("u64"));
+    assert_eq!(server.stop().0, 0);
+}

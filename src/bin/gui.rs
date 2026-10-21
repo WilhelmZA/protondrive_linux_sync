@@ -5063,10 +5063,10 @@ fn run_daemon() -> i32 {
     let open_i = MenuItem::new("Open NeutronSync", true, None);
     let sync_i = MenuItem::new("Sync now", true, None);
     let quit_i = MenuItem::new("Quit", true, None);
-    let _ = menu.append(&status_i);
-    let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&open_i);
     let _ = menu.append(&sync_i);
+    let _ = menu.append(&PredefinedMenuItem::separator());
+    let _ = menu.append(&status_i);
     let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&quit_i);
     let (open_id, sync_id, quit_id) = (

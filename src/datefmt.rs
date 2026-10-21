@@ -73,11 +73,40 @@ pub fn epoch_to_log_stamp(secs: i64) -> String {
 
 /// Format epoch seconds as "YYYYMMDD-HHMMSS" (UTC), for conflict-copy names.
 pub fn epoch_to_stamp(secs: i64) -> String {
-    let days = secs.div_euclid(86400);
-    let rem = secs.rem_euclid(86400);
-    let (y, m, d) = civil_from_days(days);
-    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    format!("{y:04}{m:02}{d:02}-{h:02}{mi:02}{s:02}")
+    local_epoch_parts(secs, |y, m, d, h, mi, s| {
+        format!("{y:04}{m:02}{d:02}-{h:02}{mi:02}{s:02}")
+    })
+}
+
+/// Format epoch seconds as "YYYY-MM-DD HH:MM:SS" in the local timezone (no suffix).
+pub fn epoch_to_local_log_stamp(secs: i64) -> String {
+    local_epoch_parts(secs, |y, m, d, h, mi, s| {
+        format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+    })
+}
+
+fn local_epoch_parts(
+    secs: i64,
+    fmt: impl FnOnce(i64, i64, i64, i64, i64, i64) -> String,
+) -> String {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let t = secs;
+    let ptr = unsafe { libc::localtime_r(&t, &mut tm) };
+    if ptr.is_null() {
+        let days = secs.div_euclid(86400);
+        let rem = secs.rem_euclid(86400);
+        let (y, m, d) = civil_from_days(days);
+        let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+        return fmt(y, m, d, h, mi, s);
+    }
+    fmt(
+        tm.tm_year as i64 + 1900,
+        tm.tm_mon as i64 + 1,
+        tm.tm_mday as i64,
+        tm.tm_hour as i64,
+        tm.tm_min as i64,
+        tm.tm_sec as i64,
+    )
 }
 
 /// "just now", "5 minutes ago", "yesterday": how long before `now` (both in
@@ -118,6 +147,27 @@ mod tests {
     fn known_epoch() {
         assert_eq!(iso8601_to_epoch("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(iso8601_to_epoch("2000-01-01T00:00:00Z"), Some(946684800));
+    }
+
+    #[test]
+    fn local_stamp_respects_tz() {
+        use std::ffi::CString;
+        extern "C" {
+            fn tzset();
+        }
+        let key = CString::new("TZ").unwrap();
+        let val = CString::new("Pacific/Auckland").unwrap();
+        unsafe {
+            libc::setenv(key.as_ptr(), val.as_ptr(), 1);
+            tzset();
+        }
+        // 2026-01-01 00:00:00 UTC is 2026-01-01 13:00:00 in NZDT (+13).
+        let stamp = epoch_to_stamp(1_767_225_600);
+        assert_eq!(stamp, "20260101-130000");
+        unsafe {
+            libc::unsetenv(key.as_ptr());
+            tzset();
+        }
     }
 
     #[test]

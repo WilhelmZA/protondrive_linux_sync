@@ -154,13 +154,13 @@ remote = "/my-files/photos"
         )
         self._wait_port(self.serve_port, "serve")
 
-    def start_web(self, *, auth_mode: str = "password") -> None:
+    def start_web(self, *, auth_mode: str = "password", web_host: str = "127.0.0.1") -> None:
         env = self._env_base()
         env.update(
             {
                 "NEUTRONSYNC_API_URL": self.api_url,
                 "NEUTRONSYNC_API_TOKEN": self.token,
-                "NEUTRONSYNC_WEB_HOST": "127.0.0.1",
+                "NEUTRONSYNC_WEB_HOST": web_host,
                 "NEUTRONSYNC_WEB_PORT": str(self.web_port),
                 "NEUTRONSYNC_WEB_AUTH": auth_mode,
                 "NEUTRONSYNC_WEB_DATA": str(self.root / "webdata"),
@@ -187,9 +187,9 @@ remote = "/my-files/photos"
         )
         self._wait_port(self.web_port, "web")
 
-    def start(self, *, auth_mode: str = "password") -> None:
+    def start(self, *, auth_mode: str = "password", web_host: str = "127.0.0.1") -> None:
         self.start_serve()
-        self.start_web(auth_mode=auth_mode)
+        self.start_web(auth_mode=auth_mode, web_host=web_host)
 
     def _wait_port(self, port: int, name: str, timeout: float = 30.0) -> None:
         t0 = time.time()

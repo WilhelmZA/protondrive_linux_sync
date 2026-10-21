@@ -205,12 +205,118 @@ pub struct SettledConflict {
 
 type SettledQueue = Arc<Mutex<Vec<SettledConflict>>>;
 
+#[derive(Default, Clone)]
+struct RunCounts {
+    upload: u32,
+    download: u32,
+    delete: u32,
+    other: u32,
+    failed: u32,
+    /// Dry-run plans emit no `OpFinished`; keep the planned breakdown for the summary.
+    from_plan: Option<Vec<(String, usize)>>,
+}
+
+impl RunCounts {
+    fn note(&mut self, action: &str, ok: bool) {
+        if !ok {
+            self.failed += 1;
+            return;
+        }
+        match action {
+            "upload" => self.upload += 1,
+            "download" => self.download += 1,
+            "delete" | "delete-remote" | "delete-local" | "trash" => self.delete += 1,
+            _ => self.other += 1,
+        }
+    }
+
+    fn recorded_ops(&self) -> u32 {
+        self.upload + self.download + self.delete + self.other + self.failed
+    }
+
+    /// Prefer per-op tallies; fall back to the last plan when ops never ran (dry run).
+    fn for_summary(&self) -> RunCounts {
+        if self.recorded_ops() > 0 {
+            return self.clone();
+        }
+        if let Some(plan) = &self.from_plan {
+            let mut c = RunCounts::default();
+            for (action, n) in plan {
+                for _ in 0..*n {
+                    c.note(action, true);
+                }
+            }
+            return c;
+        }
+        self.clone()
+    }
+}
+
+fn run_summary(pair: &str, c: &RunCounts) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if c.upload > 0 {
+        parts.push(format!(
+            "Uploaded {} file{}",
+            c.upload,
+            if c.upload == 1 { "" } else { "s" }
+        ));
+    }
+    if c.download > 0 {
+        parts.push(format!(
+            "Downloaded {} file{}",
+            c.download,
+            if c.download == 1 { "" } else { "s" }
+        ));
+    }
+    if c.delete > 0 {
+        parts.push(format!(
+            "Deleted {} file{}",
+            c.delete,
+            if c.delete == 1 { "" } else { "s" }
+        ));
+    }
+    if c.other > 0 {
+        parts.push(format!(
+            "Changed {} file{}",
+            c.other,
+            if c.other == 1 { "" } else { "s" }
+        ));
+    }
+    if parts.is_empty() && c.failed == 0 {
+        return format!("{pair}: Nothing to do");
+    }
+    if parts.is_empty() {
+        return format!("{pair}: Sync finished with errors");
+    }
+    if c.failed > 0 {
+        format!("{pair}: {}, {} failed", parts.join(", "), c.failed)
+    } else {
+        format!("{pair}: {}", parts.join(", "))
+    }
+}
+
 /// Turns engine events into observable [`AppState`]. Thread-safe: `emit` may be
 /// called concurrently (scan workers), so it just locks briefly.
 pub struct StateSink {
     state: Arc<Mutex<AppState>>,
     stats: Option<Arc<Stats>>,
     settled: SettledQueue,
+    runs: Arc<Mutex<std::collections::HashMap<String, RunCounts>>>,
+}
+
+impl StateSink {
+    pub fn new(
+        state: Arc<Mutex<AppState>>,
+        stats: Option<Arc<Stats>>,
+        settled: SettledQueue,
+    ) -> Self {
+        StateSink {
+            state,
+            stats,
+            settled,
+            runs: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        }
+    }
 }
 
 impl EventSink for StateSink {
@@ -218,6 +324,10 @@ impl EventSink for StateSink {
         let mut s = self.state.lock().unwrap();
         match ev {
             SyncEvent::PairStarted { pair } => {
+                self.runs
+                    .lock()
+                    .unwrap()
+                    .insert(pair.clone(), RunCounts::default());
                 if let Some(p) = s.pair_mut(pair) {
                     p.phase = Phase::Scanning;
                     p.progress = Progress::default();
@@ -227,6 +337,7 @@ impl EventSink for StateSink {
                 }
             }
             SyncEvent::ScanStarted { pair } => {
+                self.runs.lock().unwrap().entry(pair.clone()).or_default();
                 if let Some(p) = s.pair_mut(pair) {
                     p.phase = Phase::Scanning;
                 }
@@ -247,11 +358,12 @@ impl EventSink for StateSink {
                 total_ops,
                 counts,
             } => {
-                let summary = counts
-                    .iter()
-                    .map(|(k, v)| format!("{k}={v}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                self.runs
+                    .lock()
+                    .unwrap()
+                    .entry(pair.clone())
+                    .or_default()
+                    .from_plan = Some(counts.clone());
                 if let Some(p) = s.pair_mut(pair) {
                     p.phase = if *total_ops == 0 {
                         Phase::Synced
@@ -263,9 +375,6 @@ impl EventSink for StateSink {
                         total: *total_ops,
                     };
                     p.current_op = None;
-                }
-                if *total_ops > 0 {
-                    s.push(ActivityKind::Info, format!("{pair}: {summary}"));
                 }
             }
             SyncEvent::OpStarted { pair, action, path } => {
@@ -302,6 +411,12 @@ impl EventSink for StateSink {
                 }
                 s.active
                     .retain(|a| !(a.pair == *pair && a.path == *path && a.action == *action));
+                self.runs
+                    .lock()
+                    .unwrap()
+                    .entry(pair.clone())
+                    .or_default()
+                    .note(action, ok);
                 s.push_op(ActivityOp {
                     action: action.clone(),
                     path: path.clone(),
@@ -320,7 +435,7 @@ impl EventSink for StateSink {
                 errors,
                 tracked,
             } => {
-                let (applied, errors, tracked) = (*applied, *errors, *tracked);
+                let (_applied, errors, tracked) = (*applied, *errors, *tracked);
                 if let Some(p) = s.pair_mut(pair) {
                     p.phase = if errors > 0 {
                         Phase::Error
@@ -335,21 +450,19 @@ impl EventSink for StateSink {
                         p.last_error = None;
                     }
                 }
-                // Only note completion when something actually happened — a
-                // "0 applied, 0 errors" line is just noise.
-                if applied > 0 || errors > 0 {
-                    let kind = if errors > 0 {
-                        ActivityKind::Error
-                    } else {
-                        ActivityKind::Sync
-                    };
-                    let msg = if errors > 0 {
-                        format!("{pair}: {applied} applied, {errors} error(s)")
-                    } else {
-                        format!("{pair}: {applied} applied")
-                    };
-                    s.push(kind, msg);
-                }
+                let counts = self
+                    .runs
+                    .lock()
+                    .unwrap()
+                    .remove(pair)
+                    .map(|c| c.for_summary())
+                    .unwrap_or_default();
+                let kind = if errors > 0 || counts.failed > 0 {
+                    ActivityKind::Error
+                } else {
+                    ActivityKind::Sync
+                };
+                s.push(kind, run_summary(pair, &counts));
             }
             SyncEvent::Auth { signed_in } => {
                 s.signed_out = !*signed_in;
@@ -637,11 +750,7 @@ impl Controller {
         let stats = self.stats.clone();
         let settled = self.settled.clone();
         thread::spawn(move || {
-            let sink = StateSink {
-                state: state.clone(),
-                stats,
-                settled,
-            };
+            let sink = StateSink::new(state.clone(), stats, settled);
             let log = Logger::new(&cfg.state_dir.join("logs"), false, false);
             run_sync_with(
                 &cfg,
@@ -709,11 +818,7 @@ impl Controller {
         let stats = self.stats.clone();
         let settled = self.settled.clone();
         thread::spawn(move || {
-            let sink = StateSink {
-                state: state.clone(),
-                stats,
-                settled,
-            };
+            let sink = StateSink::new(state.clone(), stats, settled);
             let log = Logger::new(&cfg.state_dir.join("logs"), false, false);
             if let Err(e) = watcher::watch_with(&cfg, pairs, &log, &stop, Some(&sink)) {
                 let mut s = state.lock().unwrap();
@@ -842,11 +947,7 @@ mod tests {
     #[test]
     fn sink_maps_events_to_state() {
         let st = state_with(&["docs"]);
-        let sink = StateSink {
-            state: st.clone(),
-            stats: None,
-            settled: Default::default(),
-        };
+        let sink = StateSink::new(st.clone(), None, Default::default());
         sink.emit(&SyncEvent::PairStarted {
             pair: "docs".into(),
         });
@@ -897,7 +998,65 @@ mod tests {
         assert_eq!(s.pairs[0].phase, Phase::Synced);
         assert_eq!(s.pairs[0].tracked, 5);
         assert!(s.pairs[0].last_synced.is_some());
-        assert!(s.activity.iter().any(|a| a.text.contains("2 applied")));
+        assert!(s
+            .activity
+            .iter()
+            .any(|a| a.text.contains("Uploaded 1 file")));
+    }
+
+    #[test]
+    fn dry_run_summary_uses_planned_counts() {
+        let st = state_with(&["docs"]);
+        let sink = StateSink::new(st.clone(), None, Default::default());
+        sink.emit(&SyncEvent::PairStarted {
+            pair: "docs".into(),
+        });
+        sink.emit(&SyncEvent::Planned {
+            pair: "docs".into(),
+            total_ops: 1,
+            counts: vec![("upload".into(), 1)],
+        });
+        sink.emit(&SyncEvent::PairFinished {
+            pair: "docs".into(),
+            applied: 0,
+            errors: 0,
+            tracked: 1,
+        });
+        let s = st.lock().unwrap();
+        assert!(
+            s.activity
+                .iter()
+                .any(|a| a.text.contains("Uploaded 1 file")),
+            "{:?}",
+            s.activity.iter().map(|a| &a.text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn watcher_run_summary_counts_ops_without_pair_started() {
+        let st = state_with(&["docs"]);
+        let sink = StateSink::new(st.clone(), None, Default::default());
+        sink.emit(&SyncEvent::ScanStarted {
+            pair: "docs".into(),
+        });
+        sink.emit(&SyncEvent::OpFinished {
+            pair: "docs".into(),
+            action: "upload".into(),
+            path: "a.txt".into(),
+            ok: true,
+            error: None,
+        });
+        sink.emit(&SyncEvent::PairFinished {
+            pair: "docs".into(),
+            applied: 1,
+            errors: 0,
+            tracked: 1,
+        });
+        let s = st.lock().unwrap();
+        assert!(s
+            .activity
+            .iter()
+            .any(|a| a.text.contains("Uploaded 1 file")));
     }
 
     #[test]
@@ -906,11 +1065,7 @@ mod tests {
         let stats = Arc::new(Stats::open(dir.path()).unwrap());
         let st = state_with(&["docs"]);
         let settled: SettledQueue = Default::default();
-        let sink = StateSink {
-            state: st.clone(),
-            stats: Some(stats.clone()),
-            settled: settled.clone(),
-        };
+        let sink = StateSink::new(st.clone(), Some(stats.clone()), settled.clone());
         sink.emit(&SyncEvent::DeletesHeld {
             pair: "docs".into(),
             local: 0,
@@ -989,11 +1144,7 @@ mod tests {
         cfg.pairs.clear();
         let ctrl = Controller::new(cfg);
         assert!(ctrl.take_settled_conflicts().is_empty());
-        let sink = StateSink {
-            state: ctrl.state.clone(),
-            stats: None,
-            settled: ctrl.settled.clone(),
-        };
+        let sink = StateSink::new(ctrl.state.clone(), None, ctrl.settled.clone());
         sink.emit(&SyncEvent::ConflictSettled {
             pair: "docs".into(),
             path: "a.txt".into(),

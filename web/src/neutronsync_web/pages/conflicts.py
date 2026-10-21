@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from nicegui import ui
 
 from neutronsync_web import ctx
@@ -67,9 +69,33 @@ def render() -> None:
                     with ui.row().classes("q-mt-sm gap-2"):
                         path_to_copy = c.path
 
-                        def copy_path(p=path_to_copy) -> None:
-                            ui.clipboard.write(p)
-                            ui.notify("Path copied", type="info")
+                        async def copy_path(p=path_to_copy) -> None:
+                            copied = await ui.run_javascript(
+                                f"""
+                                (async () => {{
+                                    const text = {json.dumps(p)};
+                                    if (window.isSecureContext) {{
+                                        try {{
+                                            await navigator.clipboard.writeText(text);
+                                            return true;
+                                        }} catch (e) {{}}
+                                    }}
+                                    return false;
+                                }})()
+                                """,
+                                timeout=5.0,
+                            )
+                            if copied:
+                                ui.notify("Path copied", type="info")
+                                return
+                            with (
+                                ui.dialog() as dialog,
+                                ui.card().classes("w-full").style("max-width:480px"),
+                            ):
+                                ui.label("Copy it from here").classes("text-h6")
+                                ui.input(value=p).props("readonly").classes("w-full")
+                                ui.button("Close", on_click=dialog.close).props("flat")
+                            dialog.open()
 
                         ui.button("Copy path", on_click=copy_path).props("flat")
                         ui.button("Dismiss", on_click=lambda cid=c.id: _dismiss(cid)).props("flat")

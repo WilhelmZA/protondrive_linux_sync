@@ -19,6 +19,11 @@ def _err(exc: Exception) -> None:
 async def _sync_pair(name: str) -> None:
     try:
         await ctx.get_api().sync(pairs=[name])
+    except ApiError as exc:
+        if exc.code == "signed_out":
+            ui.notify(exc.message, type="warning")
+        else:
+            _err(exc)
     except Exception as exc:
         _err(exc)
 
@@ -253,6 +258,7 @@ def _pair_dialog(existing: PairConfig | None = None) -> None:
                     redraw_excl()
 
             ui.button("Add", on_click=add_excl).props("flat")
+            new_excl.on("keydown.enter", add_excl)
             redraw_excl()
             auto_sw = ui.switch("Auto sync this folder", value=form["auto"])
 
@@ -260,6 +266,11 @@ def _pair_dialog(existing: PairConfig | None = None) -> None:
                 ui.button("Cancel", on_click=dialog.close).props("flat")
 
                 async def save() -> None:
+                    val = (new_excl.value or "").strip()
+                    if val and val not in form["exclude"]:
+                        form["exclude"].append(val)
+                        new_excl.value = ""
+                        redraw_excl()
                     body = {
                         "name": name_in.value.strip(),
                         "local": local_in.value.strip(),

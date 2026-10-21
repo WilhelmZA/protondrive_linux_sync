@@ -68,7 +68,7 @@ impl ApiError {
         Self::new(
             StatusCode::CONFLICT,
             "signed_out",
-            "Signed out of Proton. Sign in first.",
+            "Signed out of Proton. Sign in on the Account page.",
         )
     }
     pub fn too_large() -> Self {
@@ -128,9 +128,61 @@ async fn read_json<T: DeserializeOwned>(
         if private {
             ApiError::bad_request("The request body is not the JSON object this call takes.")
         } else {
-            ApiError::bad_request(format!("Invalid JSON body: {e}"))
+            ApiError::bad_request(friendly_json_error(text, &e))
         }
     })
+}
+
+/// Turn serde's parse errors into a short message that names the field when possible.
+fn friendly_json_error(text: &[u8], e: &serde_json::Error) -> String {
+    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(text) {
+        if let Some(obj) = val.as_object() {
+            for (key, v) in obj {
+                if let Some(n) = v.as_i64() {
+                    if n < 0 {
+                        return format!("{key} must be a whole number.");
+                    }
+                }
+                if v.is_f64() && v.as_f64().unwrap_or(0.0).fract() != 0.0 {
+                    return format!("{key} must be a whole number.");
+                }
+            }
+        }
+    }
+    let raw = e.to_string();
+    if raw.contains("expected u64") || raw.contains("expected i64") {
+        if let Some(col) = raw.find("column ") {
+            let rest = &raw[col + 7..];
+            let end = rest
+                .find(')')
+                .or_else(|| rest.find(' '))
+                .unwrap_or(rest.len());
+            if let Ok(pos) = rest[..end].trim().parse::<usize>() {
+                if let Ok(s) = std::str::from_utf8(text) {
+                    if let Some(field) = field_at_column(s, pos) {
+                        return format!("{field} must be a whole number.");
+                    }
+                }
+            }
+        }
+        return "A number in the request body must be a whole number.".to_string();
+    }
+    if raw.contains("invalid type") {
+        return "The request body is not the JSON object this call takes.".to_string();
+    }
+    "The request body could not be read.".to_string()
+}
+
+fn field_at_column(json: &str, column: usize) -> Option<String> {
+    let bytes = json.as_bytes();
+    if column == 0 || column > bytes.len() {
+        return None;
+    }
+    let before = &json[..column.min(json.len())];
+    let key_start = before.rfind('"')?;
+    let rest = &json[key_start + 1..];
+    let key_end = rest.find('"')?;
+    Some(rest[..key_end].to_string())
 }
 
 impl<T: DeserializeOwned> FromRequest<Arc<Ctx>> for Body<T> {

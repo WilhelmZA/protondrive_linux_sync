@@ -270,6 +270,8 @@ def scripted_auth(method, params):
         (home / "controls.json").write_text(json.dumps(controls))
         return dict(ok=True)
     if method == "auth.submit_2fa":
+        controls = read_json("controls.json", {})
+        time.sleep(controls.get("auth_delay", 0))
         code = params.get("code", "")
         if code == "bad":
             raise Failure("auth")
@@ -281,6 +283,8 @@ def scripted_auth(method, params):
             raise Failure("auth")
         return finish_sign_in(dict(ok=True))
     if method == "auth.login":
+        controls = read_json("controls.json", {})
+        time.sleep(controls.get("auth_delay", 0))
         # Env script wins so GUI screenshot runs can force a step regardless of typed username.
         user = script or params.get("username") or "ok"
         if user in ("error", "bad"):

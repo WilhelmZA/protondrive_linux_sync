@@ -242,6 +242,12 @@ struct SyncBody {
 
 async fn sync(State(ctx): Ctl, Body(body): Body<SyncBody>) -> ApiResult<impl IntoResponse> {
     let cfg = ctx.ctrl.config();
+    if cfg.pairs.is_empty() {
+        return Err(ApiError::conflict("Add a folder first."));
+    }
+    if ctx.ctrl.snapshot().signed_out {
+        return Err(ApiError::signed_out());
+    }
     if let Some(unknown) = body
         .pairs
         .iter()

@@ -6,6 +6,7 @@ from nicegui import ui
 
 from neutronsync_web import __version__, ctx
 from neutronsync_web.api import ApiError
+from neutronsync_web.fmt import format_log_lines_local
 from neutronsync_web.pages.layout import page_shell
 
 
@@ -41,7 +42,8 @@ def render() -> None:
             async def refresh_log() -> None:
                 try:
                     lines = await ctx.get_api().logs(200)
-                    log_box.set_content("```\n" + "\n".join(lines) + "\n```")
+                    shown = format_log_lines_local(lines)
+                    log_box.set_content("```\n" + "\n".join(shown) + "\n```")
                 except Exception as exc:
                     _err(exc)
 

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import re
 import time
+from datetime import UTC, datetime
 
 from neutronsync_web.api import ConflictItem, HeldItem
+
+_LOG_STAMP = re.compile(r"^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})Z?\s")
 
 
 def thousands(n: int) -> str:
@@ -101,6 +105,29 @@ COMPARE_LABELS = {
 }
 
 LOCAL_DELETE_LABELS = {
-    "trash": "Desktop trash",
+    "trash": "Trash folder on the same drive",
     "remove": "Delete forever",
 }
+
+THREAD_MIN = 0
+THREAD_MAX = 64
+WHOLE_NUMBER_RANGE = f"Enter a whole number from {THREAD_MIN} to {THREAD_MAX}."
+
+
+def format_log_lines_local(lines: list[str]) -> list[str]:
+    """Rewrite leading UTC timestamps in log lines to local wall time."""
+    out: list[str] = []
+    for line in lines:
+        m = _LOG_STAMP.match(line)
+        if not m:
+            out.append(line)
+            continue
+        try:
+            dt = datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=UTC
+            )
+            local = dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            out.append(f"{local} {line[m.end() :]}")
+        except ValueError:
+            out.append(line)
+    return out

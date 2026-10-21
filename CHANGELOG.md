@@ -5,6 +5,15 @@ All notable changes to this project are documented here. The format follows [Kee
 ## [Unreleased]
 
 ### Fixed
+- Settings no longer send negative numbers to the engine; invalid values show a plain message beside the field (#27).
+- Sync now and dry run are disabled with a hint when no folders are configured, and the API refuses an empty sync the same way (#29).
+- Syncing while signed out of Proton is refused without marking the folder as errored (#30).
+- Exclusion patterns can be added with Enter as well as the Add button, and Save picks up a pattern still in the box (#31).
+- The web interface uses clearer folder and activity wording and shows log timestamps in local time (#32).
+- Proton sign-in steps show a spinner and disable their button until the step finishes (#36).
+- Copy path on plain HTTP shows the path to copy instead of a false “Path copied” toast (#38).
+- The activity page groups each sync into one summary row with file details folded underneath (#40).
+- The tray menu lists Open NeutronSync and Sync now above the status line (#41).
 - The container web service starts in proxy mode without a web password when `NEUTRONSYNC_WEB_AUTH=proxy` (#24).
 - The web interface keeps theme and login state on disk under `NEUTRONSYNC_WEB_DATA` instead of the service working directory (#25).
 - Container starter config and secrets use safe file modes on every start (#33).

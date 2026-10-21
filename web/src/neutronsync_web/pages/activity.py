@@ -5,9 +5,12 @@ from __future__ import annotations
 from nicegui import ui
 
 from neutronsync_web import ctx
-from neutronsync_web.api import ApiError, HeldItem
+from neutronsync_web.activity_feed import group_activity_runs
+from neutronsync_web.api import ActivityItem, ApiError, HeldItem
 from neutronsync_web.fmt import held_subtitle, held_title, plural, rel_time
 from neutronsync_web.pages.layout import page_shell
+
+_RUNS_VISIBLE = 50
 
 
 def _err(exc: Exception) -> None:
@@ -17,6 +20,11 @@ def _err(exc: Exception) -> None:
 async def _sync(dry_run: bool = False) -> None:
     try:
         await ctx.get_api().sync(dry_run=dry_run)
+    except ApiError as exc:
+        if exc.code == "signed_out":
+            ui.notify(exc.message, type="warning")
+        else:
+            _err(exc)
     except Exception as exc:
         _err(exc)
 
@@ -86,12 +94,25 @@ def _op_icon(action: str, ok: bool) -> str:
     return "sync"
 
 
+def _plain_error(text: str) -> str:
+    low = text.lower()
+    if "not logged in" in low or "sign in" in low:
+        return "Signed out of Proton. Sign in on the Account page."
+    return text
+
+
+def _summary_label(item: ActivityItem) -> str:
+    text = item.text or ""
+    if ": " in text:
+        return text.split(": ", 1)[1]
+    return text
+
+
 def render() -> None:
     def body() -> None:
         live = ctx.get_live()
+        show_all_runs = {"value": False}
 
-        # Status line and action buttons are separate refreshables: a tracked-count
-        # change must not remount Sync now / Dry run / Cancel (planner HOLD).
         with ui.element("div").classes("ns-card"):
 
             @ui.refreshable
@@ -101,20 +122,25 @@ def render() -> None:
                     ui.label("Waiting for the engine…").classes("ns-muted")
                     return
                 st = env.state
-                watched = len(st.pairs)
-                tracked = sum(p.tracked for p in st.pairs)
-                ui.label(
-                    f"{'Auto sync on' if st.watching else 'Auto sync off'} · "
-                    f"{plural(watched, 'folder')} watched · "
-                    f"{plural(tracked, 'file')} tracked"
-                )
+                folders = len(st.pairs)
+                if st.watching:
+                    tail = f"{plural(folders, 'folder')} watched"
+                else:
+                    tail = f"{plural(folders, 'folder')}"
+                ui.label(f"{'Auto sync on' if st.watching else 'Auto sync off'} · {tail}")
 
             @ui.refreshable
             def action_buttons() -> None:
                 env = live.state.envelope
                 if not env:
                     return
-                with ui.row().classes("q-mt-sm gap-2 flex-wrap"):
+                has_pairs = bool(env.state.pairs)
+                with ui.row().classes("q-mt-sm gap-2 flex-wrap items-center"):
+                    if not has_pairs:
+                        ui.label("Add a folder first").classes("ns-muted")
+                        ui.button("Sync now", on_click=lambda: None).props("color=primary disable")
+                        ui.button("Dry run", on_click=lambda: None).props("outline disable")
+                        return
                     if env.state.busy:
                         ui.button("Cancel", on_click=_cancel).props("color=negative")
                     else:
@@ -159,27 +185,47 @@ def render() -> None:
             if not env:
                 ui.label("Nothing yet.").classes("ns-muted")
                 return
-            items = list(reversed(env.state.activity[-100:]))
-            if not items:
+            runs = group_activity_runs(list(env.state.activity))
+            if not runs:
                 ui.label("Nothing yet.").classes("ns-muted")
-            for item in items:
+                return
+            visible = runs if show_all_runs["value"] else runs[:_RUNS_VISIBLE]
+            for run in visible:
+                summary = run.summary
                 with ui.element("div").classes("ns-card"):
                     with ui.row().classes("items-start no-wrap gap-3 w-full"):
-                        action = item.op.action if item.op else item.kind
-                        ok = item.op.ok if item.op else item.kind != "Error"
-                        ui.icon(_op_icon(action, ok)).classes("text-primary" if ok else "ns-err")
+                        ok = summary.kind != "Error"
+                        ui.icon("sync" if ok else "error").classes(
+                            "text-primary" if ok else "ns-err"
+                        )
                         with ui.column().classes("ns-grow gap-0"):
-                            name = item.op.path if item.op else item.text
-                            ui.label(name or item.text)
-                            meta = []
-                            if item.op and item.op.pair:
-                                meta.append(item.op.pair)
-                            meta.append(rel_time(item.ts))
-                            ui.label(" · ".join(meta)).classes("ns-muted")
-                            if item.op and item.op.error:
-                                ui.label(item.op.error).classes("ns-err")
-                            elif item.kind == "Error":
-                                ui.label(item.text).classes("ns-err")
+                            ui.label(_summary_label(summary))
+                            ui.label(rel_time(summary.ts)).classes("ns-muted")
+                            if summary.kind == "Error" and not run.files:
+                                ui.label(_plain_error(summary.text)).classes("ns-err")
+                    if run.files:
+                        with ui.expansion("Show files", icon="folder").classes("w-full"):
+                            for item in run.files:
+                                op = item.op
+                                if not op:
+                                    continue
+                                action = op.action or ""
+                                ok = op.ok
+                                with ui.row().classes("items-start no-wrap gap-2 w-full q-mt-xs"):
+                                    ui.icon(_op_icon(action, ok)).classes(
+                                        "text-primary" if ok else "ns-err"
+                                    )
+                                    with ui.column().classes("gap-0"):
+                                        ui.label(op.path or item.text)
+                                        if op.error:
+                                            ui.label(_plain_error(op.error)).classes("ns-err")
+            if len(runs) > _RUNS_VISIBLE and not show_all_runs["value"]:
+
+                def show_more() -> None:
+                    show_all_runs["value"] = True
+                    feed.refresh()
+
+                ui.button("Show more", on_click=show_more).props("flat").classes("q-mt-sm")
 
         held()
         active()
@@ -205,13 +251,8 @@ def render() -> None:
                     action_buttons.refresh()
                 return
             st = env.state
-            status_m = (
-                st.watching,
-                len(st.pairs),
-                sum(p.tracked for p in st.pairs),
-            )
-            # Buttons remount only when busy flips (or envelope first arrives).
-            buttons_m = (True, st.busy)
+            status_m = (st.watching, len(st.pairs))
+            buttons_m = (len(st.pairs), st.busy)
             held_m = tuple((h.pair, h.local, h.remote, h.tracked) for h in env.held)
             active_bits = []
             for op in st.active:
@@ -247,8 +288,6 @@ def render() -> None:
                 seen["feed"] = feed_m
                 feed.refresh()
 
-        # Do not clear markers on every rev — that remounts Sync now on each
-        # tracked-count tick and drops clicks (planner HOLD). tick() diffs.
         tick()
         ui.timer(0.25, tick)
 

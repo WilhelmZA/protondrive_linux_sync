@@ -70,6 +70,15 @@ def _wait_idle(lab: Lab, timeout: float = 60.0) -> None:
         time.sleep(0.4)
 
 
+def _wait_signed_out(lab: Lab, timeout: float = 30.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _api(lab, "GET", "/api/v1/state").json()["state"].get("signed_out"):
+            return
+        time.sleep(0.3)
+    raise AssertionError("timed out waiting for engine signed_out")
+
+
 def test_routes_redirect_when_signed_out(lab: Lab) -> None:
     for route in ROUTES:
         r = httpx.get(f"{lab.web_url}{route}", follow_redirects=False, timeout=10)
@@ -488,3 +497,133 @@ def test_held_deletions(lab: Lab, browser_page) -> None:
     assert _api(lab, "GET", "/api/v1/held").json() == []
     restored = list((lab.root / "local" / "photos").glob("f*.txt"))
     assert len(restored) >= 1
+
+
+def test_sync_disabled_with_no_pairs(tmp_path: Path, browser_page) -> None:
+    lab = Lab(tmp_path)
+    text = lab.config.read_text(encoding="utf-8")
+    lab.config.write_text(text.split("[[pair]]")[0], encoding="utf-8")
+    lab.start()
+    try:
+        page, _ = browser_page
+        _login(page, lab.web_url)
+        _goto(page, lab.web_url, "/", "Activity")
+        page.get_by_text("Add a folder first", exact=False).wait_for(timeout=10000)
+        assert page.get_by_role("button", name=re.compile("sync now", re.I)).is_disabled()
+        assert page.get_by_role("button", name=re.compile("dry run", re.I)).is_disabled()
+        r = _api(lab, "POST", "/api/v1/sync", json={"dry_run": True})
+        assert r.status_code == 409
+        assert "Add a folder" in r.json()["error"]["message"]
+    finally:
+        lab.stop()
+
+
+def test_folder_sync_signed_out_shows_message_once(tmp_path: Path, browser_page) -> None:
+    lab = Lab(tmp_path)
+    lab.controls({"signed_in": False})
+    lab.start()
+    try:
+        _wait_signed_out(lab)
+        page, _ = browser_page
+        _login(page, lab.web_url)
+        _goto(page, lab.web_url, "/folders", "photos")
+        _wait_live(page)
+        sync_btn = (
+            page.locator(".ns-card")
+            .filter(has_text="photos")
+            .get_by_role("button", name=re.compile("sync now", re.I))
+        )
+        sync_btn.click()
+        msg = "Signed out of Proton. Sign in on the Account page."
+        notif = page.locator(".q-notification__message").filter(has_text=msg)
+        notif.wait_for(timeout=20000)
+        assert notif.count() == 1
+    finally:
+        lab.stop()
+
+
+def test_exclusions_enter_and_save_on_save(lab: Lab, browser_page) -> None:
+    page, _ = browser_page
+    _login(page, lab.web_url)
+    _goto(page, lab.web_url, "/folders", "photos")
+    page.locator(".ns-card").filter(has_text="photos").get_by_role(
+        "button", name=re.compile("^edit$", re.I)
+    ).click()
+    dialog = page.locator(".q-dialog")
+    excl = dialog.get_by_label("Add exclusion")
+    excl.fill("*.enter")
+    excl.press("Enter")
+    dialog.get_by_text("*.enter").wait_for(timeout=5000)
+    excl.fill("*.save")
+    dialog.get_by_role("button", name=re.compile("^save$", re.I)).click()
+    deadline = time.time() + 15
+    while time.time() < deadline and "*.save" not in lab.config_text():
+        time.sleep(0.3)
+    cfg = lab.config_text()
+    assert "*.enter" in cfg
+    assert "*.save" in cfg
+
+
+def test_activity_wording_auto_sync_off(lab: Lab, browser_page) -> None:
+    page, _ = browser_page
+    _login(page, lab.web_url)
+    _goto(page, lab.web_url, "/", "Activity")
+    page.get_by_text(re.compile(r"Auto sync off · 1 folder(?!s watched)", re.I)).wait_for(
+        timeout=15000
+    )
+
+
+def test_sign_in_totp_shows_spinner(tmp_path: Path, browser_page) -> None:
+    lab = Lab(tmp_path, fake_auth="totp")
+    lab.controls({"signed_in": False, "auth_delay": 2})
+    lab.start()
+    try:
+        page, _ = browser_page
+        _login(page, lab.web_url)
+        _goto(page, lab.web_url, "/account", "Email or username")
+        _fill_synced(page, page.get_by_label("Email or username"), "user")
+        _fill_synced(page, page.get_by_label("Password", exact=True), "secret")
+        page.get_by_role("button", name=re.compile("^sign in$", re.I)).click()
+        page.get_by_label("6-digit code").wait_for(timeout=20000)
+        _fill_synced(page, page.get_by_label("6-digit code"), "123456")
+        page.get_by_role("button", name=re.compile("^continue$", re.I)).click()
+        page.get_by_text("Signing in", exact=False).wait_for(timeout=5000)
+        assert page.get_by_role("button", name=re.compile("^continue$", re.I)).is_disabled()
+    finally:
+        lab.stop()
+
+
+def test_copy_path_fallback_when_not_secure_context(lab: Lab, browser_page) -> None:
+    page, _ = browser_page
+    page.add_init_script("Object.defineProperty(window, 'isSecureContext', { get: () => false });")
+    lab.both("c.txt", "same")
+    _login(page, lab.web_url)
+    _goto(page, lab.web_url, "/", "Sync now")
+    page.get_by_role("button", name=re.compile("sync now", re.I)).click()
+    _wait_idle(lab, 30)
+    (lab.root / "local" / "photos" / "c.txt").write_text("local-new", encoding="utf-8")
+    lab.remote_file("c.txt", "c.txt", "photos", "remote-new")
+    page.get_by_role("button", name=re.compile("sync now", re.I)).click()
+    _wait_idle(lab, 30)
+    page.goto(f"{lab.web_url}/conflicts")
+    page.get_by_text("c.txt", exact=False).first.wait_for(timeout=30000)
+    page.get_by_role("button", name=re.compile("copy path", re.I)).first.click()
+    page.get_by_text("Copy it from here", exact=False).wait_for(timeout=10000)
+    assert "Path copied" not in page.inner_text("body")
+
+
+def test_activity_groups_runs_without_upload_equals(lab: Lab, browser_page) -> None:
+    page, _ = browser_page
+    lab.both("one.txt", "a")
+    _login(page, lab.web_url)
+    _goto(page, lab.web_url, "/", "Sync now")
+    for _ in range(3):
+        page.get_by_role("button", name=re.compile("sync now", re.I)).click()
+        _wait_idle(lab, 30)
+    activity = _api(lab, "GET", "/api/v1/state").json()["state"]["activity"]
+    blob = str(activity)
+    assert "upload=" not in blob
+    assert any(
+        "Nothing to do" in (a.get("text") or "") or "Uploaded" in (a.get("text") or "")
+        for a in activity
+    )

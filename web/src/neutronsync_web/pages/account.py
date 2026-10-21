@@ -28,6 +28,7 @@ def _form_for_client() -> dict:
             "hv_type": None,
             "hv_url": None,
             "error": None,
+            "signing_in": False,
         }
         _FORMS[cid] = form
     return form
@@ -90,6 +91,10 @@ def render() -> None:
                 code.on_value_change(lambda e: form.update(totp_code=e.value or ""))
 
                 async def send_2fa() -> None:
+                    if form["signing_in"]:
+                        return
+                    form["signing_in"] = True
+                    form_ui.refresh()
                     try:
                         value = (code.value or form["totp_code"] or "").strip()
                         step = await ctx.get_api().submit_2fa(value)
@@ -100,11 +105,22 @@ def render() -> None:
                         form["error"] = exc.message
                         form["totp_code"] = ""
                         code.value = ""
-                        form_ui.refresh()
                     except Exception as exc:
                         _err(exc)
+                    finally:
+                        form["signing_in"] = False
+                        form_ui.refresh()
 
-                ui.button("Continue", on_click=send_2fa).props("color=primary").classes("w-full")
+                btn = (
+                    ui.button("Continue", on_click=send_2fa)
+                    .props("color=primary")
+                    .classes("w-full")
+                )
+                if form["signing_in"]:
+                    btn.props("disable")
+                    with ui.row().classes("items-center gap-2 q-mt-sm"):
+                        ui.spinner(size="sm")
+                        ui.label("Signing in…")
                 return
 
             if form["step"] == "need_mailbox_password":
@@ -121,6 +137,10 @@ def render() -> None:
                 pw.on_value_change(lambda e: form.update(mailbox_password=e.value or ""))
 
                 async def send_mb() -> None:
+                    if form["signing_in"]:
+                        return
+                    form["signing_in"] = True
+                    form_ui.refresh()
                     try:
                         value = pw.value or form["mailbox_password"] or ""
                         step = await ctx.get_api().submit_mailbox_password(value)
@@ -131,11 +151,20 @@ def render() -> None:
                         form["error"] = exc.message
                         form["mailbox_password"] = ""
                         pw.value = ""
-                        form_ui.refresh()
                     except Exception as exc:
                         _err(exc)
+                    finally:
+                        form["signing_in"] = False
+                        form_ui.refresh()
 
-                ui.button("Continue", on_click=send_mb).props("color=primary").classes("w-full")
+                btn = (
+                    ui.button("Continue", on_click=send_mb).props("color=primary").classes("w-full")
+                )
+                if form["signing_in"]:
+                    btn.props("disable")
+                    with ui.row().classes("items-center gap-2 q-mt-sm"):
+                        ui.spinner(size="sm")
+                        ui.label("Signing in…")
                 return
 
             if form["step"] == "need_human_verification":
@@ -164,9 +193,12 @@ def render() -> None:
             pw = ui.input("Password", password=True, password_toggle_button=True).classes("w-full")
 
             async def send_login() -> None:
+                if form["signing_in"]:
+                    return
+                form["signing_in"] = True
+                form_ui.refresh()
                 form["username"] = (user.value or form["username"] or "").strip()
                 password = pw.value or ""
-                pw.value = ""
                 try:
                     kwargs = {}
                     if form["step"] == "login_hv" and form["hv_token"]:
@@ -177,11 +209,18 @@ def render() -> None:
                     _apply_step(step)
                 except ApiError as exc:
                     form["error"] = exc.message
-                    form_ui.refresh()
                 except Exception as exc:
                     _err(exc)
+                finally:
+                    form["signing_in"] = False
+                    form_ui.refresh()
 
-            ui.button("Sign in", on_click=send_login).props("color=primary").classes("w-full")
+            btn = ui.button("Sign in", on_click=send_login).props("color=primary").classes("w-full")
+            if form["signing_in"]:
+                btn.props("disable")
+                with ui.row().classes("items-center gap-2 q-mt-sm"):
+                    ui.spinner(size="sm")
+                    ui.label("Signing in…")
 
         def _apply_step(step: SignInStep) -> None:
             form["step"] = step.step or "done"
