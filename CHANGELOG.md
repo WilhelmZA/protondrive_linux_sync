@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-22
+
 ### Added
 - The tray and `neutronsync serve` host the same `/api/v1` on `$XDG_RUNTIME_DIR/neutronsync/api.sock` (mode 0600). The tray can also listen on TCP with `[cli] api_listen`.
 - OpenAPI 3.1 at `docs/openapi.json` and `GET /api/v1/openapi.json`, checked in CI so a drift or a v1 break is a failed build.
