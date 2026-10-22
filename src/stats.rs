@@ -31,6 +31,7 @@ pub struct Stats {
 
 /// A pair whose deletions were held back, as stored in `held_deletes`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub struct HeldDeletes {
     pub pair: String,
     /// Files that would have left this computer.
@@ -45,6 +46,7 @@ pub struct HeldDeletes {
 
 /// A settled conflict, as stored in `conflicts`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub struct ConflictRecord {
     pub id: i64,
     pub pair: String,

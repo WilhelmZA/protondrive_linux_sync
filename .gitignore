@@ -27,4 +27,14 @@ logs/
 /web/**/__pycache__/
 /web/.pytest_cache/
 /web/*.egg-info/
+
+# Python client
+/clients/python/.venv/
+/clients/python/.pytest_cache/
+/clients/python/.ruff_cache/
+/clients/python/**/__pycache__/
+/clients/python/**/*.egg-info/
+
+# TypeScript client
+/clients/typescript/node_modules/
 /.tools/

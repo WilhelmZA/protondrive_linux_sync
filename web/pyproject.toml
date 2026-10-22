@@ -5,8 +5,7 @@ description = "Browser interface for NeutronSync"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "nicegui==3.18.0",
-    "httpx==0.28.1",
-    "httpx-sse==0.4.3",
+    "neutronsync-client",
 ]
 
 [project.scripts]
@@ -29,6 +28,9 @@ dev = [
 
 [tool.uv]
 default-groups = ["dev"]
+
+[tool.uv.sources]
+neutronsync-client = { path = "../clients/python", editable = true }
 
 [tool.pytest.ini_options]
 # strict: only @pytest.mark.asyncio tests get a loop. auto left a running loop

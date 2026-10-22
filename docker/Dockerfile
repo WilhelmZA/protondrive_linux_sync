@@ -44,11 +44,15 @@ RUN bun install --frozen-lockfile \
 # ----- web: NiceGUI app venv -----
 FROM python:3.12-slim-bookworm AS web
 COPY --from=ghcr.io/astral-sh/uv:0.13.3 /uv /usr/local/bin/uv
+# neutronsync-web depends on the repo-local neutronsync-client path package.
+COPY clients/python /app/clients/python
 WORKDIR /app/web
 COPY web/pyproject.toml web/uv.lock ./
 COPY web/src ./src
 COPY web/README.md ./
-RUN uv sync --locked --no-dev \
+# --no-editable bakes the client into the venv so the final image need not
+# keep /app/clients/python.
+RUN uv sync --locked --no-dev --no-editable \
 	&& ln -sf /app/web/.venv/bin/neutronsync-web /usr/local/bin/neutronsync-web-link
 
 # ----- final runtime image -----

@@ -67,6 +67,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # Regenerates docs/openapi.json from the server (`--features serve` is
+      # enough; the GUI libraries above are for the bins, not for this check)
+      # and fails if a v1 field was removed or changed since the last tag that
+      # already published a spec.
+      - name: OpenAPI document is generated and compatible
+        run: scripts/check-openapi.sh
+
       # Informational here: CI builds on the runner's newer glibc, so the Rust
       # binaries exceed the floor by design. The release job, which builds
       # inside ubuntu:22.04, enforces it. What this catches early is a Bun or

@@ -245,6 +245,8 @@ fn cfg(root: &Path) -> Config {
         file_manager_bookmarks: false,
         session_store: Default::default(),
         session_key_file: None,
+        api_listen: None,
+        api_token_file: None,
         state_dir: root.join("state"),
         pairs: vec![Pair {
             name: "docs".into(),

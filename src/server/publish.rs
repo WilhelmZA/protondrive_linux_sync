@@ -27,7 +27,7 @@ const DB_EVERY: Duration = Duration::from_secs(2);
 
 /// Everything a client needs in one object. `rev` grows only when the rest
 /// changed, so a client can tell a repeat from an update.
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct Envelope {
     pub rev: u64,
     pub state: AppState,

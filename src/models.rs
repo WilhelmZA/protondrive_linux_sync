@@ -120,6 +120,7 @@ impl Action {
 /// `kept_both`, `kept_local`, `kept_remote` or `skipped` (the HTTP API).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub enum ConflictOutcome {
     /// Both versions kept; the local one renamed to a "(conflict …)" copy.
     KeptBoth,

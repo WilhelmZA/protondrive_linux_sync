@@ -8,6 +8,7 @@
 //! The library is separate from the binaries so the CLI and the GUI share one
 //! core (config, engine, backend, state).
 
+pub mod api_client;
 pub mod auth_signal;
 pub mod backend;
 pub mod bookmarks;
@@ -55,6 +56,15 @@ pub const EXAMPLE_CONFIG: &str = r#"# neutronsync configuration. See README.md.
 # or from the NEUTRONSYNC_SESSION_KEY environment variable.
 # session_store = "keyring"
 # session_key_file = "/path/to/session.key"
+# TCP address the desktop tray also binds for /api/v1. The tray always binds
+# $XDG_RUNTIME_DIR/neutronsync/api.sock (mode 0600) when a runtime directory
+# exists. `neutronsync serve` uses --listen (default 127.0.0.1:8090) and that
+# socket when XDG_RUNTIME_DIR is set; it does not read api_listen. Anything
+# but a loopback address needs an API token.
+# api_listen = "127.0.0.1:8090"
+# Token file for the tray's TCP listener when NEUTRONSYNC_API_TOKEN is unset.
+# At least 32 characters. The unix socket does not use a bearer token.
+# api_token_file = "/path/to/api.token"
 
 [options]
 # Proton's per-user root. Remote paths in [[pair]] resolve under this unless

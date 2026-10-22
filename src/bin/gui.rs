@@ -1,4 +1,9 @@
-//! neutronsync GUI — a native egui/eframe front-end over the `service::Controller`.
+//! neutronsync GUI — a native egui/eframe front-end.
+//!
+//! The window talks to the engine only over the unix socket (`/api/v1`).
+//! `service::Controller` stays in this process for the tray child and, when
+//! tray mode is off, for the local engine host the window starts and shuts
+//! down with. The pages never call it.
 //!
 //! Visual language follows Proton Drive's desktop client (see reference/gui and
 //! reference/gui/mockup): a frameless dark window with a custom title bar, a left
@@ -9,8 +14,10 @@
 //!
 //! Build/run: `cargo run --features gui --bin neutronsync-gui`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -21,11 +28,14 @@ use eframe::egui::{
     self, pos2, vec2, Align2, Color32, FontFamily, FontId, Rect, RichText, Sense, Stroke,
 };
 
+use neutronsync::api_client::{self, EngineIo, Reply};
 use neutronsync::bookmarks;
 use neutronsync::config::{self, Config, ConflictPolicy, LocalDelete, Pair, Theme, UpdateChannel};
 use neutronsync::models::{Compare, ConflictOutcome, Entry};
 use neutronsync::notify_policy::{self, NotifyMemory};
-use neutronsync::service::{ActivityKind, ActivityOp, AppState, Controller, PairState, Phase};
+use neutronsync::service::{
+    ActivityKind, ActivityOp, AppState, Controller, PairState, Phase, SettledConflict,
+};
 use neutronsync::stats::{ConflictRecord, HeldDeletes};
 use neutronsync::tray_policy::{self, ChildEnd, DaemonBanner, SupervisorAction, TrayState};
 use neutronsync::updater::{self, UpdateInfo};
@@ -591,6 +601,10 @@ static NOTIFY_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
 struct Notifier {
     prev: AppState,
     mem: NotifyMemory,
+    /// Conflict ids already turned into a notice. The window has no
+    /// `take_settled_conflicts` queue; new rows on the envelope are the signal.
+    seen: HashSet<i64>,
+    seeded: bool,
 }
 
 impl Notifier {
@@ -598,6 +612,8 @@ impl Notifier {
         Notifier {
             prev: Self::remember(snap),
             mem: NotifyMemory::default(),
+            seen: HashSet::new(),
+            seeded: false,
         }
     }
 
@@ -610,14 +626,43 @@ impl Notifier {
         kept
     }
 
-    /// One pass: drain the settled conflicts and send what the policy says.
-    /// With notifications off the memory is cleared, so nothing old fires
-    /// when they are turned back on.
+    /// One pass for the tray, which owns the engine and its settled-conflict queue.
     fn tick(&mut self, ctrl: &Controller, snap: &AppState, enabled: bool) {
         let settled = ctrl.take_settled_conflicts();
+        self.emit(snap, &settled, enabled);
+    }
+
+    /// One pass for the window when it hosts the engine. Conflicts newly
+    /// present on the envelope stand in for the tray's queue. The first call
+    /// only remembers what is already there.
+    fn tick_envelope(&mut self, snap: &AppState, conflicts: &[ConflictRecord], enabled: bool) {
+        if !self.seeded {
+            self.seen.extend(conflicts.iter().map(|c| c.id));
+            self.seeded = true;
+            self.prev = Self::remember(snap);
+            if !enabled {
+                self.mem = NotifyMemory::default();
+            }
+            return;
+        }
+        let settled: Vec<SettledConflict> = conflicts
+            .iter()
+            .filter(|c| self.seen.insert(c.id))
+            .map(|c| SettledConflict {
+                pair: c.pair.clone(),
+                path: c.path.clone(),
+                outcome: c.outcome,
+            })
+            .collect();
+        self.emit(snap, &settled, enabled);
+    }
+
+    /// With notifications off the memory is cleared, so nothing old fires
+    /// when they are turned back on.
+    fn emit(&mut self, snap: &AppState, settled: &[SettledConflict], enabled: bool) {
         if enabled {
             for notice in
-                notify_policy::notices(&self.prev, snap, &settled, &mut self.mem, now_secs())
+                notify_policy::notices(&self.prev, snap, settled, &mut self.mem, now_secs())
             {
                 send_notification(notice.title, notice.body);
             }
@@ -930,10 +975,10 @@ struct ApiSignIn {
     factor: String,
     step: serde_json::Value,
     error: Option<String>,
-    pending: Option<std::sync::mpsc::Receiver<Result<serde_json::Value, String>>>,
+    pending: Option<Receiver<Result<Reply, String>>>,
 }
 
-/// Samples of the tray lock and `status.json`, at most once every two seconds.
+/// Samples of the tray lock and the engine socket, at most once every two seconds.
 struct DaemonWatch {
     last_check: f64,
     alive: bool,
@@ -941,7 +986,6 @@ struct DaemonWatch {
     attempts: u32,
     spawned: bool,
     last_spawn: f64,
-    status_missing_since: Option<f64>,
     /// Set when this window itself started the tray. The "stopped" banner waits
     /// out the first two seconds, because that spawn is a start, not a restart.
     startup_grace: bool,
@@ -956,14 +1000,31 @@ impl DaemonWatch {
             attempts: 0,
             spawned: false,
             last_spawn: 0.0,
-            status_missing_since: None,
             startup_grace: false,
         }
     }
 }
 
 struct App {
-    ctrl: Controller,
+    /// Unix-socket API. None for `--screenshots`, and when there is no runtime
+    /// directory to bind a socket in.
+    link: Option<EngineIo>,
+    /// Local engine host when tray mode is off. Dropped on window close, which
+    /// stops the API. The window does not keep the `Controller`.
+    _local_engine: Option<neutronsync::server::ServerHandle>,
+    engine_error: Option<String>,
+    /// Latest envelope. Pages render this, not `status.json`.
+    live: AppState,
+    rev: u64,
+    /// Logged once when an older tray's fresh status file is shown.
+    grace_logged: bool,
+    follow_sync: Option<(Vec<String>, bool)>,
+    save_rx: Option<Receiver<Result<(), String>>>,
+    reset_rx: Option<Receiver<Result<(), String>>>,
+    resetting: bool,
+    logout_rx: Option<Receiver<Result<Reply, String>>>,
+    auto_rx: Option<Receiver<Result<Reply, String>>>,
+    action_rx: Vec<Receiver<Result<Reply, String>>>,
     cfg: Config,
     config_path: PathBuf,
     config_loaded: bool,
@@ -984,7 +1045,7 @@ struct App {
     browser_entries: Vec<Entry>,
     browser_loading: bool,
     browser_error: Option<String>,
-    browser_rx: Option<std::sync::mpsc::Receiver<Result<Vec<Entry>, String>>>,
+    browser_rx: Option<Receiver<Result<Reply, String>>>,
 
     // app logo texture (lazy-loaded from assets/logo.png)
     logo_tex: Option<egui::TextureHandle>,
@@ -994,7 +1055,7 @@ struct App {
     excl_entries: Vec<String>,
     excl_loading: bool,
     excl_error: Option<String>,
-    excl_rx: Option<std::sync::mpsc::Receiver<Result<Vec<Entry>, String>>>,
+    excl_rx: Option<Receiver<Result<Reply, String>>>,
     excl_newly: Vec<String>,
     confirm_remove_local: Option<(usize, Vec<String>)>,
 
@@ -1008,7 +1069,6 @@ struct App {
     // two seconds so they are right whichever process did the sync.
     holds: Vec<HeldDeletes>,
     conflicts: Vec<ConflictRecord>,
-    last_state_poll: f64,
     /// The pair whose "Delete them" answer is awaiting confirmation.
     confirm_delete_held: Option<String>,
 
@@ -1016,8 +1076,8 @@ struct App {
     // made-up data and write one PNG per scene. None in normal use.
     demo: Option<Demo>,
 
-    /// Desktop notices, decided from this window's own controller. Unused
-    /// in tray mode, where the tray process owns sync and notifies.
+    /// Desktop notices. Unused in tray mode, where the tray process owns sync
+    /// and notifies, so the window does not send the same notice twice.
     notifier: Notifier,
 }
 
@@ -1034,8 +1094,7 @@ impl App {
         LIGHT_MODE.store(cfg.theme == Theme::Light, Ordering::Relaxed);
         install_theme(&cc.egui_ctx);
         ensure_desktop_integration();
-        let ctrl = Controller::new(cfg.clone());
-        let notifier = Notifier::new(&ctrl.snapshot());
+        let notifier = Notifier::new(&AppState::default());
         // With the tray on, a headless daemon owns the tray + watcher; this window
         // just ensures one exists, takes a window lock, and exits on close.
         let mode_daemon = cfg.run_in_tray;
@@ -1055,8 +1114,24 @@ impl App {
             None
         };
 
+        let ctx = cc.egui_ctx.clone();
+        let (local_engine, link, engine_error) =
+            attach_engine(&cfg, mode_daemon, move || ctx.request_repaint());
+
         let app = App {
-            ctrl,
+            link,
+            _local_engine: local_engine,
+            engine_error,
+            live: AppState::default(),
+            rev: 0,
+            grace_logged: false,
+            follow_sync: None,
+            save_rx: None,
+            reset_rx: None,
+            resetting: false,
+            logout_rx: None,
+            auto_rx: None,
+            action_rx: Vec::new(),
             cfg,
             config_path,
             config_loaded,
@@ -1088,19 +1163,10 @@ impl App {
             _win_lock: win_lock,
             holds: Vec::new(),
             conflicts: Vec::new(),
-            last_state_poll: -1.0,
             confirm_delete_held: None,
             demo: None,
             notifier,
         };
-        // Resume Auto sync if it was on last time — but not in daemon mode, where
-        // the daemon owns the watcher (only one watcher may hold the lock).
-        if app.cfg.auto_sync && !app.mode_daemon {
-            let names = app.auto_names();
-            if !names.is_empty() {
-                app.ctrl.start_watch(names);
-            }
-        }
         // Optional quiet update check on launch (notify only).
         if app.cfg.check_on_launch {
             spawn_update_check(
@@ -1136,10 +1202,7 @@ impl App {
     }
 
     fn commit(&mut self) {
-        self.ctrl.commit_config(self.cfg.clone());
-        if self.demo.is_none() {
-            reconcile_bookmarks(&self.cfg);
-        }
+        self.dirty = true;
     }
 
     /// When the tray is on, the headless daemon owns it. This window just makes
@@ -1154,7 +1217,7 @@ impl App {
         }
     }
 
-    /// Sample the tray lock and `status.json` at most every two seconds.
+    /// Sample the tray lock and the engine socket at most every two seconds.
     fn poll_daemon_liveness(&mut self, now: f64) {
         if !self.mode_daemon || self.demo.is_some() {
             return;
@@ -1165,24 +1228,13 @@ impl App {
         self.daemon_watch.last_check = now;
         let alive = daemon_running(&self.cfg.state_dir);
         if self.daemon_watch.startup_grace && !alive && now - self.daemon_watch.last_spawn < 2.0 {
-            // A tray this window just started is not "stopped" yet. Ignore a
-            // leftover status.json until the grace passes or the lock appears.
+            // A tray this window just started is not "stopped" yet.
             self.daemon_watch.alive = false;
             self.daemon_watch.banner = None;
             return;
         }
         self.daemon_watch.startup_grace = false;
-        let age = status_age_secs(&self.cfg.state_dir);
-        if age.is_some() || !alive {
-            self.daemon_watch.status_missing_since = None;
-        }
-        let missing_for = if alive && age.is_none() {
-            let since = self.daemon_watch.status_missing_since.get_or_insert(now);
-            Some(now - *since)
-        } else {
-            None
-        };
-        let stale = tray_policy::status_is_stale(age, missing_for);
+        let stale = self.engine_stale();
         let spawn_due = !self.daemon_watch.spawned || now - self.daemon_watch.last_spawn >= 10.0;
         let decision =
             tray_policy::window_liveness(alive, stale, self.daemon_watch.attempts, spawn_due);
@@ -1196,16 +1248,123 @@ impl App {
         }
     }
 
-    /// Re-read held deletions and the conflict inbox from stats.db, at most
-    /// every two seconds. Both are written by whichever process ran the sync
-    /// (this window, the tray, or the CLI), so the file is the one truth.
-    fn poll_state(&mut self, now: f64) {
-        if self.demo.is_some() || !tray_policy::check_due(now, self.last_state_poll, 2.0) {
+    fn engine_health(&self) -> bool {
+        self.link.as_ref().is_some_and(|link| link.health_ok())
+    }
+
+    /// Socket down, and this window has not yet seen an envelope, while an
+    /// older tray's `status.json` is still fresh. One release only.
+    fn old_tray_grace(&self) -> bool {
+        if self.rev != 0 || self.engine_health() {
+            return false;
+        }
+        status_age_secs(&self.cfg.state_dir).is_some_and(|age| age < 10.0)
+    }
+
+    fn engine_stale(&self) -> bool {
+        let quiet = self.link.as_ref().and_then(|link| link.events_quiet_secs());
+        tray_policy::engine_not_responding(self.engine_health(), quiet) && !self.old_tray_grace()
+    }
+
+    fn pump_engine(&mut self, ctx: &egui::Context) {
+        if self.demo.is_some() {
             return;
         }
-        self.last_state_poll = now;
-        self.holds = self.ctrl.held_deletes();
-        self.conflicts = self.ctrl.conflicts();
+        if let Some(link) = &self.link {
+            while let Some(env) = link.try_state() {
+                if env.rev != self.rev {
+                    self.rev = env.rev;
+                    self.live = env.state;
+                    self.holds = env.held;
+                    self.conflicts = env.conflicts;
+                    ctx.request_repaint();
+                }
+            }
+        }
+        if let Some(rx) = &self.save_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.save_rx = None;
+                match result {
+                    Ok(()) => {
+                        if self.demo.is_none() {
+                            reconcile_bookmarks(&self.cfg);
+                        }
+                        self.config_loaded = true;
+                    }
+                    Err(err) => {
+                        if self.engine_health() {
+                            self.toast(ctx, err, true);
+                        } else {
+                            self.dirty = true;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(rx) = &self.reset_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.reset_rx = None;
+                self.resetting = false;
+                match result {
+                    Ok(()) => {
+                        self.cfg.pairs.clear();
+                        self.cfg.auto_sync = false;
+                        if self.demo.is_none() {
+                            reconcile_bookmarks(&self.cfg);
+                        }
+                        self.toast(
+                            ctx,
+                            "NeutronSync reset. Add a folder to start fresh.",
+                            false,
+                        );
+                    }
+                    Err(err) => self.toast(ctx, err, true),
+                }
+            }
+        }
+        if let Some(rx) = &self.logout_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.logout_rx = None;
+                match result.and_then(api_client::ok_json) {
+                    Ok(_) => self.toast(ctx, "Logged out.", false),
+                    Err(err) => self.toast(ctx, err, true),
+                }
+            }
+        }
+        if let Some(rx) = &self.auto_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.auto_rx = None;
+                if let Err(err) = result.and_then(api_client::ok_json) {
+                    self.cfg.auto_sync = !self.cfg.auto_sync;
+                    self.toast(ctx, err, true);
+                }
+            }
+        }
+        let mut finished = Vec::new();
+        for (i, rx) in self.action_rx.iter().enumerate() {
+            if let Ok(result) = rx.try_recv() {
+                finished.push((i, result));
+            }
+        }
+        for (i, _) in finished.iter().rev() {
+            self.action_rx.remove(*i);
+        }
+        for (_, result) in finished {
+            if let Err(err) = result.and_then(api_client::ok_json) {
+                self.toast(ctx, err, true);
+            }
+        }
+        let waiting = self.save_rx.is_some()
+            || self.reset_rx.is_some()
+            || self.logout_rx.is_some()
+            || self.auto_rx.is_some()
+            || !self.action_rx.is_empty()
+            || self.api_signin.pending.is_some()
+            || self.browser_rx.is_some()
+            || self.excl_rx.is_some();
+        if waiting {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
 
     /// "Try again" resets the failure count and starts background sync once.
@@ -1221,13 +1380,35 @@ impl App {
         }
     }
 
-    /// Commit + write config without a toast (used for auto-save on change).
-    fn save_silent(&mut self) {
-        self.commit();
-        if self.ctrl.save(&self.config_path).is_ok() {
-            self.dirty = false;
-            self.config_loaded = true;
+    /// Send the edited config to the engine. Bookmarks are reconciled when the
+    /// write succeeds. While the socket is not up yet, the edit stays dirty.
+    fn flush_config(&mut self) {
+        if self.demo.is_some() || self.resetting || self.save_rx.is_some() {
+            return;
         }
+        if self.follow_sync.is_none() && !self.dirty {
+            return;
+        }
+        let Some(link) = &self.link else {
+            return;
+        };
+        if !self.engine_health() && self.rev == 0 {
+            return;
+        }
+        if self.dirty {
+            let cfg = self.cfg.clone();
+            let sync = self.follow_sync.take();
+            self.dirty = false;
+            self.save_rx = Some(link.push(cfg, sync));
+        } else if let Some((pairs, dry_run)) = self.follow_sync.take() {
+            let body = serde_json::json!({"pairs": pairs, "dry_run": dry_run}).to_string();
+            let rx = link.call("POST", "/api/v1/sync", Some(body.into_bytes()));
+            self.action_rx.push(rx);
+        }
+    }
+
+    fn api(&self) -> Option<&EngineIo> {
+        self.link.as_ref()
     }
 
     fn auto_names(&self) -> Vec<String> {
@@ -1249,15 +1430,19 @@ impl App {
         self.load_browser();
     }
     fn load_browser(&mut self) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.browser_rx = Some(rx);
         self.browser_loading = true;
         self.browser_error = None;
-        let cfg = self.cfg.clone();
-        let path = self.browser_path.clone();
-        thread::spawn(move || {
-            let _ = tx.send(neutronsync::backend::list_remote(&cfg, &path));
-        });
+        let path = format!(
+            "/api/v1/remote/list?path={}",
+            api_client::encode_component(&self.browser_path)
+        );
+        match self.api() {
+            Some(link) => self.browser_rx = Some(link.call("GET", path, None)),
+            None => {
+                self.browser_loading = false;
+                self.browser_error = Some("The engine is not running.".into());
+            }
+        }
     }
 
     // -- exclude editor ("choose folders to sync" for a pair) ---------------
@@ -1270,13 +1455,18 @@ impl App {
         self.excl_error = None;
         self.excl_newly.clear();
         self.excl_loading = true;
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.excl_rx = Some(rx);
-        let cfg = self.cfg.clone();
         let remote = self.cfg.pairs[i].remote.clone();
-        thread::spawn(move || {
-            let _ = tx.send(neutronsync::backend::list_remote(&cfg, &remote));
-        });
+        let path = format!(
+            "/api/v1/remote/list?path={}",
+            api_client::encode_component(&remote)
+        );
+        match self.api() {
+            Some(link) => self.excl_rx = Some(link.call("GET", path, None)),
+            None => {
+                self.excl_loading = false;
+                self.excl_error = Some("The engine is not running.".into());
+            }
+        }
     }
 
     fn exclude_window(&mut self, ctx: &egui::Context) {
@@ -1449,9 +1639,8 @@ impl App {
                 exclude: Vec::new(),
             });
             self.commit();
-            self.dirty = true;
+            self.follow_sync = Some((vec![name], false));
             self.browser_open = false;
-            self.ctrl.sync(vec![name], false); // auto-initialize
             self.set_nav(Nav::Activity);
             self.toast(ctx, "Added — initializing…", false);
         }
@@ -1559,13 +1748,16 @@ impl eframe::App for App {
         self.pump_tray(ctx);
         let now = ctx.input(|i| i.time);
         self.poll_daemon_liveness(now);
-        self.poll_state(now);
+        self.pump_engine(ctx);
         // pump the remote browser channel
         if let Some(rx) = &self.browser_rx {
             if let Ok(res) = rx.try_recv() {
                 self.browser_rx = None;
                 self.browser_loading = false;
-                match res {
+                match res
+                    .and_then(api_client::ok_json)
+                    .and_then(|v| api_client::remote_entries(&v))
+                {
                     Ok(entries) => {
                         let mut dirs: Vec<Entry> =
                             entries.into_iter().filter(|e| e.is_dir).collect();
@@ -1581,7 +1773,10 @@ impl eframe::App for App {
             if let Ok(res) = rx.try_recv() {
                 self.excl_rx = None;
                 self.excl_loading = false;
-                match res {
+                match res
+                    .and_then(api_client::ok_json)
+                    .and_then(|v| api_client::remote_entries(&v))
+                {
                     Ok(entries) => {
                         let mut dirs: Vec<String> = entries
                             .into_iter()
@@ -1596,42 +1791,33 @@ impl eframe::App for App {
             }
         }
 
-        // In tray mode the background daemon owns the watcher/sync in a separate
-        // process, so this window's own controller is idle. Display the daemon's
-        // published live state instead (scanning, syncing, per-file ops), keeping
-        // this window's own account check. Falls back to our own state if the
-        // daemon hasn't published yet.
+        // Live state is the latest envelope. `--screenshots` overlays a fake
+        // one and never opens the socket.
         let snap = if let Some(state) = self.demo_frame(ctx) {
             state
         } else {
-            let mine = self.ctrl.snapshot();
-            // Only the process that owns sync notifies (D1): this window when
-            // the tray is off; in tray mode the tray does it.
+            // One-release grace: an older tray publishes only status.json.
+            // This is the only read_status path left in the window. A socket
+            // that has already answered, or a stale file, does not use it.
+            let grace = self.mode_daemon && self.old_tray_grace();
+            let snap = if grace {
+                if !self.grace_logged {
+                    eprintln!(
+                        "neutronsync: the engine socket is not answering; showing a fresh status.json from an older tray for this release"
+                    );
+                    self.grace_logged = true;
+                }
+                grace_status_snapshot(&self.cfg.state_dir).unwrap_or_else(|| self.live.clone())
+            } else {
+                self.live.clone()
+            };
+            // The tray process notifies when it owns the engine. This window
+            // notifies only when it hosts the engine itself.
             if !self.mode_daemon {
                 self.notifier
-                    .tick(&self.ctrl, &mine, self.cfg.notifications);
+                    .tick_envelope(&snap, &self.conflicts, self.cfg.notifications);
             }
-            // A dead tray leaves status.json behind. Ignore it and show this
-            // window's own state until background sync is publishing again.
-            if self.mode_daemon && self.daemon_watch.alive {
-                match Controller::read_status(&self.cfg.state_dir) {
-                    Some(mut pubd) => {
-                        pubd.account = mine.account.clone();
-                        // The window probes auth directly; trust it over the
-                        // daemon's possibly stale signed_out flag (up to 20s lag
-                        // without a refresh signal).
-                        if mine.account.checked {
-                            pubd.signed_out = mine.account.backend_ready
-                                && !mine.account.signed_in
-                                && !mine.account.keyring_locked;
-                        }
-                        pubd
-                    }
-                    None => mine,
-                }
-            } else {
-                mine
-            }
+            snap
         };
         // Keep polling the daemon's published state while a window is open.
         if self.mode_daemon {
@@ -1655,15 +1841,16 @@ impl eframe::App for App {
         // First-run / broken-prereq gate: show the sign-in page unless we have
         // CONFIRMED a reachable, signed-in sidecar. Covers both "sidecar missing"
         // (page_signin explains) and "present but signed out".
-        let signin =
-            snap.account.checked && !(snap.account.backend_ready && snap.account.signed_in);
+        let signin = self.engine_error.is_none()
+            && snap.account.checked
+            && !(snap.account.backend_ready && snap.account.signed_in);
         // The gate used to probe once. A session that was already in the keyring,
         // or that becomes readable after the keyring unlocks, never got a second
         // look, so the login page stayed up until Refresh. Keep asking.
-        if signin && self.demo.is_none() {
+        if signin && self.demo.is_none() && self.engine_error.is_none() {
             let now = ctx.input(|i| i.time);
             if now - self.last_account_poll > 2.5 && !snap.account.checking {
-                self.ctrl.refresh_account(true);
+                self.refresh_account();
                 self.last_account_poll = now;
             }
             ctx.request_repaint_after(std::time::Duration::from_millis(400));
@@ -1682,6 +1869,18 @@ impl eframe::App for App {
                     }
                     ui.add_space(14.0);
                 }
+            }
+            if let Some(msg) = self.engine_error.clone() {
+                let _ = activity_banner(
+                    ui,
+                    pal().danger,
+                    Icon::Info,
+                    "Engine unavailable",
+                    &msg,
+                    false,
+                    None,
+                );
+                ui.add_space(14.0);
             }
             if signin {
                 self.page_signin(ui, &snap);
@@ -1714,9 +1913,9 @@ impl eframe::App for App {
         self.reset_dialog(ctx);
         self.toast_overlay(ctx);
 
-        // auto-save any config change (settings, folders, auto-sync) — no manual Save needed
-        if self.dirty {
-            self.save_silent();
+        // auto-save any config change (settings, folders) — no manual Save needed
+        if self.demo.is_none() && (self.dirty || self.follow_sync.is_some()) {
+            self.flush_config();
         }
 
         if snap.busy || snap.watching || self.nav_t < 1.0 || self.toast.is_some() {
@@ -1928,21 +2127,19 @@ impl App {
         // In tray mode the background daemon owns the watcher, so this window
         // shows/edits the *setting* (cfg.auto_sync) rather than its own watch
         // state — starting a second watcher here would fight over the lock.
-        let on = if self.mode_daemon {
-            self.cfg.auto_sync
-        } else {
-            snap.watching
-        };
+        let on = self.cfg.auto_sync;
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(RichText::new("Auto sync").size(12.5).color(pal().text));
-                let sub = if on && self.mode_daemon {
+                let sub = if on && self.mode_daemon && snap.watching {
                     format!(
                         "On · tray is watching {n} folder{}",
                         if n == 1 { "" } else { "s" }
                     )
-                } else if on {
+                } else if on && snap.watching {
                     format!("On · watching {n} folder{}", if n == 1 { "" } else { "s" })
+                } else if on {
+                    format!("On · {n} folder{}", if n == 1 { "" } else { "s" })
                 } else {
                     "Off · sync on demand".to_string()
                 };
@@ -1950,32 +2147,15 @@ impl App {
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if switch(ui, on) {
-                    if self.mode_daemon {
-                        // Just update the setting; the tray daemon applies it.
-                        let ctx = ui.ctx().clone();
-                        if on {
-                            self.cfg.auto_sync = false;
-                            self.dirty = true;
-                            self.toast(&ctx, "Auto sync off — restart the tray to apply.", false);
-                        } else if n == 0 {
-                            self.toast(&ctx, "No folders set to Auto.", true);
-                        } else {
-                            self.cfg.auto_sync = true;
-                            self.dirty = true;
-                            self.toast(&ctx, "Auto sync on — restart the tray to apply.", false);
-                        }
-                    } else if on {
-                        self.ctrl.stop_watch();
+                    let ctx = ui.ctx().clone();
+                    if on {
                         self.cfg.auto_sync = false;
-                        self.dirty = true;
+                        self.post_auto(false);
                     } else if n == 0 {
-                        let ctx = ui.ctx().clone();
                         self.toast(&ctx, "No folders set to Auto.", true);
                     } else {
-                        self.commit();
-                        self.ctrl.start_watch(self.auto_names());
                         self.cfg.auto_sync = true;
-                        self.dirty = true;
+                        self.post_auto(true);
                     }
                 }
             });
@@ -2011,19 +2191,15 @@ impl App {
         let active = busy || scanning || syncing;
         self.page_header(ui, "Activity", |ui, app| {
             if active {
-                // Only the window's OWN sync can be cancelled from here; a
-                // background daemon run just shows as busy.
                 if busy && button(ui, None, "Cancel", Btn::Secondary, false, true).clicked() {
-                    app.ctrl.cancel();
+                    app.post_empty("POST", "/api/v1/cancel");
                 }
             } else {
                 if button(ui, Some(Icon::Sync), "Sync now", Btn::Primary, false, true).clicked() {
-                    app.commit();
-                    app.ctrl.sync(vec![], false);
+                    app.follow_sync = Some((Vec::new(), false));
                 }
                 if button(ui, None, "Dry run", Btn::Ghost, false, true).clicked() {
-                    app.commit();
-                    app.ctrl.sync(vec![], true);
+                    app.follow_sync = Some((Vec::new(), true));
                 }
             }
         });
@@ -2094,7 +2270,8 @@ impl App {
                 ui.add_space(10.0);
                 match held_banner(ui, hold, !active) {
                     HeldAction::Restore => {
-                        self.ctrl.restore_held(hold.pair.clone());
+                        let pair = api_client::encode_component(&hold.pair);
+                        self.post_empty("POST", &format!("/api/v1/held/{pair}/restore"));
                         self.toast(
                             ui.ctx(),
                             format!("Bringing the files back in {}…", hold.pair),
@@ -2411,8 +2588,6 @@ impl App {
         if let Some(i) = remove {
             // Purge the folder's stored data too, so re-adding a same-named
             // folder later starts fresh instead of inheriting a stale baseline.
-            let name = self.cfg.pairs[i].name.clone();
-            self.ctrl.forget_pair(&name);
             self.cfg.pairs.remove(i);
             changed = true;
         }
@@ -2452,7 +2627,7 @@ impl App {
         }
         if let Some(name) = sync_one {
             self.commit();
-            self.ctrl.sync(vec![name], false);
+            self.follow_sync = Some((vec![name], false));
             self.set_nav(Nav::Activity);
         }
     }
@@ -2577,14 +2752,12 @@ impl App {
             open_path(&p);
         }
         if let Some(id) = dismiss {
-            self.ctrl.dismiss_conflict(id);
+            self.post_empty("POST", &format!("/api/v1/conflicts/{id}/dismiss"));
             self.conflicts.retain(|c| c.id != id);
-            self.last_state_poll = -1.0;
         }
         if dismiss_all {
-            self.ctrl.dismiss_all_conflicts();
+            self.post_empty("POST", "/api/v1/conflicts/dismiss-all");
             self.conflicts.clear();
-            self.last_state_poll = -1.0;
         }
     }
 
@@ -2659,7 +2832,12 @@ impl App {
         if let Some(go) = choice {
             self.confirm_delete_held = None;
             if go {
-                self.ctrl.delete_held(name.clone());
+                let pair = api_client::encode_component(&name);
+                self.post_json(
+                    "POST",
+                    &format!("/api/v1/held/{pair}/delete"),
+                    r#"{"confirm":true}"#,
+                );
                 self.toast(ctx, format!("Deleting the held files in {name}…"), false);
                 self.set_nav(Nav::Activity);
             }
@@ -3010,7 +3188,7 @@ impl App {
         }
         if refresh {
             self.last_account_poll = ui.ctx().input(|i| i.time);
-            self.ctrl.refresh_account(false);
+            self.refresh_account();
         }
 
         if acc.keyring_locked {
@@ -3437,7 +3615,7 @@ impl App {
                         .clicked()
                         {
                             self.last_account_poll = ui.ctx().input(|i| i.time);
-                            self.ctrl.refresh_account(false);
+                            self.refresh_account();
                         }
                     });
                 }
@@ -3454,13 +3632,12 @@ impl App {
         {
             self.api_signin.pending = None;
             self.api_signin.factor.clear();
-            match result {
+            match result.and_then(api_client::ok_json) {
                 Ok(step) => {
-                    if step["ok"] == true {
+                    if step["step"] == "done" {
                         self.api_signin = ApiSignIn::default();
-                        self.ctrl.refresh_account(true);
                     } else {
-                        if step["need_human_verification"] != true {
+                        if step["step"] != "need_human_verification" {
                             self.api_signin.password.clear();
                         }
                         self.api_signin.step = step;
@@ -3482,9 +3659,9 @@ impl App {
             ui.set_width(field_w);
             ui.add_enabled_ui(!busy, |ui| {
                 let form = &mut self.api_signin;
-                let two_factor = form.step["need_2fa"] == true;
-                let mailbox = form.step["need_mailbox_password"] == true;
-                let hv = form.step["need_human_verification"] == true;
+                let two_factor = form.step["step"] == "need_2fa";
+                let mailbox = form.step["step"] == "need_mailbox_password";
+                let hv = form.step["step"] == "need_human_verification";
                 let pad = egui::Margin::symmetric(4, 2);
                 if hv {
                     ui.label(
@@ -3582,41 +3759,46 @@ impl App {
             ui.ctx().open_url(egui::OpenUrl::new_tab(url));
         }
         if submit && !busy {
-            let form = &mut self.api_signin;
-            let two_factor = form.step["need_2fa"] == true;
-            let mailbox = form.step["need_mailbox_password"] == true;
-            let hv = form.step["need_human_verification"] == true;
-            let (method, params) = if two_factor {
-                (
-                    "auth.submit_2fa",
-                    serde_json::json!({"code": std::mem::take(&mut form.factor)}),
-                )
-            } else if mailbox {
-                (
-                    "auth.submit_mailbox_password",
-                    serde_json::json!({"password": std::mem::take(&mut form.factor)}),
-                )
-            } else {
-                let mut params =
-                    serde_json::json!({"username": form.username, "password": form.password});
-                if hv {
-                    params["hv_token"] = form.step["token"].clone();
-                    params["hv_type"] = form.step["methods"][0].clone();
-                }
-                ("auth.login", params)
+            let (path, body) = {
+                let form = &mut self.api_signin;
+                let two_factor = form.step["step"] == "need_2fa";
+                let mailbox = form.step["step"] == "need_mailbox_password";
+                let hv = form.step["step"] == "need_human_verification";
+                let (path, params) = if two_factor {
+                    (
+                        "/api/v1/account/2fa",
+                        serde_json::json!({"code": std::mem::take(&mut form.factor)}),
+                    )
+                } else if mailbox {
+                    (
+                        "/api/v1/account/mailbox-password",
+                        serde_json::json!({"password": std::mem::take(&mut form.factor)}),
+                    )
+                } else {
+                    let mut params =
+                        serde_json::json!({"username": form.username, "password": form.password});
+                    if hv {
+                        params["hv_token"] = form.step["token"].clone();
+                        let hv_type = form.step["methods"][0]
+                            .as_str()
+                            .unwrap_or("captcha")
+                            .to_string();
+                        params["hv_type"] = serde_json::Value::String(hv_type);
+                    }
+                    ("/api/v1/account/login", params)
+                };
+                form.error = None;
+                (path, params.to_string())
             };
-            let (tx, rx) = std::sync::mpsc::channel();
-            form.pending = Some(rx);
-            form.error = None;
-            let cfg = self.cfg.clone();
-            let ctx = ui.ctx().clone();
-            thread::spawn(move || {
-                let result = neutronsync::driveapi::DriveApi::new(&cfg)
-                    .and_then(|api| api.auth(method, params))
-                    .map_err(|e| e.to_string());
-                let _ = tx.send(result);
-                ctx.request_repaint();
-            });
+            let call = self
+                .api()
+                .map(|link| link.call("POST", path, Some(body.into_bytes())));
+            match call {
+                Some(rx) => self.api_signin.pending = Some(rx),
+                None => {
+                    self.api_signin.error = Some("The engine is not running.".into());
+                }
+            }
         }
     }
 
@@ -3647,14 +3829,13 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if button(ui, None, "Log out", Btn::Danger, false, true).clicked() {
-                            let result = neutronsync::driveapi::DriveApi::new(&self.cfg)
-                                .and_then(|api| api.auth("auth.logout", serde_json::json!({})))
-                                .map(|_| ());
-                            self.ctrl.refresh_account(false);
                             self.confirm_logout = false;
-                            match result {
-                                Ok(()) => self.toast(ctx, "Logged out.", false),
-                                Err(error) => self.toast(ctx, error.to_string(), true),
+                            let call = self.api().map(|link| {
+                                link.call("POST", "/api/v1/account/logout", Some(b"{}".to_vec()))
+                            });
+                            match call {
+                                Some(rx) => self.logout_rx = Some(rx),
+                                None => self.toast(ctx, "The engine is not running.", true),
                             }
                         }
                         if button(ui, None, "Cancel", Btn::Secondary, false, true).clicked() {
@@ -3696,16 +3877,16 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if button(ui, None, "Reset everything", Btn::Danger, false, true).clicked()
                         {
-                            self.ctrl.reset_data();
-                            self.cfg.pairs.clear();
-                            self.cfg.auto_sync = false;
-                            self.dirty = true; // auto-save writes the clean config
                             self.confirm_reset = false;
-                            self.toast(
-                                ctx,
-                                "NeutronSync reset. Add a folder to start fresh.",
-                                false,
-                            );
+                            let names = self.cfg.pairs.iter().map(|p| p.name.clone()).collect();
+                            let call = self.api().map(|link| link.reset(names));
+                            match call {
+                                Some(rx) => {
+                                    self.resetting = true;
+                                    self.reset_rx = Some(rx);
+                                }
+                                None => self.toast(ctx, "The engine is not running.", true),
+                            }
                         }
                         if button(ui, None, "Cancel", Btn::Secondary, false, true).clicked() {
                             self.confirm_reset = false;
@@ -4832,6 +5013,8 @@ fn starter_config(path: &Path) -> Config {
         file_manager_bookmarks: false,
         session_store: Default::default(),
         session_key_file: None,
+        api_listen: None,
+        api_token_file: None,
         state_dir: {
             let base = std::env::var("XDG_STATE_HOME")
                 .map(PathBuf::from)
@@ -4890,6 +5073,11 @@ fn run_tray_supervisor() {
             return;
         }
     };
+    // serve.lock is the other owner. The tray lock keeps its own message.
+    if neutronsync::server::serve_lock_alive(&cfg.state_dir) {
+        eprintln!("{}", neutronsync::server::ENGINE_BUSY);
+        return;
+    }
     let _lock = match PidLock::acquire(&cfg.state_dir, DAEMON_LOCK) {
         Some(lock) => lock,
         None => {
@@ -5018,6 +5206,167 @@ fn wait_tray_child(child: &mut std::process::Child) -> ChildEnd {
     }
 }
 
+fn refresh_account_call(link: &EngineIo) {
+    drop(link.call("GET", "/api/v1/account", None));
+}
+
+impl App {
+    fn refresh_account(&self) {
+        if let Some(link) = &self.link {
+            refresh_account_call(link);
+        }
+    }
+
+    fn post_empty(&mut self, method: &str, path: &str) {
+        self.post_json(method, path, "{}");
+    }
+
+    fn post_json(&mut self, method: &str, path: &str, body: &str) {
+        if let Some(link) = &self.link {
+            let rx = link.call(method, path, Some(body.as_bytes().to_vec()));
+            self.action_rx.push(rx);
+        }
+    }
+
+    fn post_auto(&mut self, enabled: bool) {
+        let body = if enabled {
+            r#"{"enabled":true}"#
+        } else {
+            r#"{"enabled":false}"#
+        };
+        if let Some(link) = &self.link {
+            self.auto_rx =
+                Some(link.call("POST", "/api/v1/auto-sync", Some(body.as_bytes().to_vec())));
+        }
+    }
+}
+
+/// One-release grace for a tray that only publishes `status.json`.
+/// This is the window's only read of that file.
+fn grace_status_snapshot(state_dir: &Path) -> Option<AppState> {
+    let data = std::fs::read(state_dir.join("status.json")).ok()?;
+    serde_json::from_slice(&data).ok()
+}
+
+/// Start a `Controller` and the unix API in this process when tray mode is
+/// off. The caller keeps only the [`ServerHandle`].
+fn start_window_engine(cfg: &Config) -> Result<neutronsync::server::ServerHandle, String> {
+    if neutronsync::server::tray_socket_path().is_none() {
+        return Err(
+            "NeutronSync needs a runtime directory (XDG_RUNTIME_DIR) so this window can reach its engine."
+                .into(),
+        );
+    }
+    let ctrl = Arc::new(Controller::new(cfg.clone()));
+    if cfg.auto_sync {
+        let names = auto_names_of(cfg);
+        if !names.is_empty() {
+            ctrl.start_watch(names);
+        }
+    }
+    start_tray_api(&ctrl, cfg).ok_or_else(|| "The engine API did not start.".into())
+}
+
+fn attach_engine(
+    cfg: &Config,
+    mode_daemon: bool,
+    repaint: impl Fn() + Send + Sync + 'static,
+) -> (
+    Option<neutronsync::server::ServerHandle>,
+    Option<EngineIo>,
+    Option<String>,
+) {
+    let Some(sock) = neutronsync::server::tray_socket_path() else {
+        return (
+            None,
+            None,
+            Some(
+                "NeutronSync needs a runtime directory (XDG_RUNTIME_DIR) so this window can reach its engine."
+                    .into(),
+            ),
+        );
+    };
+    if mode_daemon {
+        return (None, Some(EngineIo::spawn(sock, repaint)), None);
+    }
+    match start_window_engine(cfg) {
+        Ok(handle) => (Some(handle), Some(EngineIo::spawn(sock, repaint)), None),
+        Err(err) => (None, None, Some(err)),
+    }
+}
+
+fn stop_api(api: &mut Option<neutronsync::server::ServerHandle>) {
+    if let Some(handle) = api.take() {
+        handle.shutdown();
+    }
+}
+
+/// Bind the tray's API beside the controller this process already owns.
+/// A missing runtime directory, or a TCP listener that fails the token rule,
+/// does not stop syncing.
+fn start_tray_api(
+    ctrl: &Arc<Controller>,
+    cfg: &Config,
+) -> Option<neutronsync::server::ServerHandle> {
+    let unix = neutronsync::server::tray_socket_path();
+    if unix.is_none() {
+        eprintln!(
+            "neutronsync: no XDG_RUNTIME_DIR and no /run/user/{} directory; the API socket was not started",
+            unsafe { libc::getuid() }
+        );
+    }
+    let mut token_ok = true;
+    let token = match neutronsync::server::read_api_token(None, cfg.api_token_file.as_deref()) {
+        Ok(token) => token,
+        Err(err) => {
+            eprintln!("neutronsync: {err:#}");
+            token_ok = false;
+            None
+        }
+    };
+    let tcp = if token_ok {
+        cfg.api_listen.as_deref().and_then(|text| match text.parse() {
+            Ok(addr) => Some(addr),
+            Err(_) => {
+                eprintln!(
+                    "neutronsync: api_listen {text} is not an address and port such as 127.0.0.1:8090"
+                );
+                None
+            }
+        })
+    } else {
+        None
+    };
+    if unix.is_none() && tcp.is_none() {
+        return None;
+    }
+    let config_path = cfg
+        .source_path
+        .clone()
+        .unwrap_or_else(|| config::find_config(None).unwrap_or_else(config::default_config_path));
+    let browse_roots = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|home| std::fs::canonicalize(home).ok())
+        .into_iter()
+        .collect();
+    match neutronsync::server::spawn_attached(
+        ctrl.clone(),
+        neutronsync::server::AttachOptions {
+            listeners: neutronsync::server::Listeners { unix, tcp },
+            token,
+            config_path,
+            pair_roots: Vec::new(),
+            browse_roots,
+        },
+    ) {
+        Ok(handle) => Some(handle),
+        Err(err) => {
+            eprintln!("neutronsync: API not started: {err:#}");
+            None
+        }
+    }
+}
+
 /// Headless tray child (`--tray-child`): owns the system tray (GTK/AppIndicator)
 /// and an optional watcher, with no window. The supervisor (`--tray`) holds
 /// `tray-daemon.lock` and restarts this process; this child takes no lock.
@@ -5047,9 +5396,13 @@ fn run_daemon() -> i32 {
             ctrl.start_watch(names);
         }
     }
+    // The API shares this controller. It runs on its own thread; GTK keeps
+    // the main thread. Quit shuts the listeners down before the loop ends.
+    let mut api = start_tray_api(&ctrl, &cfg);
 
     if let Err(e) = gtk::init() {
         eprintln!("neutronsync: GTK init failed: {e}");
+        stop_api(&mut api);
         ctrl.stop_watch();
         return 1;
     }
@@ -5086,6 +5439,7 @@ fn run_daemon() -> i32 {
         Ok(t) => t,
         Err(e) => {
             eprintln!("neutronsync: system tray unavailable: {e}");
+            stop_api(&mut api);
             ctrl.stop_watch();
             return 1;
         }
@@ -5111,6 +5465,8 @@ fn run_daemon() -> i32 {
     let mut want_watch = cfg.auto_sync;
     let mut pending_restart = false;
     let quit_flag = quit.clone();
+    let api = std::rc::Rc::new(std::cell::RefCell::new(api));
+    let api_quit = api.clone();
     gtk::glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
         // tray menu
         while let Ok(ev) = menu_rx.try_recv() {
@@ -5126,6 +5482,10 @@ fn run_daemon() -> i32 {
                 }
             } else if id == &quit_id {
                 // Full quit: close the window too (if open), then end the daemon.
+                // Stop the API first so its thread is gone before the process exits.
+                if let Some(handle) = api_quit.borrow_mut().take() {
+                    handle.shutdown();
+                }
                 quit_flag.store(true, Ordering::SeqCst);
                 terminate_window(&state_dir);
                 gtk::main_quit();
@@ -5194,6 +5554,9 @@ fn run_daemon() -> i32 {
     });
 
     gtk::main();
+    if let Some(handle) = api.borrow_mut().take() {
+        handle.shutdown();
+    }
     ctrl.stop_watch();
     if quit.load(Ordering::SeqCst) {
         0
@@ -5631,11 +5994,22 @@ impl App {
         cfg.sidecar = Some(scratch.path().join("no-sidecar"));
         cfg.pairs = demo_pairs();
         cfg.auto_sync = true;
-        let ctrl = Controller::new(cfg.clone());
-        let notifier = Notifier::new(&ctrl.snapshot());
+        let notifier = Notifier::new(&AppState::default());
         let _ = std::fs::create_dir_all(&dir);
         App {
-            ctrl,
+            link: None,
+            _local_engine: None,
+            engine_error: None,
+            live: AppState::default(),
+            rev: 0,
+            grace_logged: false,
+            follow_sync: None,
+            save_rx: None,
+            reset_rx: None,
+            resetting: false,
+            logout_rx: None,
+            auto_rx: None,
+            action_rx: Vec::new(),
             cfg,
             config_path,
             config_loaded: true,
@@ -5667,7 +6041,6 @@ impl App {
             _win_lock: None,
             holds: Vec::new(),
             conflicts: Vec::new(),
-            last_state_poll: -1.0,
             confirm_delete_held: None,
             demo: Some(Demo {
                 dir,

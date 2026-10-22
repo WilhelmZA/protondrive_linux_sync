@@ -82,6 +82,13 @@ pub struct Config {
     /// File holding the 32-byte key for the session file (base64 or hex).
     /// Only read when `session_store` is `File`.
     pub session_key_file: Option<PathBuf>,
+    /// TCP address (`host:port`) the desktop tray also binds for `/api/v1`.
+    /// Absent means the tray serves only on its unix socket. `neutronsync serve`
+    /// uses `--listen` and does not read this.
+    pub api_listen: Option<String>,
+    /// API token file for the tray's TCP listener when `NEUTRONSYNC_API_TOKEN`
+    /// is unset. `neutronsync serve` uses `--token-file` or the environment.
+    pub api_token_file: Option<PathBuf>,
     /// Concurrent folder reconciles during a full walk (0 = auto).
     pub scan_threads: usize,
     /// Concurrent file downloads during a sync (0 = auto). Bandwidth-bound, so
@@ -181,6 +188,8 @@ struct RawCli {
     sidecar: Option<String>,
     session_store: Option<String>,
     session_key_file: Option<String>,
+    api_listen: Option<String>,
+    api_token_file: Option<String>,
     scan_threads: Option<u64>,
     download_threads: Option<u64>,
 }
@@ -587,6 +596,11 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         sidecar: cli.sidecar.map(|p| expand(&p)),
         session_store,
         session_key_file: cli.session_key_file.map(|p| expand(&p)),
+        api_listen: cli.api_listen.and_then(|s| {
+            let s = s.trim().to_string();
+            (!s.is_empty()).then_some(s)
+        }),
+        api_token_file: cli.api_token_file.map(|p| expand(&p)),
         scan_threads,
         download_threads,
         remote_root,
@@ -656,6 +670,12 @@ struct OutCli {
     session_store: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_key_file: Option<PathBuf>,
+    /// Written only when set, so a desktop config does not gain a TCP listener
+    /// on the next save.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_listen: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_token_file: Option<PathBuf>,
     scan_threads: usize,
     download_threads: usize,
 }
@@ -728,7 +748,8 @@ pub fn compare_str(v: Compare) -> &'static str {
     }
 }
 
-fn update_channel_str(v: UpdateChannel) -> &'static str {
+/// The config spelling of an update channel.
+pub fn update_channel_str(v: UpdateChannel) -> &'static str {
     match v {
         UpdateChannel::Stable => "stable",
         UpdateChannel::Prerelease => "prerelease",
@@ -760,6 +781,8 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
             session_store: (cfg.session_store != SessionStore::Keyring)
                 .then(|| session_store_str(cfg.session_store)),
             session_key_file: cfg.session_key_file.clone(),
+            api_listen: cfg.api_listen.clone(),
+            api_token_file: cfg.api_token_file.clone(),
             scan_threads: cfg.scan_threads,
             download_threads: cfg.download_threads,
         },
@@ -1071,6 +1094,46 @@ state_dir = "/tmp/ns-test-state"
             assert!(loaded.notifications);
             assert_eq!(loaded.theme, Theme::System);
             assert!(!loaded.file_manager_bookmarks);
+        }
+    }
+
+    #[test]
+    fn api_listen_is_kept_only_when_set() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("cfg.toml");
+        fs::write(
+            &path,
+            "[cli]\nbackend = \"api\"\n[options]\nstate_dir = \"/tmp/ns-test-state\"\n",
+        )
+        .unwrap();
+        let mut cfg = load(path.to_str()).unwrap();
+        assert!(cfg.api_listen.is_none());
+        assert!(cfg.api_token_file.is_none());
+        save(&cfg, &path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("api_listen"), "{text}");
+        assert!(!text.contains("api_token_file"), "{text}");
+
+        cfg.api_listen = Some("127.0.0.1:8091".into());
+        cfg.api_token_file = Some("/tmp/ns-test-state/api.token".into());
+        save(&cfg, &path).unwrap();
+        let loaded = load(path.to_str()).unwrap();
+        assert_eq!(loaded.api_listen.as_deref(), Some("127.0.0.1:8091"));
+        assert_eq!(
+            loaded.api_token_file.as_deref(),
+            Some(std::path::Path::new("/tmp/ns-test-state/api.token"))
+        );
+
+        for example in [
+            crate::EXAMPLE_CONFIG,
+            include_str!("../neutronsync.example.toml"),
+        ] {
+            assert!(example.contains("# api_listen = \"127.0.0.1:8090\""));
+            assert!(example.contains("# api_token_file ="));
+            fs::write(&path, example).unwrap();
+            let loaded = load(path.to_str()).unwrap();
+            assert!(loaded.api_listen.is_none());
+            assert!(loaded.api_token_file.is_none());
         }
     }
 }

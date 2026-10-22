@@ -252,7 +252,7 @@ NEUTRONSYNC_API_TOKEN=$(head -c 24 /dev/urandom | base64) \
   neutronsync serve --listen 0.0.0.0:8090 --local-root /data
 ```
 
-Listening on anything but loopback needs an API token of at least 32 characters. Only one NeutronSync may sync a state directory at a time, so stop the desktop tray first. Where there is no keyring, set `session_store = "file"` in `[cli]` and give a key; the Proton session is then kept encrypted in the state directory. [`docs/HTTP_API.md`](docs/HTTP_API.md) lists every endpoint.
+Listening on anything but loopback needs an API token of at least 32 characters. Only one NeutronSync may sync a state directory at a time, so stop the desktop tray first. Where there is no keyring, set `session_store = "file"` in `[cli]` and give a key; the Proton session is then kept encrypted in the state directory. [`docs/HTTP_API.md`](docs/HTTP_API.md) lists every endpoint. [`docs/BUILD_A_CLIENT.md`](docs/BUILD_A_CLIENT.md) is how to write your own front end against that API. Typed clients live in [`clients/python`](clients/python) and [`clients/typescript`](clients/typescript); install them from this repository.
 
 ## Run on Unraid or Docker
 

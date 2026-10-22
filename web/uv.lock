@@ -392,12 +392,33 @@ wheels = [
 ]
 
 [[package]]
+name = "neutronsync-client"
+version = "0.8.2"
+source = { editable = "../clients/python" }
+dependencies = [
+    { name = "httpx" },
+    { name = "httpx-sse" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.28.1,<0.29" },
+    { name = "httpx-sse", specifier = ">=0.4.3,<0.5" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=8.4.0" },
+    { name = "pytest-asyncio", specifier = ">=1.2.0" },
+    { name = "ruff", specifier = ">=0.14.0" },
+]
+
+[[package]]
 name = "neutronsync-web"
 version = "0.8.2"
 source = { editable = "." }
 dependencies = [
-    { name = "httpx" },
-    { name = "httpx-sse" },
+    { name = "neutronsync-client" },
     { name = "nicegui" },
 ]
 
@@ -411,8 +432,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "httpx", specifier = "==0.28.1" },
-    { name = "httpx-sse", specifier = "==0.4.3" },
+    { name = "neutronsync-client", editable = "../clients/python" },
     { name = "nicegui", specifier = "==3.18.0" },
 ]
 

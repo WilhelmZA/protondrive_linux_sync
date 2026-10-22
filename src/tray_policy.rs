@@ -163,9 +163,10 @@ pub struct WindowLiveness {
 /// Failed `--tray` starts from the window before it stops trying.
 pub const MAX_WINDOW_SPAWN_ATTEMPTS: u32 = 3;
 
-/// `status_stale` is true when `status.json` is older than 10 seconds, or missing
-/// for that long while the lock is still live. `spawn_due` is true when the window
-/// has not started background sync in the last 10 seconds.
+/// `status_stale` is true when the engine is not answering: the unix socket's
+/// `/health` has lapsed and the event stream is missing or has been quiet for
+/// more than 10 seconds. See [`engine_not_responding`]. `spawn_due` is true when
+/// the window has not started background sync in the last 10 seconds.
 ///
 /// A spawn counts as failed only once that 10 second wait has passed and the lock
 /// is still dead. The third failure switches the banner to [`DaemonBanner::CouldNotStart`].
@@ -214,7 +215,24 @@ pub fn window_liveness(
     }
 }
 
-/// True when the window should sample the lock and `status.json` again.
+/// The engine is not publishing when `/health` has not succeeded within the
+/// last 10 seconds and the event stream has not delivered a frame (or a
+/// keepalive) in that same stretch.
+///
+/// A successful health check is enough on its own. The server keepalive is
+/// 15 seconds, so a quiet stream is not a stall while health still answers.
+/// A stream that delivered something in the last 10 seconds also counts, so
+/// one missed health probe does not flash the banner.
+///
+/// `events_quiet_secs` is `None` when the stream has never connected.
+pub fn engine_not_responding(health_ok: bool, events_quiet_secs: Option<f64>) -> bool {
+    if health_ok {
+        return false;
+    }
+    events_quiet_secs.is_none_or(|age| age > 10.0)
+}
+
+/// True when the window should sample the lock and the engine socket again.
 /// `last_check_secs < 0` forces the first sample.
 pub fn check_due(now_secs: f64, last_check_secs: f64, interval_secs: f64) -> bool {
     last_check_secs < 0.0 || now_secs - last_check_secs >= interval_secs
@@ -453,6 +471,27 @@ mod tests {
         assert_eq!(failed.banner, Some(DaemonBanner::CouldNotStart));
         assert!(!failed.spawn);
         assert_eq!(failed.attempts, 3);
+    }
+
+    #[test]
+    fn socket_down_while_the_lock_is_live_is_not_responding() {
+        assert!(engine_not_responding(false, None));
+        assert!(engine_not_responding(false, Some(11.0)));
+        assert!(!engine_not_responding(false, Some(3.0)));
+        let down = window_liveness(true, true, 0, false);
+        assert_eq!(down.banner, Some(DaemonBanner::NotResponding));
+        assert!(!down.spawn);
+        assert_eq!(down.attempts, 0);
+    }
+
+    #[test]
+    fn socket_up_shows_no_banner() {
+        assert!(!engine_not_responding(true, None));
+        assert!(!engine_not_responding(true, Some(30.0)));
+        let up = window_liveness(true, engine_not_responding(true, Some(1.0)), 2, true);
+        assert_eq!(up.banner, None);
+        assert!(!up.spawn);
+        assert_eq!(up.attempts, 0);
     }
 
     #[test]

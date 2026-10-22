@@ -1,0 +1,45 @@
+/** TypeScript client for the NeutronSync HTTP API. */
+
+export { ApiError, Client, createClient } from "./client.ts";
+export type { ClientOptions, EventResponse } from "./client.ts";
+export { followEvents } from "./events.ts";
+export type { FollowEventsOptions } from "./events.ts";
+export type {
+  $defs,
+  Accepted,
+  AccountState,
+  ActivityItem,
+  ActivityKind,
+  ActivityOp,
+  ApiErrorBody,
+  ApiErrorDetail,
+  ApiVersion,
+  AppState,
+  AuthStep,
+  AutoSyncBody,
+  AutoSyncReply,
+  CodeBody,
+  components,
+  ConfirmBody,
+  ConflictOutcome,
+  ConflictRecord,
+  Envelope,
+  Health,
+  HeldDeletes,
+  LocalEntry,
+  LoginBody,
+  LogLines,
+  operations,
+  PairIn,
+  PairOut,
+  PairRemoved,
+  PairState,
+  PasswordBody,
+  paths,
+  Phase,
+  Progress,
+  RemoteEntry,
+  Settings,
+  SyncBody,
+  webhooks,
+} from "./openapi.ts";

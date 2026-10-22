@@ -4,12 +4,14 @@
 
 A single Cargo crate: a **library** (the reusable core) plus two binaries, plus the Bun sidecar.
 
-- `src/lib.rs` — core: `config`, `models`, `backend` (builds the `Remote`), `remote` (the `Remote` trait), `driveapi` (API sidecar client), `changefeed`, `watcher_feed`, `engine` (three-way merge), `state`, `trash`, `datefmt`, `logger`, `events`, `service` (`Controller` for frontends), `watcher`.
+- `src/lib.rs` — core: `config`, `models`, `backend` (builds the `Remote`), `remote` (the `Remote` trait), `driveapi` (API sidecar client), `changefeed`, `watcher_feed`, `engine` (three-way merge), `state`, `trash`, `datefmt`, `logger`, `events`, `service` (`Controller` for the tray and `serve`), `server` (`/api/v1`), `watcher`.
 - `src/main.rs` — the `neutronsync` CLI.
-- `src/bin/gui.rs` — the `neutronsync-gui` GUI (behind the `gui` feature).
+- `src/bin/gui.rs` — the `neutronsync-gui` GUI (behind the `gui` feature). The window is an HTTP client of the engine; see `docs/GUI_API.md`.
 - `sidecar/` — `neutronsync-drive`, the Proton Drive SDK helper (Bun).
+- `clients/` — Python and TypeScript clients of `/api/v1`.
+- `web/` — the browser interface, also an API client.
 
-The GUI is intentionally thin over `service::Controller` (see `docs/GUI_API.md`); the core has no UI or CLI assumptions.
+The core has no UI or CLI assumptions. `Controller` is the in-process engine used by the tray and `neutronsync serve`; other front ends use the HTTP API.
 
 ## Build & test
 
@@ -21,6 +23,8 @@ sidecar/build.sh                  # -> sidecar/dist/neutronsync-drive
 cargo build --features gui --bin neutronsync-gui
 cargo run   --features gui --bin neutronsync-gui
 ```
+
+The `gui` feature includes `serve`, so `neutronsync-gui` hosts the same `/api/v1` server as `neutronsync serve`.
 
 CI blocks a merge on any of these, so run them before pushing:
 

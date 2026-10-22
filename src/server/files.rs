@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use super::error::ApiError;
 
-#[derive(Serialize, Debug, PartialEq, Eq)]
+#[derive(Serialize, Debug, PartialEq, Eq, utoipa::ToSchema)]
 pub struct LocalEntry {
     pub name: String,
     pub path: String,

@@ -4,7 +4,14 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+- The tray and `neutronsync serve` host the same `/api/v1` on `$XDG_RUNTIME_DIR/neutronsync/api.sock` (mode 0600). The tray can also listen on TCP with `[cli] api_listen`.
+- OpenAPI 3.1 at `docs/openapi.json` and `GET /api/v1/openapi.json`, checked in CI so a drift or a v1 break is a failed build.
+- Python and TypeScript clients at `clients/python` (`neutronsync-client`) and `clients/typescript` (`@neutronsync/client`). The web interface uses the Python package. How to build another front end: `docs/BUILD_A_CLIENT.md`.
+
 ### Changed
+- The desktop window talks to the engine over the unix socket API. Theme, tray, notifications and the other desktop preferences travel with `PUT /settings`, so a later save does not wipe them.
+- For this release, a tray that only publishes `status.json` still shows in the window when the socket is down and that file is fresh.
 - The Unraid template moved to its own repository, [WilhelmZA/unraid-templates](https://github.com/WilhelmZA/unraid-templates), for Community Applications. It and the compose example use `:latest` now that a release with the image is stable.
 
 ## [0.8.2] - 2026-10-21

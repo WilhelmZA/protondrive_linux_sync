@@ -1,0 +1,2150 @@
+{
+  "components": {
+    "schemas": {
+      "Accepted": {
+        "properties": {
+          "accepted": {
+            "description": "Always true when the status is 202.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "accepted"
+        ],
+        "type": "object"
+      },
+      "AccountState": {
+        "properties": {
+          "account": {
+            "description": "Proton account name from the API probe. Empty on the CLI backend.",
+            "type": "string"
+          },
+          "backend_ready": {
+            "description": "On the API backend: the sidecar answered. On the CLI backend: a binary was found on PATH.",
+            "type": "boolean"
+          },
+          "checked": {
+            "type": "boolean"
+          },
+          "checking": {
+            "description": "A login/version check is in flight (drives the Refresh spinner).",
+            "type": "boolean"
+          },
+          "keyring_locked": {
+            "description": "The system keyring is locked (or couldn't be read). The Proton session\nmay still be in it. This is not a sign-out: don't show the login form.",
+            "type": "boolean"
+          },
+          "signed_in": {
+            "type": "boolean"
+          },
+          "version": {
+            "description": "Sidecar path or identity on the API backend; binary version/path on the CLI backend.\nOn probe failure this holds the error text shown on the sign-in page.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "checked",
+          "backend_ready",
+          "signed_in",
+          "version",
+          "checking"
+        ],
+        "type": "object"
+      },
+      "ActivityItem": {
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/ActivityKind"
+          },
+          "op": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ActivityOp",
+                "description": "Present for per-file operations; None for info/error/summary lines."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ts",
+          "kind",
+          "text"
+        ],
+        "type": "object"
+      },
+      "ActivityKind": {
+        "enum": [
+          "Info",
+          "Sync",
+          "Error"
+        ],
+        "type": "string"
+      },
+      "ActivityOp": {
+        "description": "A per-file operation, for rendering a rich activity table.",
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "error": {
+            "description": "Why a failed op failed. `None` for successes, and for failures recorded\nby a build that predates this field.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "pair": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action",
+          "path",
+          "pair",
+          "ok"
+        ],
+        "type": "object"
+      },
+      "ApiErrorBody": {
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ApiErrorDetail"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "type": "object"
+      },
+      "ApiErrorDetail": {
+        "properties": {
+          "code": {
+            "description": "`bad_request`, `unauthorized`, `sign_in_failed`, `forbidden`, `not_found`, `busy`, `conflict`, `signed_out`, `too_large`, `invalid_config`, `backend`, or `internal`.",
+            "type": "string"
+          },
+          "message": {
+            "description": "A sentence. Passwords and codes are never included.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "ApiVersion": {
+        "properties": {
+          "api_version": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "build": {
+            "description": "Commit the binary was built from, the same string `neutronsync --version` shows.",
+            "type": "string"
+          },
+          "version": {
+            "description": "Crate version (`neutronsync --version` without the build).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "api_version",
+          "version",
+          "build"
+        ],
+        "type": "object"
+      },
+      "AppState": {
+        "properties": {
+          "account": {
+            "$ref": "#/components/schemas/AccountState"
+          },
+          "active": {
+            "description": "Operations currently in flight (rendered as live \"uploading…\" rows).",
+            "items": {
+              "$ref": "#/components/schemas/ActivityOp"
+            },
+            "type": "array"
+          },
+          "activity": {
+            "description": "The feed is a deque in the engine. On the wire, and in the OpenAPI\nschema, it is a JSON array.",
+            "items": {
+              "$ref": "#/components/schemas/ActivityItem"
+            },
+            "type": "array"
+          },
+          "busy": {
+            "type": "boolean"
+          },
+          "pairs": {
+            "items": {
+              "$ref": "#/components/schemas/PairState"
+            },
+            "type": "array"
+          },
+          "signed_out": {
+            "description": "The watch daemon has detected the proton-drive session is signed out.\nSurfaced as a distinct \"sign in to resume\" banner instead of error spam.",
+            "type": "boolean"
+          },
+          "watching": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "pairs",
+          "account",
+          "activity",
+          "active",
+          "busy",
+          "watching"
+        ],
+        "type": "object"
+      },
+      "AuthStep": {
+        "description": "The next sign-in step. `url`, `token`, and `methods` are present only when `step` is `need_human_verification`.",
+        "properties": {
+          "methods": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "step": {
+            "description": "`done`, `need_2fa`, `need_mailbox_password`, or `need_human_verification`.",
+            "type": "string"
+          },
+          "token": {
+            "description": "Proton human-verification token, not the API bearer token.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "step"
+        ],
+        "type": "object"
+      },
+      "AutoSyncBody": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "type": "object"
+      },
+      "AutoSyncReply": {
+        "properties": {
+          "auto_sync": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "auto_sync"
+        ],
+        "type": "object"
+      },
+      "CodeBody": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "type": "object"
+      },
+      "ConfirmBody": {
+        "additionalProperties": false,
+        "properties": {
+          "confirm": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "ConflictOutcome": {
+        "description": "How the engine settled a file that changed on both sides. Serialises as\n`kept_both`, `kept_local`, `kept_remote` or `skipped` (the HTTP API).",
+        "enum": [
+          "kept_both",
+          "kept_local",
+          "kept_remote",
+          "skipped"
+        ],
+        "type": "string"
+      },
+      "ConflictRecord": {
+        "description": "A settled conflict, as stored in `conflicts`.",
+        "properties": {
+          "copy": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dismissed": {
+            "type": "boolean"
+          },
+          "first_ts": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "last_ts": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/ConflictOutcome"
+          },
+          "pair": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "seen": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "pair",
+          "path",
+          "outcome",
+          "first_ts",
+          "last_ts",
+          "seen",
+          "dismissed"
+        ],
+        "type": "object"
+      },
+      "Envelope": {
+        "description": "Everything a client needs in one object. `rev` grows only when the rest\nchanged, so a client can tell a repeat from an update.",
+        "properties": {
+          "auto_sync": {
+            "type": "boolean"
+          },
+          "conflicts": {
+            "items": {
+              "$ref": "#/components/schemas/ConflictRecord"
+            },
+            "type": "array"
+          },
+          "held": {
+            "items": {
+              "$ref": "#/components/schemas/HeldDeletes"
+            },
+            "type": "array"
+          },
+          "rev": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/AppState"
+          }
+        },
+        "required": [
+          "rev",
+          "state",
+          "held",
+          "conflicts",
+          "auto_sync"
+        ],
+        "type": "object"
+      },
+      "Health": {
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "type": "object"
+      },
+      "HeldDeletes": {
+        "description": "A pair whose deletions were held back, as stored in `held_deletes`.",
+        "properties": {
+          "local": {
+            "description": "Files that would have left this computer.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pair": {
+            "type": "string"
+          },
+          "remote": {
+            "description": "Files that would have left Proton Drive.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "since": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "tracked": {
+            "description": "Files the pair tracked when the deletions were first held.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "updated": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pair",
+          "local",
+          "remote",
+          "tracked",
+          "since",
+          "updated"
+        ],
+        "type": "object"
+      },
+      "LocalEntry": {
+        "properties": {
+          "hidden": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "path",
+          "hidden"
+        ],
+        "type": "object"
+      },
+      "LogLines": {
+        "properties": {
+          "lines": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "lines"
+        ],
+        "type": "object"
+      },
+      "LoginBody": {
+        "additionalProperties": false,
+        "properties": {
+          "hv_token": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hv_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "password": {
+            "type": "string"
+          },
+          "username": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "username",
+          "password"
+        ],
+        "type": "object"
+      },
+      "PairIn": {
+        "additionalProperties": false,
+        "properties": {
+          "auto": {
+            "type": "boolean"
+          },
+          "exclude": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "local": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "remote": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "local",
+          "remote"
+        ],
+        "type": "object"
+      },
+      "PairOut": {
+        "properties": {
+          "auto": {
+            "type": "boolean"
+          },
+          "exclude": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "local": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "remote": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "local",
+          "remote",
+          "auto",
+          "exclude"
+        ],
+        "type": "object"
+      },
+      "PairRemoved": {
+        "properties": {
+          "files_deleted": {
+            "description": "Always false. Removing a folder does not delete a file on either side.",
+            "type": "boolean"
+          },
+          "message": {
+            "type": "string"
+          },
+          "removed": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "removed",
+          "files_deleted",
+          "message"
+        ],
+        "type": "object"
+      },
+      "PairState": {
+        "properties": {
+          "current_op": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_synced": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "local": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "phase": {
+            "$ref": "#/components/schemas/Phase"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/Progress"
+          },
+          "remote": {
+            "type": "string"
+          },
+          "scanned_folders": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tracked": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "local",
+          "remote",
+          "phase",
+          "progress",
+          "scanned_folders",
+          "tracked"
+        ],
+        "type": "object"
+      },
+      "PasswordBody": {
+        "additionalProperties": false,
+        "properties": {
+          "password": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "password"
+        ],
+        "type": "object"
+      },
+      "Phase": {
+        "enum": [
+          "Idle",
+          "Scanning",
+          "Syncing",
+          "Synced",
+          "Error"
+        ],
+        "type": "string"
+      },
+      "Progress": {
+        "properties": {
+          "done": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "done",
+          "total"
+        ],
+        "type": "object"
+      },
+      "RemoteEntry": {
+        "properties": {
+          "kind": {
+            "description": "`folder` or `file`.",
+            "type": "string"
+          },
+          "mtime": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "Settings": {
+        "additionalProperties": false,
+        "description": "The settings a server can use, in their TOML spelling. Every key is\noptional on `PUT`; an unknown key is refused.",
+        "properties": {
+          "auto_sync": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "check_on_launch": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "compare": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "conflict": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "debounce": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "download_limit_kbps": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "download_threads": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "file_manager_bookmarks": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "full_walk_interval": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "local_delete": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_delete_files": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_delete_percent": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "notifications": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "propagate_deletes": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "remote_root": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "run_in_tray": {
+            "description": "Desktop window preferences. Optional on `PUT`, returned on `GET`, and\nstored in `[options]` so a later settings write does not drop them.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "scan_interval": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "scan_threads": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "theme": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "update_channel": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "upload_limit_kbps": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "x11_compat": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "SyncBody": {
+        "additionalProperties": false,
+        "properties": {
+          "dry_run": {
+            "type": "boolean"
+          },
+          "pairs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "description": "API token on TCP, as `Authorization: Bearer <token>`. Required on TCP only when a token is configured. The unix socket does not use a bearer token. `GET /api/v1/health` never requires one.",
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "The `/api/v1` contract served by `neutronsync serve` and the desktop tray. No field or endpoint is removed, and none changes its meaning. New optional response fields and new endpoints may be added; clients ignore fields they do not know. Request bodies refuse unknown fields. Bodies are JSON, at most 64 KiB. The prose contract is `docs/HTTP_API.md`.",
+    "license": {
+      "identifier": "MIT",
+      "name": "MIT"
+    },
+    "title": "NeutronSync HTTP API",
+    "version": "0.8.2"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/account": {
+      "get": {
+        "operationId": "account",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountState"
+                }
+              }
+            },
+            "description": "Account state, re-checked when the last check is more than 30 seconds old."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/account/2fa": {
+      "post": {
+        "operationId": "twoFactor",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CodeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthStep"
+                }
+              }
+            },
+            "description": "The next sign-in step."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Proton refused the code (`sign_in_failed`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/account/login": {
+      "post": {
+        "operationId": "login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthStep"
+                }
+              }
+            },
+            "description": "The next sign-in step."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Proton refused the step (`sign_in_failed`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/account/logout": {
+      "post": {
+        "operationId": "logout",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthStep"
+                }
+              }
+            },
+            "description": "Signed out. `step` is `done`."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/account/mailbox-password": {
+      "post": {
+        "operationId": "mailboxPassword",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasswordBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthStep"
+                }
+              }
+            },
+            "description": "The next sign-in step."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Proton refused the password (`sign_in_failed`)."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/auto-sync": {
+      "post": {
+        "operationId": "autoSync",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AutoSyncBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutoSyncReply"
+                }
+              }
+            },
+            "description": "Auto sync was saved and applied."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "The config would not load. Nothing was changed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/cancel": {
+      "post": {
+        "operationId": "cancel",
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Accepted"
+                }
+              }
+            },
+            "description": "Stop was requested. No body is required."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/conflicts": {
+      "get": {
+        "operationId": "conflicts",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ConflictRecord"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Settled conflicts not yet dismissed, newest first."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/conflicts/dismiss-all": {
+      "post": {
+        "operationId": "conflictsDismissAll",
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Accepted"
+                }
+              }
+            },
+            "description": "Every conflict was dismissed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/conflicts/{id}/dismiss": {
+      "post": {
+        "operationId": "conflictDismiss",
+        "parameters": [
+          {
+            "description": "Conflict id. A non-integer is 404.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Accepted"
+                }
+              }
+            },
+            "description": "The conflict was dismissed."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "No such conflict."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/events": {
+      "get": {
+        "operationId": "events",
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "Server-sent events (`text/event-stream`). Each event is named `state`. The `data` line is an Envelope: `rev`, `state`, `held`, `conflicts`, `auto_sync` (the newest 100 activity items). With nothing to report, the server sends an SSE comment `: keepalive` every 15 seconds. The stream ends when the server shuts down."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        },
+        "x-sse-comments": [
+          ": keepalive"
+        ],
+        "x-sse-events": [
+          {
+            "data": {
+              "$ref": "#/components/schemas/Envelope"
+            },
+            "name": "state"
+          }
+        ]
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            },
+            "description": "The process is up. No token, origin, or Host check."
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/api/v1/held": {
+      "get": {
+        "operationId": "held",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/HeldDeletes"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Pairs whose deletions are held back."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/held/{pair}/delete": {
+      "post": {
+        "operationId": "heldDelete",
+        "parameters": [
+          {
+            "description": "Synced folder name.",
+            "in": "path",
+            "name": "pair",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfirmBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Accepted"
+                }
+              }
+            },
+            "description": "The held deletions will go through on the next run of that folder."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "`confirm` was not true. Nothing was deleted."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Unknown folder, or nothing is held for it."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "A sync is already running."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/held/{pair}/restore": {
+      "post": {
+        "operationId": "heldRestore",
+        "parameters": [
+          {
+            "description": "Synced folder name.",
+            "in": "path",
+            "name": "pair",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Accepted"
+                }
+              }
+            },
+            "description": "A merge of that folder was started."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Unknown folder, or nothing is held for it."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "A sync is already running."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/local/list": {
+      "get": {
+        "operationId": "localList",
+        "parameters": [
+          {
+            "description": "Folder on this machine. Without it, the folders the server may browse.",
+            "in": "query",
+            "name": "path",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/LocalEntry"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Child folders only, sorted by name."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "The path is outside the folders this server may browse."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/logs": {
+      "get": {
+        "operationId": "logs",
+        "parameters": [
+          {
+            "description": "Lines from the end of `sync.log`. Default 200, at most 2000.",
+            "in": "query",
+            "name": "lines",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogLines"
+                }
+              }
+            },
+            "description": "The last lines of the sync log."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/openapi.json": {
+      "get": {
+        "operationId": "openapi",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "This OpenAPI document. Same authentication as `GET /api/v1/state`."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/pairs": {
+      "get": {
+        "operationId": "pairsGet",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/PairOut"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Synced folders, in config order."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      },
+      "post": {
+        "operationId": "pairsAdd",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PairIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/PairOut"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The folder list, including the new folder."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "A folder with that name already exists."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "The path or the name is not a valid config."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/pairs/{name}": {
+      "delete": {
+        "operationId": "pairsRemove",
+        "parameters": [
+          {
+            "description": "Folder name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PairRemoved"
+                }
+              }
+            },
+            "description": "The folder is no longer synced. No file was deleted."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "No folder with that name."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      },
+      "put": {
+        "operationId": "pairsReplace",
+        "parameters": [
+          {
+            "description": "Current folder name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PairIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/PairOut"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The folder list after the replacement."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "No folder with that name."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "The new name is already taken."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "The path or the name is not a valid config."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/remote/list": {
+      "get": {
+        "operationId": "remoteList",
+        "parameters": [
+          {
+            "description": "Proton Drive folder. Defaults to `remote_root`. Must start with `/`.",
+            "in": "query",
+            "name": "path",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/RemoteEntry"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Folders first, then files, each sorted by name."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Signed out of Proton."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/reset": {
+      "post": {
+        "operationId": "reset",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfirmBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Accepted"
+                }
+              }
+            },
+            "description": "Stored sync metadata was wiped. No file was deleted."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "`confirm` was not true. Nothing was changed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/settings": {
+      "get": {
+        "operationId": "settingsGet",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Settings"
+                }
+              }
+            },
+            "description": "The settings a server can use. A later version may add optional fields."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      },
+      "put": {
+        "operationId": "settingsPut",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Settings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Settings"
+                }
+              }
+            },
+            "description": "The full settings object after the change."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Unknown key or a value of the wrong type."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "The config would not load. Nothing was changed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/state": {
+      "get": {
+        "operationId": "state",
+        "parameters": [
+          {
+            "description": "Newest activity items to keep. Default 100, at most 500.",
+            "in": "query",
+            "name": "activity",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "The state envelope. `rev` matches `GET /api/v1/events` for the same content."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/sync": {
+      "post": {
+        "operationId": "sync",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SyncBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Accepted"
+                }
+              }
+            },
+            "description": "The run was started."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Unknown folder name, or the body was refused."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "`busy` (a sync is running), `conflict` (no folder yet), or `signed_out`."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/version": {
+      "get": {
+        "operationId": "version",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiVersion"
+                }
+              }
+            },
+            "description": "API version, crate version, and build commit."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    }
+  },
+  "security": [
+    {},
+    {
+      "bearerAuth": []
+    }
+  ],
+  "servers": [
+    {
+      "description": "Default loopback TCP listener. The desktop tray serves the same paths on its unix socket.",
+      "url": "http://127.0.0.1:8090"
+    }
+  ]
+}

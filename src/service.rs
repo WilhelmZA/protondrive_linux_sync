@@ -27,6 +27,7 @@ const ACTIVITY_CAP: usize = 500;
 const SETTLED_CAP: usize = 1000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub enum Phase {
     Idle,
     Scanning,
@@ -36,6 +37,7 @@ pub enum Phase {
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub struct Progress {
     pub done: usize,
     pub total: usize,
@@ -53,6 +55,7 @@ impl Progress {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub struct PairState {
     pub name: String,
     pub local: String,
@@ -84,6 +87,7 @@ impl PairState {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub struct AccountState {
     pub checked: bool,
     /// On the API backend: the sidecar answered. On the CLI backend: a binary was found on PATH.
@@ -104,6 +108,7 @@ pub struct AccountState {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub enum ActivityKind {
     Info,
     Sync,
@@ -112,6 +117,7 @@ pub enum ActivityKind {
 
 /// A per-file operation, for rendering a rich activity table.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub struct ActivityOp {
     pub action: String, // "upload" | "download" | "delete" | ...
     pub path: String,
@@ -124,6 +130,7 @@ pub struct ActivityOp {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub struct ActivityItem {
     pub ts: i64,
     pub kind: ActivityKind,
@@ -133,9 +140,13 @@ pub struct ActivityItem {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub struct AppState {
     pub pairs: Vec<PairState>,
     pub account: AccountState,
+    /// The feed is a deque in the engine. On the wire, and in the OpenAPI
+    /// schema, it is a JSON array.
+    #[cfg_attr(feature = "serve", schema(value_type = Vec<ActivityItem>))]
     pub activity: VecDeque<ActivityItem>,
     /// Operations currently in flight (rendered as live "uploading…" rows).
     pub active: Vec<ActivityOp>,
@@ -1137,6 +1148,8 @@ mod tests {
             file_manager_bookmarks: false,
             session_store: Default::default(),
             session_key_file: None,
+            api_listen: None,
+            api_token_file: None,
             state_dir: dir.path().to_path_buf(),
             pairs: vec![],
             source_path: None,
@@ -1187,6 +1200,8 @@ mod tests {
             file_manager_bookmarks: false,
             session_store: Default::default(),
             session_key_file: None,
+            api_listen: None,
+            api_token_file: None,
             state_dir: dir.path().to_path_buf(),
             pairs: vec![],
             source_path: None,

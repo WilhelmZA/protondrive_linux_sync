@@ -29,11 +29,13 @@ type ApiResult<T> = Result<T, ApiError>;
 pub fn router(ctx: Arc<Ctx>) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/openapi.json", get(openapi_spec))
         .route("/api/v1/version", get(version))
         .route("/api/v1/state", get(state))
         .route("/api/v1/events", get(events))
         .route("/api/v1/sync", post(sync))
         .route("/api/v1/cancel", post(cancel))
+        .route("/api/v1/reset", post(reset))
         .route("/api/v1/auto-sync", post(auto_sync))
         .route("/api/v1/held", get(held))
         .route("/api/v1/held/{pair}/restore", post(held_restore))
@@ -194,6 +196,17 @@ async fn health() -> Json<Value> {
     Json(json!({"ok": true}))
 }
 
+/// The OpenAPI document. Same gate as every route except health: the unix
+/// socket does not ask for a token, and TCP uses the bearer token when one
+/// is set.
+async fn openapi_spec() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        HttpBody::from(super::openapi::json_pretty()),
+    )
+}
+
 async fn version() -> Json<Value> {
     Json(json!({
         "api_version": API_VERSION,
@@ -231,9 +244,9 @@ async fn events(State(ctx): Ctl) -> Sse<impl Stream<Item = Result<Event, Infalli
 
 // ---- sync ------------------------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct SyncBody {
+pub(crate) struct SyncBody {
     #[serde(default)]
     pairs: Vec<String>,
     #[serde(default)]
@@ -280,9 +293,22 @@ async fn cancel(State(ctx): Ctl) -> impl IntoResponse {
     accepted()
 }
 
-#[derive(Deserialize)]
+async fn reset(State(ctx): Ctl, Body(body): Body<ConfirmBody>) -> ApiResult<impl IntoResponse> {
+    if !body.confirm {
+        return Err(ApiError::bad_request(
+            "Resetting stored sync data needs {\"confirm\":true}. Nothing was changed.",
+        ));
+    }
+    // Wipes baselines and history. The config's folder list, and every file
+    // on disk, stay as they are; the caller removes folders if it wants to.
+    let ctrl = ctx.ctrl.clone();
+    blocking(move || ctrl.reset_data()).await?;
+    Ok(accepted())
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct AutoSyncBody {
+pub(crate) struct AutoSyncBody {
     enabled: bool,
 }
 
@@ -333,9 +359,9 @@ async fn held_restore(State(ctx): Ctl, Path(pair): Path<String>) -> ApiResult<im
     Ok(accepted())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct ConfirmBody {
+pub(crate) struct ConfirmBody {
     #[serde(default)]
     confirm: bool,
 }
@@ -466,9 +492,9 @@ async fn edit_config(
 
 /// The settings a server can use, in their TOML spelling. Every key is
 /// optional on `PUT`; an unknown key is refused.
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct Settings {
+pub(crate) struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
     propagate_deletes: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -499,6 +525,22 @@ struct Settings {
     auto_sync: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     remote_root: Option<String>,
+    /// Desktop window preferences. Optional on `PUT`, returned on `GET`, and
+    /// stored in `[options]` so a later settings write does not drop them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_in_tray: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x11_compat: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notifications: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    theme: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_manager_bookmarks: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    update_channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    check_on_launch: Option<bool>,
 }
 
 impl Settings {
@@ -519,6 +561,13 @@ impl Settings {
             download_limit_kbps: Some(cfg.download_limit_kbps),
             auto_sync: Some(cfg.auto_sync),
             remote_root: Some(cfg.remote_root.clone()),
+            run_in_tray: Some(cfg.run_in_tray),
+            x11_compat: Some(cfg.x11_compat),
+            notifications: Some(cfg.notifications),
+            theme: Some(config::theme_str(cfg.theme).into()),
+            file_manager_bookmarks: Some(cfg.file_manager_bookmarks),
+            update_channel: Some(config::update_channel_str(cfg.update_channel).into()),
+            check_on_launch: Some(cfg.check_on_launch),
         }
     }
 
@@ -574,8 +623,8 @@ async fn settings_put(State(ctx): Ctl, Body(body): Body<Settings>) -> ApiResult<
 
 // ---- pairs ---------------------------------------------------------------------
 
-#[derive(Serialize)]
-struct PairOut {
+#[derive(Serialize, utoipa::ToSchema)]
+pub(crate) struct PairOut {
     name: String,
     local: String,
     remote: String,
@@ -596,9 +645,9 @@ fn pairs_of(cfg: &Config) -> Vec<PairOut> {
         .collect()
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct PairIn {
+pub(crate) struct PairIn {
     name: String,
     local: String,
     remote: String,
@@ -851,9 +900,9 @@ async fn auth_call(ctx: Arc<Ctx>, method: &'static str, params: Value) -> ApiRes
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct LoginBody {
+pub(crate) struct LoginBody {
     username: String,
     password: String,
     hv_token: Option<String>,
@@ -869,9 +918,9 @@ async fn login(State(ctx): Ctl, PrivateBody(b): PrivateBody<LoginBody>) -> ApiRe
     auth_call(ctx, "auth.login", params).await
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct CodeBody {
+pub(crate) struct CodeBody {
     code: String,
 }
 
@@ -882,9 +931,9 @@ async fn two_factor(
     auth_call(ctx, "auth.submit_2fa", json!({"code": b.code})).await
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct PasswordBody {
+pub(crate) struct PasswordBody {
     password: String,
 }
 
@@ -911,9 +960,11 @@ struct PathQuery {
     path: Option<String>,
 }
 
-#[derive(Serialize)]
-struct RemoteEntry {
+#[derive(Serialize, utoipa::ToSchema)]
+pub(crate) struct RemoteEntry {
     name: String,
+    /// `folder` or `file`.
+    #[schema(value_type = String)]
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     size: Option<u64>,

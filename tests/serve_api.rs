@@ -9,6 +9,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -566,16 +567,31 @@ fn startup_refuses_public_addresses_and_short_tokens() {
 }
 
 #[test]
+fn openapi_document_is_served() {
+    let lab = Lab::new();
+    let server = lab.serve(&[]);
+    let r = server.get("/api/v1/openapi.json");
+    assert_eq!(r.status, 200, "{}", r.body);
+    let doc = r.json();
+    let version = doc["openapi"].as_str().expect("openapi version");
+    assert!(version.starts_with("3.1"), "{version}");
+    assert!(doc["paths"].get("/api/v1/state").is_some());
+    assert!(doc["paths"].get("/api/v1/events").is_some());
+}
+
+#[test]
 fn every_endpoint_but_health_needs_the_token_and_bodies_are_capped() {
     let lab = Lab::new();
     let token = "t0ken-for-the-serve-api-tests-0123456789";
     let server = lab.serve_env(&[], &[("NEUTRONSYNC_API_TOKEN", token)]);
     let endpoints = [
         ("GET", "/api/v1/version"),
+        ("GET", "/api/v1/openapi.json"),
         ("GET", "/api/v1/state"),
         ("GET", "/api/v1/events"),
         ("POST", "/api/v1/sync"),
         ("POST", "/api/v1/cancel"),
+        ("POST", "/api/v1/reset"),
         ("POST", "/api/v1/auto-sync"),
         ("GET", "/api/v1/held"),
         ("POST", "/api/v1/held/test/restore"),
@@ -631,6 +647,163 @@ fn every_endpoint_but_health_needs_the_token_and_bodies_are_capped() {
     );
     assert!(!err.contains("wrong-token-wrong-token"), "{err}");
     assert_eq!(server.stop().0, 0);
+}
+
+/// HTTP/1.1 on an already-connected stream. `host` is sent as `Host`.
+fn http_exchange(
+    mut stream: impl Read + Write,
+    method: &str,
+    path: &str,
+    host: &str,
+    body: Option<&[u8]>,
+    token: Option<&str>,
+    extra: &str,
+) -> Reply {
+    let body = body.unwrap_or(b"");
+    let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
+    if let Some(token) = token {
+        head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    if !extra.is_empty() {
+        head.push_str(extra);
+        if !extra.ends_with("\r\n") {
+            head.push_str("\r\n");
+        }
+    }
+    if !body.is_empty() || method != "GET" {
+        head.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        ));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).unwrap();
+    stream.write_all(body).unwrap();
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("no header end");
+    let headers = String::from_utf8_lossy(&raw[..split]).to_string();
+    let status = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let mut payload = raw[split + 4..].to_vec();
+    if headers
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        payload = dechunk(&payload);
+    }
+    Reply {
+        status,
+        body: String::from_utf8_lossy(&payload).into_owned(),
+    }
+}
+
+fn unix_exchange(
+    sock: &Path,
+    method: &str,
+    path: &str,
+    host: &str,
+    body: Option<&[u8]>,
+    extra: &str,
+) -> Reply {
+    let stream = UnixStream::connect(sock).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    http_exchange(stream, method, path, host, body, None, extra)
+}
+
+// ---- unix socket, reset, shared owner ---------------------------------------
+
+#[test]
+fn unix_socket_accepts_host_x_without_a_bearer_token() {
+    let lab = Lab::new();
+    let token = "t0ken-for-the-serve-api-tests-0123456789";
+    let server = lab.serve_env(&[], &[("NEUTRONSYNC_API_TOKEN", token)]);
+    let sock = lab.path("runtime").join("neutronsync").join("api.sock");
+
+    let mode = fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "socket mode {mode:o}");
+
+    let tcp = server
+        .try_request("GET", "/api/v1/state", None, None)
+        .unwrap();
+    assert_eq!(tcp.status, 401, "{}", tcp.body);
+
+    let unix = unix_exchange(&sock, "GET", "/api/v1/state", "x", None, "");
+    assert_eq!(unix.status, 200, "{}", unix.body);
+    let env = unix.json();
+    assert!(env.get("rev").is_some(), "{env}");
+    assert!(env.get("state").is_some(), "{env}");
+
+    let page = unix_exchange(
+        &sock,
+        "GET",
+        "/api/v1/state",
+        "x",
+        None,
+        "Origin: http://evil.example\r\n",
+    );
+    assert_eq!(page.status, 403, "{}", page.body);
+    assert_eq!(server.stop().0, 0);
+}
+
+#[test]
+fn reset_requires_confirm_and_does_not_delete_local_files() {
+    let lab = Lab::new();
+    let marker = lab.local_root().join("keep-me.txt");
+    fs::write(&marker, "safe").unwrap();
+    let server = lab.serve(&[]);
+
+    let missing = server.post("/api/v1/reset", json!({}));
+    assert_eq!(missing.status, 400, "{}", missing.body);
+    assert_eq!(missing.code(), "bad_request");
+
+    let no = server.post("/api/v1/reset", json!({"confirm": false}));
+    assert_eq!(no.status, 400, "{}", no.body);
+    assert_eq!(no.code(), "bad_request");
+
+    let yes = server.post("/api/v1/reset", json!({"confirm": true}));
+    assert_eq!(yes.status, 202, "{}", yes.body);
+    assert_eq!(yes.json()["accepted"], true);
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "safe");
+    assert!(
+        lab.config_text().contains("name = \"test\""),
+        "reset does not rewrite the folder list"
+    );
+    assert_eq!(server.stop().0, 0);
+}
+
+#[test]
+fn engine_owner_alive_is_the_shared_lock_rule() {
+    let lab = Lab::new();
+    fs::create_dir_all(lab.state_dir()).unwrap();
+    assert!(!neutronsync::server::serve_lock_alive(&lab.state_dir()));
+    assert!(!neutronsync::server::engine_owner_alive(&lab.state_dir()));
+
+    let mut holder = Command::new("sleep").arg("60").spawn().unwrap();
+    fs::write(lab.state_dir().join("serve.lock"), lock_record(holder.id())).unwrap();
+    // The tray refuses on this, before it takes tray-daemon.lock.
+    assert!(neutronsync::server::serve_lock_alive(&lab.state_dir()));
+    assert!(neutronsync::server::engine_owner_alive(&lab.state_dir()));
+
+    fs::remove_file(lab.state_dir().join("serve.lock")).unwrap();
+    fs::write(
+        lab.state_dir().join("tray-daemon.lock"),
+        lock_record(holder.id()),
+    )
+    .unwrap();
+    assert!(!neutronsync::server::serve_lock_alive(&lab.state_dir()));
+    assert!(neutronsync::server::engine_owner_alive(&lab.state_dir()));
+
+    unsafe { libc::kill(holder.id() as i32, libc::SIGKILL) };
+    let _ = holder.wait();
+    assert!(
+        !neutronsync::server::engine_owner_alive(&lab.state_dir()),
+        "a dead pid does not own the state"
+    );
 }
 
 // ---- AC-4: one owner per state directory, clean stop --------------------------
@@ -1075,10 +1248,13 @@ fn settings_go_through_the_real_parser_and_keep_desktop_keys() {
     let before = server.get("/api/v1/settings").json();
     assert_eq!(before["max_delete_percent"], 30);
     assert_eq!(before["conflict"], "keep-both");
-    assert!(
-        before.get("theme").is_none(),
-        "desktop keys are not exposed"
-    );
+    assert_eq!(before["theme"], "dark");
+    assert_eq!(before["notifications"], false);
+    assert_eq!(before["run_in_tray"], true);
+    assert_eq!(before["file_manager_bookmarks"], true);
+    assert_eq!(before["update_channel"], "prerelease");
+    assert_eq!(before["x11_compat"], false);
+    assert_eq!(before["check_on_launch"], false);
 
     let r = server.put("/api/v1/settings", json!({"max_delete_percent": 40}));
     assert_eq!(r.status, 200, "{}", r.body);
@@ -1114,9 +1290,26 @@ fn settings_go_through_the_real_parser_and_keep_desktop_keys() {
         "keep-both"
     );
 
-    let r = server.put("/api/v1/settings", json!({"theme": "light"}));
+    let r = server.put("/api/v1/settings", json!({"not_a_setting": true}));
     assert_eq!((r.status, r.code().as_str()), (400, "bad_request"));
     assert_eq!(fs::read(lab.path("config.toml")).unwrap(), bytes);
+
+    let r = server.put("/api/v1/settings", json!({"theme": "light"}));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["theme"], "light");
+    assert!(lab.config_text().contains("theme = \"light\""));
+    for key in [
+        "notifications = false",
+        "run_in_tray = true",
+        "file_manager_bookmarks = true",
+        "update_channel = \"prerelease\"",
+    ] {
+        assert!(
+            lab.config_text().contains(key),
+            "{key} lost:\n{}",
+            lab.config_text()
+        );
+    }
     // No temp file is left beside the config.
     let leftovers: Vec<_> = fs::read_dir(lab.dir.path())
         .unwrap()

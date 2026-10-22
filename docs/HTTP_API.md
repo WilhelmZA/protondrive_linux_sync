@@ -6,21 +6,24 @@
 neutronsync serve [--listen ADDR:PORT] [--token-file PATH] [--local-root PATH]...
 ```
 
-- `--listen` defaults to `127.0.0.1:8090`. Any address that is not loopback needs an API token, or the server refuses to start: "Refusing to listen on ADDR without an API token. Set NEUTRONSYNC_API_TOKEN or --token-file." (exit status 2).
-- The token comes from `--token-file` (surrounding whitespace ignored), else `NEUTRONSYNC_API_TOKEN`, else there is none. A token shorter than 32 characters is refused (exit status 2).
-- `--local-root` names a folder the API may browse and put synced folders under; repeat it for several. Without it, browsing is limited to the home directory and a synced folder may be any absolute path.
+- `--listen` defaults to `127.0.0.1:8090`. `serve` always binds that TCP address. When `XDG_RUNTIME_DIR` is set it also binds `$XDG_RUNTIME_DIR/neutronsync/api.sock`: the directory is created (mode `0700`), a stale socket file is replaced, and the socket is mode `0600`. When `XDG_RUNTIME_DIR` is unset, only TCP is bound.
+- The desktop tray (`neutronsync-gui --tray`) hosts this same API on that unix socket, using the controller it already runs. If `XDG_RUNTIME_DIR` is unset it uses `/run/user/<uid>/neutronsync/api.sock` when `/run/user/<uid>` exists; otherwise it logs and keeps syncing without the API. `[cli] api_listen` (`host:port` in the config) adds a TCP listener on the tray only. `neutronsync serve` does not read `api_listen`; it uses `--listen`.
+- Any TCP address that is not loopback needs an API token, or `serve` refuses to start: "Refusing to listen on ADDR without an API token. Set NEUTRONSYNC_API_TOKEN or --token-file." (exit status 2). The tray prints that same sentence and does not bind TCP; the unix socket still starts.
+- For `serve`, the token comes from `--token-file` (surrounding whitespace ignored), else `NEUTRONSYNC_API_TOKEN`, else there is none. The tray has no `--token-file`: it uses `NEUTRONSYNC_API_TOKEN`, else `[cli] api_token_file`. A token shorter than 32 characters is refused (exit status 2 for `serve`; the tray prints the error, skips TCP, and still binds the unix socket).
+- The unix socket does not take a bearer token. Its auth is mode `0600` (owner only). A token, when set, is checked on TCP only. `GET /api/v1/health` stays open on both.
+- `--local-root` names a folder the API may browse and put synced folders under; repeat it for several. Without it, browsing is limited to the home directory and a synced folder may be any absolute path. The tray has no `--local-root`, so its API browses the home directory.
 - The config is found the same way as for every other command: `--config`, then `NEUTRONSYNC_CONFIG`, then `~/.config/neutronsync/neutronsync.toml`, then `./neutronsync.toml`.
-- One NeutronSync owns a state directory. `serve` writes `serve.lock` there and refuses to start (exit status 1) while that lock or the desktop tray's `tray-daemon.lock` names a live process: "Another NeutronSync is already syncing this state (the desktop tray or another serve). Stop it first." Auto sync also takes `watch.lock`, so a `neutronsync watch` on the same state cannot run beside it.
-- On start it loads the config, starts auto sync when `auto_sync = true`, and checks the account. On SIGTERM or SIGINT it stops accepting requests, ends every event stream, stops auto sync, cancels a running sync, waits up to eight seconds for it to stop (so the whole stop stays under ten), removes `serve.lock` and exits 0.
-- Logs go to `state_dir/logs/sync.log`. Standard error gets one line when the server starts, one when it stops, and one the first time each kind of request is refused. Request bodies are never logged.
+- One NeutronSync owns a state directory. `serve` writes `serve.lock` there and refuses to start (exit status 1) while that lock or the desktop tray's `tray-daemon.lock` names a live process: "Another NeutronSync is already syncing this state (the desktop tray or another serve). Stop it first." The tray checks `serve.lock` before it takes `tray-daemon.lock` and prints that same sentence. A live `tray-daemon.lock` still prints "a tray daemon is already running". The two lock files stay separate. Auto sync also takes `watch.lock`, so a `neutronsync watch` on the same state cannot run beside it.
+- On start `serve` loads the config, starts auto sync when `auto_sync = true`, and checks the account. On SIGTERM or SIGINT it stops accepting requests, ends every event stream, stops auto sync, cancels a running sync, waits up to eight seconds for it to stop (so the whole stop stays under ten), removes `serve.lock` and the unix socket, and exits 0. The tray stops its listeners when Quit is chosen (the GTK thread calls shutdown and waits a couple of seconds) and leaves the engine stop to the tray's own quit path.
+- Logs go to `state_dir/logs/sync.log`. Standard error gets one line per listener when the server starts, one when `serve` stops, and one the first time each kind of request is refused. Request bodies are never logged.
 
 ## Conventions
 
-- Every path starts with `/api/v1`. A breaking change will get `/api/v2`; new fields may appear in v1 at any time, so clients must ignore fields they do not know.
+- Every path starts with `/api/v1`. Stability for that version: no field or endpoint is removed, and none changes its meaning. New optional response fields and new endpoints may be added; clients must ignore fields they do not know. Deprecations are announced here and in `CHANGELOG.md` and keep working until the next major API version. A breaking change means `/api/v2` is served alongside `/api/v1` for at least one release. Request bodies still refuse unknown fields with `400`. The machine-readable copy is OpenAPI 3.1, generated from the server: `docs/openapi.json` and `GET /api/v1/openapi.json`.
 - Bodies are JSON, at most 64 KiB (413 above that, chunked or not, on every endpoint). A body that is not empty must be sent as `Content-Type: application/json` (parameters such as `charset` allowed), or the request is refused with 415 before anything runs. An empty body counts as `{}`. Unknown fields in a body are refused with 400.
-- When a token is set, every request except `GET /api/v1/health` needs `Authorization: Bearer <token>`. A missing or wrong token is 401 with no detail. The token is compared in constant time.
-- The API is for server-side clients (curl, a web app's backend), never for scripts in a browser. A request carrying an `Origin` header, or a `Sec-Fetch-Site` header other than `none` or `same-origin`, is refused with 403. Every browser adds these headers to the requests a page makes, so a page the user happens to open cannot drive the server even when it has no token. There are no CORS headers.
-- On a loopback address, the request's `Host` must be `localhost`, a `*.localhost` name or a loopback address (`127.0.0.1`, `[::1]`); any other name is refused with 403. This stops a page from reaching the server through a name of its own that resolves to 127.0.0.1 (DNS rebinding).
+- When a token is set, every TCP request except `GET /api/v1/health` needs `Authorization: Bearer <token>`. A missing or wrong token is 401 with no detail. The token is compared in constant time. The unix socket never asks for a bearer token, even when TCP has one.
+- The API is for server-side clients (curl, a web app's backend), never for scripts in a browser. A request carrying an `Origin` header, or a `Sec-Fetch-Site` header other than `none` or `same-origin`, is refused with 403 on both listeners. Every browser adds these headers to the requests a page makes, so a page the user happens to open cannot drive the server even when it has no token. There are no CORS headers.
+- On a loopback TCP address, the request's `Host` must be `localhost`, a `*.localhost` name or a loopback address (`127.0.0.1`, `[::1]`); any other name is refused with 403. This stops a page from reaching the server through a name of its own that resolves to 127.0.0.1 (DNS rebinding). The unix socket does not apply that Host check, so `curl --unix-socket …/api.sock http://x/api/v1/state` is a normal call. Access there is the socket's mode `0600`.
 - `GET /api/v1/health` is exempt from the token, origin and host checks.
 - Commands that start work return `202 {"accepted":true}`; what happens next shows in the state and the event stream.
 
@@ -152,6 +155,14 @@ No token needed and no state touched, for container health checks. Response `200
 curl $API/health
 ```
 
+### `GET /api/v1/openapi.json`
+
+The OpenAPI 3.1 document for this API, the same JSON as `docs/openapi.json`. Same token rules as `GET /api/v1/state`. Response `200` with `Content-Type: application/json`.
+
+```sh
+curl -H "$AUTH" $API/openapi.json
+```
+
 ### `GET /api/v1/version`
 
 Response `200 {"api_version":1,"version":"0.7.0","build":"<commit>"}`. `build` is the same string `neutronsync --version` shows.
@@ -182,6 +193,20 @@ Stops the running sync before its next operation. No body. Response `202 {"accep
 
 ```sh
 curl -H "$AUTH" -X POST $API/cancel
+```
+
+### `POST /api/v1/reset`
+
+Wipes stored sync metadata (baselines, per-file state, stats and the activity feed) and stops auto sync in this process. It does not delete a file on this computer or on Proton Drive, and it does not change the folder list in the config. Body `{"confirm":true}` is required. Response `202 {"accepted":true}`. Errors: `bad_request` (no confirmation; nothing was changed).
+
+```sh
+curl -H "$AUTH" -H "$JSON" -X POST $API/reset -d '{"confirm":true}'
+```
+
+On the tray's socket the same call needs no token:
+
+```sh
+curl --unix-socket "$XDG_RUNTIME_DIR/neutronsync/api.sock" -H "$JSON" -X POST http://x/api/v1/reset -d '{"confirm":true}'
 ```
 
 ### `POST /api/v1/auto-sync`
@@ -242,7 +267,7 @@ curl -H "$AUTH" -X POST $API/conflicts/dismiss-all
 
 ### `GET /api/v1/settings`
 
-The settings a server can use, with the values and spellings of the config file. Desktop-only settings (tray, X11, theme, notifications, bookmarks, update channel) are not here and are left as they are.
+The settings a server can use, with the values and spellings of the config file. The desktop window's own preferences are included, so a settings write does not drop them: `run_in_tray`, `x11_compat`, `notifications`, `theme` (`system`, `light` or `dark`), `file_manager_bookmarks`, `update_channel` (`stable` or `prerelease`) and `check_on_launch`. Each is optional on `PUT` and always present on `GET`.
 
 ```json
 {
@@ -250,7 +275,10 @@ The settings a server can use, with the values and spellings of the config file.
   "local_delete": "trash", "conflict": "keep-both", "compare": "size+mtime",
   "scan_threads": 0, "download_threads": 0, "full_walk_interval": 86400,
   "scan_interval": 120, "debounce": 2, "upload_limit_kbps": 0,
-  "download_limit_kbps": 0, "auto_sync": false, "remote_root": "/my-files"
+  "download_limit_kbps": 0, "auto_sync": false, "remote_root": "/my-files",
+  "run_in_tray": false, "x11_compat": false, "notifications": true,
+  "theme": "system", "file_manager_bookmarks": false,
+  "update_channel": "stable", "check_on_launch": false
 }
 ```
 
@@ -396,3 +424,7 @@ head -c 32 /dev/urandom | base64 > session.key && chmod 600 session.key
 ```
 
 The environment variables `NEUTRONSYNC_SESSION_STORE=file`, `NEUTRONSYNC_SESSION_FILE` and `NEUTRONSYNC_SESSION_KEY_FILE` work too and take precedence over the config. Without a usable key the sidecar does not start and says "Session file store needs a 32-byte key (NEUTRONSYNC_SESSION_KEY or NEUTRONSYNC_SESSION_KEY_FILE)." A session file that does not decrypt with the key given (a wrong key, a damaged file) stops the sidecar with "The saved session cannot be decrypted: wrong key or damaged file." and the file is left alone, so a mistyped key cannot destroy a good session; only signing out removes it.
+
+## Building a client
+
+[`BUILD_A_CLIENT.md`](BUILD_A_CLIENT.md) is the guide for a front end of your own: how to connect (including the desktop socket), how to read the state envelope and the event stream, and the stability rules for `/api/v1`.

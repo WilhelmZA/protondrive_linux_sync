@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from collections.abc import Callable
@@ -11,8 +10,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-import httpx
-from httpx_sse._decoders import SSEDecoder
+from neutronsync_client import EventSource
 
 from neutronsync_web import SUPPORTED_API_VERSIONS, __version__
 from neutronsync_web.api import ApiClient, ApiError, Envelope, VersionInfo
@@ -76,21 +74,6 @@ class LiveHub:
         self._health_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._clock = time.monotonic
-        # Own HTTP client for the event stream so POSTs on api._client cannot
-        # stall or corrupt the long-lived SSE read (httpx multiplex hazard).
-        self._events_client = self._build_events_client()
-
-    def _build_events_client(self) -> httpx.AsyncClient:
-        kwargs: dict[str, Any] = {
-            "base_url": str(self.api._client.base_url),
-            "headers": dict(self.api._client.headers),
-            "timeout": httpx.Timeout(None, connect=10.0),
-        }
-        # Share MockTransport with the API client in unit tests only.
-        transport = getattr(self.api._client, "_transport", None)
-        if isinstance(transport, httpx.MockTransport):
-            kwargs["transport"] = transport
-        return httpx.AsyncClient(**kwargs)
 
     def set_clock(self, clock: Callable[[], float]) -> None:
         """Test hook: replace monotonic clock."""
@@ -98,8 +81,6 @@ class LiveHub:
 
     async def start(self) -> None:
         self._stop.clear()
-        if self._events_client.is_closed:
-            self._events_client = self._build_events_client()
         self._task = asyncio.create_task(self._run_events(), name="live-events")
         self._health_task = asyncio.create_task(self._run_health(), name="live-health")
 
@@ -114,8 +95,6 @@ class LiveHub:
                     pass
         self._task = None
         self._health_task = None
-        if not self._events_client.is_closed:
-            await self._events_client.aclose()
 
     async def check_version(self) -> bool:
         try:
@@ -191,55 +170,33 @@ class LiveHub:
     async def _consume_stream(self) -> None:
         self.state.status = ConnStatus.CONNECTING
         self.state.notify(force=True)
-        headers = dict(self._events_client.headers)
-        headers["Accept"] = "text/event-stream"
-        headers["Cache-Control"] = "no-store"
-        # Iterate raw SSE lines so ": keepalive" comments update last_frame_at.
-        # httpx-sse's aiter_sse drops comment lines before yielding events.
-        async with self._events_client.stream(
-            "GET",
-            "/api/v1/events",
-            headers=headers,
-            timeout=httpx.Timeout(None, connect=10.0),
-        ) as response:
-            ctype = response.headers.get("content-type", "")
-            if "text/event-stream" not in ctype.partition(";")[0]:
-                raise ApiError(
-                    "bad_response",
-                    f"Expected text/event-stream, got {ctype!r}",
-                    status=response.status_code,
-                )
-            self.state.status = ConnStatus.OK
-            self.state.last_frame_at = self._clock()
-            self.state.notify(force=True)
-            watchdog = asyncio.create_task(self._watch_frames())
-            decoder = SSEDecoder()
-            try:
-                async for line in response.aiter_lines():
-                    if self._stop.is_set():
-                        break
-                    # Any line (including ": keepalive") proves the stream is alive.
+        # EventSource owns the SSE connection, including ": keepalive" comments.
+        watchdog: asyncio.Task | None = None
+        try:
+            async for notice in EventSource(self.api):
+                if self._stop.is_set():
+                    break
+                if notice.kind == "open":
+                    self.state.status = ConnStatus.OK
                     self.state.last_frame_at = self._clock()
-                    if self.state.status == ConnStatus.LOST:
-                        self.state.status = ConnStatus.OK
+                    self.state.notify(force=True)
+                    watchdog = asyncio.create_task(self._watch_frames())
+                    continue
+                # Any line (including ": keepalive") proves the stream is alive.
+                self.state.last_frame_at = self._clock()
+                if self.state.status == ConnStatus.LOST:
+                    self.state.status = ConnStatus.OK
+                    self.state.notify(force=True)
+                if notice.kind == "state" and notice.envelope is not None:
+                    envelope = notice.envelope
+                    self.state.envelope = envelope
+                    self.state.status = ConnStatus.OK
+                    self.state.api_healthy = True
+                    if envelope.rev != self.state._last_rev:
+                        self.state._last_rev = envelope.rev
                         self.state.notify(force=True)
-                    event = decoder.decode(line.rstrip("\n"))
-                    if event is None:
-                        continue
-                    if event.event == "state" and event.data:
-                        try:
-                            data = json.loads(event.data)
-                            envelope = Envelope.from_dict(data)
-                        except Exception:
-                            log.exception("bad state event")
-                            continue
-                        self.state.envelope = envelope
-                        self.state.status = ConnStatus.OK
-                        self.state.api_healthy = True
-                        if envelope.rev != self.state._last_rev:
-                            self.state._last_rev = envelope.rev
-                            self.state.notify(force=True)
-            finally:
+        finally:
+            if watchdog is not None:
                 watchdog.cancel()
                 try:
                     await watchdog
