@@ -23,6 +23,8 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs .build-sha ./
 COPY build ./build
 COPY src ./src
+# Cargo.toml names the openapi example, so the manifest will not parse without it.
+COPY examples ./examples
 # Fetch and build with the serve feature only (no GUI libraries).
 ENV NEUTRONSYNC_BUILD_SHA=${NEUTRONSYNC_BUILD_SHA}
 RUN cargo build --release --features serve --bin neutronsync \

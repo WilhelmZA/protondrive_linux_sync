@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Fixed
+- The container image builds again: the Dockerfile now copies `examples/`, which `Cargo.toml` needs for the OpenAPI generator.
+
 ## [0.9.0] - 2026-10-22
 
 ### Added
