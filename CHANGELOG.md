@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-23
+
 ### Added
 - The web interface lists local trash per synced folder, restores files without overwriting an existing path, and permanently deletes entries after confirmation (#44).
 - First-start password setup uses a one-time code from the container log. The Account page changes the web password and signs out other sessions. Environment passwords seed new installations unless an explicit reset is requested (#43).

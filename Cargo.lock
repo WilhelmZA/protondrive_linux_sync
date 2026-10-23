@@ -3327,7 +3327,7 @@ dependencies = [
 
 [[package]]
 name = "neutronsync"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "axum",
