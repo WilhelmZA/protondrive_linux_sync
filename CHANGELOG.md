@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-10-23
+
 ### Fixed
 - The update release-notes card expands within the scrollable About page instead of clipping notes in a short nested scroll area (#45).
 - The tray and headless server recheck account state every 20 seconds without an open window. Unlocking the keyring clears stale status and resumes an enabled watcher without turning on disabled auto-sync (#46).

@@ -1,6 +1,6 @@
 [project]
 name = "neutronsync-client"
-version = "0.9.1"
+version = "0.9.2"
 description = "Python client for the NeutronSync HTTP API"
 readme = "README.md"
 requires-python = ">=3.12"
