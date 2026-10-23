@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,10 +27,14 @@ def _settings(tmp_path: Path, password: str | None, mode: str = "password") -> S
     )
 
 
-def test_first_start_without_password(tmp_path: Path) -> None:
+def test_first_start_without_password(tmp_path: Path, caplog) -> None:
     store = AuthStore(_settings(tmp_path, None))
-    with pytest.raises(SystemExit, match="NEUTRONSYNC_WEB_PASSWORD"):
-        store.prepare()
+    store.prepare()
+    assert store.needs_setup
+    assert store.setup_code
+    assert f"NeutronSync setup code: {store.setup_code}" in caplog.text
+    assert not store.verify_password("anything")
+    assert not (tmp_path / "auth.json").exists()
 
 
 def test_eleven_char_password_refused(tmp_path: Path) -> None:
@@ -65,16 +72,90 @@ def test_rate_limit_and_success(tmp_path: Path) -> None:
     assert store.verify_password(password)
 
 
-def test_password_change_replaces_hash(tmp_path: Path) -> None:
+def test_environment_only_seeds_password(tmp_path: Path) -> None:
     store = AuthStore(_settings(tmp_path, "old-password-1234"))
     store.prepare()
     old = (tmp_path / "auth.json").read_text(encoding="utf-8")
     store2 = AuthStore(_settings(tmp_path, "new-password-5678"))
     store2.prepare()
     new = (tmp_path / "auth.json").read_text(encoding="utf-8")
-    assert old != new
-    assert store2.verify_password("new-password-5678")
-    assert not store2.verify_password("old-password-1234")
+    assert old == new
+    assert not store2.verify_password("new-password-5678")
+    assert store2.verify_password("old-password-1234")
+
+
+def test_setup_code_rotation_validation_and_consumption(tmp_path: Path, caplog) -> None:
+    first = AuthStore(_settings(tmp_path, None))
+    first.prepare()
+    store = AuthStore(_settings(tmp_path, None))
+    store.prepare()
+    assert first.setup_code != store.setup_code
+    for code, password, confirmation, error in (
+        (first.setup_code, "a" * 12, "a" * 12, "setup code"),
+        ("WRONG", "a" * 12, "a" * 12, "setup code"),
+        (store.setup_code, "short", "short", "12 characters"),
+        (store.setup_code, "a" * 12, "b" * 12, "do not match"),
+    ):
+        with pytest.raises(ValueError, match=error):
+            store.complete_setup(code, password, confirmation)
+        assert store.needs_setup
+    code = store.setup_code
+    store.complete_setup(code, "a" * 12, "a" * 12)
+    assert not store.needs_setup
+    assert store.setup_code is None
+    with pytest.raises(ValueError, match="expired"):
+        store.complete_setup(code, "b" * 12, "b" * 12)
+    caplog.clear()
+    restarted = AuthStore(_settings(tmp_path, None))
+    restarted.prepare()
+    assert restarted.verify_password("a" * 12)
+    assert not restarted.needs_setup
+    assert not caplog.records
+
+
+def test_change_password_and_explicit_reset(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, "old-password-1234")
+    store = AuthStore(settings)
+    store.prepare()
+    version = store.session_version
+    with pytest.raises(ValueError, match="current password"):
+        store.change_password("wrong", "new-password-5678", "new-password-5678")
+    with pytest.raises(ValueError, match="do not match"):
+        store.change_password("old-password-1234", "new-password-5678", "different")
+    assert store.session_version == version
+    store.change_password("old-password-1234", "new-password-5678", "new-password-5678")
+    assert store.session_version != version
+    changed_version = store.session_version
+    restarted = AuthStore(settings)
+    restarted.prepare()
+    assert restarted.verify_password("new-password-5678")
+    assert restarted.session_version == changed_version
+    reset = AuthStore(replace(settings, web_password_reset=True))
+    reset.prepare()
+    assert reset.verify_password("old-password-1234")
+    assert reset.session_version != changed_version
+
+
+def test_reset_requires_valid_seed(tmp_path: Path) -> None:
+    store = AuthStore(replace(_settings(tmp_path, None), web_password_reset=True))
+    with pytest.raises(SystemExit, match="12 characters"):
+        store.prepare()
+
+
+def test_deleting_auth_file_restores_setup(tmp_path: Path) -> None:
+    store = AuthStore(_settings(tmp_path, "old-password-1234"))
+    store.prepare()
+    (tmp_path / "auth.json").unlink()
+    restarted = AuthStore(_settings(tmp_path, None))
+    restarted.prepare()
+    assert restarted.needs_setup
+
+
+def test_invalid_seed_is_ignored_when_password_exists(tmp_path: Path) -> None:
+    AuthStore(_settings(tmp_path, "old-password-1234")).prepare()
+    store = AuthStore(_settings(tmp_path, "short"))
+    store.prepare()
+    assert store.verify_password("old-password-1234")
 
 
 def test_proxy_mode_logs_warning(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
@@ -84,3 +165,23 @@ def test_proxy_mode_logs_warning(tmp_path: Path, caplog: pytest.LogCaptureFixtur
     assert any("Web login is off" in r.message for r in caplog.records)
     assert store.proxy_warning
     assert not (tmp_path / "auth.json").exists()
+    assert not store.needs_setup
+    assert store.setup_code is None
+
+
+def test_password_rotation_invalidates_other_session(tmp_path: Path, monkeypatch) -> None:
+    from neutronsync_web.pages import layout
+
+    store = AuthStore(_settings(tmp_path, "old-password-1234"))
+    store.prepare()
+    session = {
+        "signed_in": True,
+        "signed_at": time.time(),
+        "session_version": store.session_version,
+    }
+    monkeypatch.setattr(layout.ctx, "get_auth", lambda: store)
+    monkeypatch.setattr(layout, "app", SimpleNamespace(storage=SimpleNamespace(user=session)))
+    assert layout.require_session()
+    store.change_password("old-password-1234", "new-password-5678", "new-password-5678")
+    assert not layout.require_session()
+    assert session == {}

@@ -29,6 +29,7 @@ class ConnStatus(StrEnum):
     LOST = "lost"
     UNSUPPORTED = "unsupported"
     UNREACHABLE = "unreachable"
+    INVALID_CONFIG = "invalid_config"
 
 
 @dataclass
@@ -100,7 +101,13 @@ class LiveHub:
         try:
             version = await self.api.version()
         except ApiError as exc:
-            self.state.status = ConnStatus.UNREACHABLE
+            self.state.status = (
+                ConnStatus.INVALID_CONFIG
+                if exc.code == "invalid_config"
+                else ConnStatus.UNREACHABLE
+            )
+            if self.state.status == ConnStatus.INVALID_CONFIG:
+                self.state.envelope = None
             self.state.last_error = exc.message
             self.state.api_healthy = False
             self.state.notify(force=True)
@@ -139,7 +146,6 @@ class LiveHub:
                     continue
                 delay = BACKOFF[min(attempt, len(BACKOFF) - 1)]
                 attempt += 1
-                self.state.status = ConnStatus.UNREACHABLE
                 self.state.notify(force=True)
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=delay)

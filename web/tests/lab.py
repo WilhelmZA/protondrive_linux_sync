@@ -154,8 +154,17 @@ remote = "/my-files/photos"
         )
         self._wait_port(self.serve_port, "serve")
 
-    def start_web(self, *, auth_mode: str = "password", web_host: str = "127.0.0.1") -> None:
+    def start_web(
+        self,
+        *,
+        auth_mode: str = "password",
+        web_host: str = "127.0.0.1",
+        web_password: str | None = WEB_PASSWORD,
+        password_reset: bool = False,
+    ) -> None:
         env = self._env_base()
+        env.pop("NEUTRONSYNC_WEB_PASSWORD_FILE", None)
+        env.pop("NEUTRONSYNC_WEB_PASSWORD_RESET", None)
         env.update(
             {
                 "NEUTRONSYNC_API_URL": self.api_url,
@@ -167,10 +176,12 @@ remote = "/my-files/photos"
                 "PYTHONPATH": str(WEB / "src"),
             }
         )
-        if auth_mode == "password":
-            env["NEUTRONSYNC_WEB_PASSWORD"] = WEB_PASSWORD
+        if auth_mode == "password" and web_password is not None:
+            env["NEUTRONSYNC_WEB_PASSWORD"] = web_password
         else:
             env.pop("NEUTRONSYNC_WEB_PASSWORD", None)
+        if password_reset:
+            env["NEUTRONSYNC_WEB_PASSWORD_RESET"] = "1"
         # NiceGUI treats PYTEST_CURRENT_TEST as "run under screen fixture".
         env.pop("PYTEST_CURRENT_TEST", None)
         stderr = open(self.root / "web.stderr", "w", encoding="utf-8")

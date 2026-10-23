@@ -33,6 +33,7 @@ class Settings:
     web_auth: str
     web_password: str | None
     web_data: Path
+    web_password_reset: bool = False
 
 
 def load_settings() -> Settings:
@@ -73,4 +74,5 @@ def load_settings() -> Settings:
         web_auth=web_auth,
         web_password=web_password,
         web_data=web_data,
+        web_password_reset=os.environ.get("NEUTRONSYNC_WEB_PASSWORD_RESET") == "1",
     )

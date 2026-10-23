@@ -12,9 +12,13 @@ Then search for NeutronSync and install from the template. The template pulls `g
 
 ## First start
 
-Set **Web Password** (`NEUTRONSYNC_WEB_PASSWORD`) to at least 12 characters before starting. The web interface will not become healthy without it.
+**Web Password** (`NEUTRONSYNC_WEB_PASSWORD`) is optional. Start the container and find `NeutronSync setup code: ...` in the Unraid container log.
 
-Open `http://<unraid-ip>:8080`, sign in with that password, then sign in to Proton Drive from the Account page.
+Open `http://<unraid-ip>:8080`. Enter the setup code and enter a password of at least 12 characters twice. Then sign in to Proton Drive from the Account page. The setup code changes on each start and stops working after setup. The container can become healthy before setup; sync controls remain locked.
+
+If you supply **Web Password** or `NEUTRONSYNC_WEB_PASSWORD_FILE`, it seeds the first password and skips setup. It never replaces a saved password. Change the password under **Account → Change web password**; other browser sessions are signed out.
+
+For recovery, set **Web Password** and add `NEUTRONSYNC_WEB_PASSWORD_RESET=1`, then restart. Remove the reset flag after recovery. Alternatively, remove the password variables, delete `/config/web/auth.json` from appdata, and restart to return to setup. Proxy mode skips both setup and login.
 
 ## Paths
 

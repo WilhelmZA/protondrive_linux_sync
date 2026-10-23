@@ -324,6 +324,8 @@ fn folder_departure(destination: Option<(&str, &str)>, parent: &str) {
     fs::write(path, config).unwrap();
     let mut tree = h.tree();
     tree["sub"] = json!({"name":"sub","type":"folder","parent_uid":"a"});
+    tree["nested"] = json!({"name":"nested","type":"folder","parent_uid":"sub"});
+    tree["deep"] = json!({"name":"deep","type":"file","parent_uid":"nested","size":4,"mtime":1700000000,"sha1":sha1_smol::Sha1::from("deep").digest().to_string(),"data":"64656570"});
     h.write("tree.json", tree);
     h.file("sub", "child", "folder contents");
     h.ready();
@@ -346,10 +348,20 @@ fn folder_departure(destination: Option<(&str, &str)>, parent: &str) {
     } else {
         tree.as_object_mut().unwrap().remove("sub");
         tree.as_object_mut().unwrap().remove("file");
+        tree.as_object_mut().unwrap().remove("nested");
+        tree.as_object_mut().unwrap().remove("deep");
     }
     h.write("tree.json", tree);
     h.write("feed.json", json!([{"last_event_id":"1","events":[{"type":if destination.is_some(){"node_updated"}else{"node_deleted"},"node_uid":"sub","parent_uid":parent}]}]));
     h.applied();
+    if let Some((parent, name)) = destination {
+        // Cursor persistence must cover descendants, not just the directory.
+        assert_eq!(
+            h.local(&format!("{parent}/{name}/child")),
+            "folder contents"
+        );
+        assert_eq!(h.local(&format!("{parent}/{name}/nested/deep")), "deep");
+    }
     h.wait(|| h.records("acks").iter().any(|a| a["event_id"] == "1"));
     h.wait(|| h.log().contains("uid=sub disposition=mapped"));
     assert!(!h.cfg.pairs[0].local.join("a/sub").exists());

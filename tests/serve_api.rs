@@ -1971,10 +1971,15 @@ fn sync_with_no_configured_pairs_is_refused() {
 fn sync_while_signed_out_does_not_change_pair_phase() {
     let lab = Lab::new();
     lab.both("a.txt", "alpha");
-    let server = lab.serve(&[]);
+    // Set the session before the startup account probe. Polling /state only
+    // reads published state; it does not request another auth.status probe.
     lab.controls(json!({"signed_in": false}));
+    let server = lab.serve(&[]);
     wait_for("signed out", Duration::from_secs(15), || {
-        server.state()["state"]["signed_out"] == true
+        let state = server.state();
+        state["state"]["account"]["checked"] == true
+            && state["state"]["account"]["checking"] == false
+            && state["state"]["signed_out"] == true
     });
     let before = server.state()["state"]["pairs"][0]["phase"]
         .as_str()
@@ -1985,6 +1990,13 @@ fn sync_while_signed_out_does_not_change_pair_phase() {
     let snap = server.state();
     let after = snap["state"]["pairs"][0]["phase"].as_str().unwrap();
     assert_eq!(after, before);
+    assert_eq!(snap["state"]["busy"], false);
+    assert!(
+        !lab.lines("calls")
+            .iter()
+            .any(|line| line.contains("\"node.walk\"")),
+        "a refused sync must not start a scan"
+    );
     assert_eq!(server.stop().0, 0);
     lab.wait_for_sidecars();
 }
@@ -2000,5 +2012,72 @@ fn settings_put_rejects_negative_numbers_with_field_name() {
     assert!(msg.contains("max_delete_files"));
     assert!(!msg.contains("serde"));
     assert!(!msg.contains("u64"));
+    assert_eq!(server.stop().0, 0);
+}
+
+#[test]
+fn trash_api_lists_restores_refuses_overwrite_and_requires_delete_confirmation() {
+    let lab = Lab::new();
+    let trash = lab.path(&format!(".Trash-{}", unsafe { libc::geteuid() }));
+    fs::create_dir_all(trash.join("files")).unwrap();
+    fs::create_dir_all(trash.join("info")).unwrap();
+    let original = lab.local_root().join("restored.txt");
+    let seed = || {
+        fs::write(trash.join("files/item"), "saved").unwrap();
+        fs::write(
+            trash.join("info/item.trashinfo"),
+            format!(
+                "[Trash Info]\nPath={}\nDeletionDate=2026-10-23T12:34:56\n",
+                original.display()
+            ),
+        )
+        .unwrap();
+    };
+    seed();
+    let server = lab.serve(&[]);
+    let reply = server.get("/api/v1/trash");
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let items = reply.json();
+    assert_eq!(items.as_array().unwrap().len(), 1);
+    assert_eq!(items[0]["pair"], PAIR);
+    assert_eq!(items[0]["size"], 5);
+    let id = items[0]["id"].as_str().unwrap();
+    let base = format!("/api/v1/trash/{PAIR}/{id}");
+    for body in [json!({}), json!({"confirm": false})] {
+        assert_eq!(server.post(&format!("{base}/delete"), body).status, 400);
+        assert!(trash.join("files/item").exists());
+    }
+    assert_eq!(
+        server
+            .post(&format!("/api/v1/trash/other/{id}/restore"), json!({}))
+            .status,
+        404
+    );
+    fs::write(&original, "existing").unwrap();
+    assert_eq!(
+        server.post(&format!("{base}/restore"), json!({})).status,
+        409
+    );
+    assert_eq!(fs::read_to_string(&original).unwrap(), "existing");
+    fs::remove_file(&original).unwrap();
+    assert_eq!(
+        server.post(&format!("{base}/restore"), json!({})).status,
+        200
+    );
+    assert_eq!(fs::read_to_string(&original).unwrap(), "saved");
+    assert_eq!(
+        server.post(&format!("{base}/restore"), json!({})).status,
+        404
+    );
+    seed();
+    assert_eq!(
+        server
+            .post(&format!("{base}/delete"), json!({"confirm": true}))
+            .status,
+        200
+    );
+    assert!(!trash.join("files/item").exists());
+    assert!(!trash.join("info/item.trashinfo").exists());
+    assert_eq!(server.get("/api/v1/trash").json(), json!([]));
     assert_eq!(server.stop().0, 0);
 }

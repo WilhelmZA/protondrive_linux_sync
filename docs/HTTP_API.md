@@ -19,6 +19,14 @@ neutronsync serve [--listen ADDR:PORT] [--token-file PATH] [--local-root PATH]..
 
 ## Conventions
 
+### Invalid configuration at startup
+
+When the configuration cannot load, `serve` keeps a restricted TCP API available. `GET /api/v1/health` returns `200 {"ok":true,"ready":false}`. Other requests return `422 invalid_config` with the startup error, after the normal token, browser-origin and Host checks. The web interface shows this error instead of a connection failure. TOML syntax errors omit source lines to protect configuration values.
+
+This mode does not start the controller, sidecar, account checks or sync. It does not write the configuration, acquire a state lock or replace the unix socket. Edit the configuration file shown in the web notice; for overlapping pairs, remove or correct the overlapping `[[pair]]` entry. `serve` retries the file every second and starts normally once it is valid. SIGTERM and SIGINT still stop the process. Configuration correction through the API is not available in this mode.
+
+### Request conventions
+
 - Every path starts with `/api/v1`. Stability for that version: no field or endpoint is removed, and none changes its meaning. New optional response fields and new endpoints may be added; clients must ignore fields they do not know. Deprecations are announced here and in `CHANGELOG.md` and keep working until the next major API version. A breaking change means `/api/v2` is served alongside `/api/v1` for at least one release. Request bodies still refuse unknown fields with `400`. The machine-readable copy is OpenAPI 3.1, generated from the server: `docs/openapi.json` and `GET /api/v1/openapi.json`.
 - Bodies are JSON, at most 64 KiB (413 above that, chunked or not, on every endpoint). A body that is not empty must be sent as `Content-Type: application/json` (parameters such as `charset` allowed), or the request is refused with 415 before anything runs. An empty body counts as `{}`. Unknown fields in a body are refused with 400.
 - When a token is set, every TCP request except `GET /api/v1/health` needs `Authorization: Bearer <token>`. A missing or wrong token is 401 with no detail. The token is compared in constant time. The unix socket never asks for a bearer token, even when TCP has one.
@@ -146,6 +154,14 @@ curl -N -H "$AUTH" $API/events
 ```
 
 ## Endpoints
+
+### Local trash
+
+`GET /api/v1/trash` returns local freedesktop trash entries for configured folder pairs. Each entry contains `id`, `pair`, `name`, `original_path`, `size` (bytes), and `deleted_at` (the `.trashinfo` deletion date). The server reads the home trash and per-volume `.Trash-<uid>` and `.Trash/<uid>` directories. Entries outside the configured pair, malformed metadata, and symlink payloads are excluded. An unavailable pair returns `409` rather than an empty list.
+
+`POST /api/v1/trash/{pair}/{id}/restore` restores the entry to its original path. Missing parent directories are created. Restore never overwrites an existing file, directory, or symlink. Unsafe parent paths, cross-filesystem moves, and existing destinations return `409`; the entry stays in trash. Unknown entries return `404`. Successful restore returns `200 {"ok":true}`.
+
+`POST /api/v1/trash/{pair}/{id}/delete` permanently removes the entry and its metadata. The request requires `{"confirm":true}`; absent or false confirmation returns `400` without deleting anything. Unknown entries return `404`. Success returns `200 {"ok":true}`. URL-encode the pair name and use the opaque entry id from the current listing. These endpoints use the same authentication and browser-origin restrictions as the other API endpoints. The web Trash page calls these endpoints through its backend and asks for confirmation before permanent deletion.
 
 ### `GET /api/v1/health`
 

@@ -266,7 +266,7 @@ Until NeutronSync is listed in Community Applications, add this template reposit
 https://github.com/WilhelmZA/unraid-templates
 ```
 
-Install from the template (`ghcr.io/wilhelmza/neutronsync:latest`). The template lives in [WilhelmZA/unraid-templates](https://github.com/WilhelmZA/unraid-templates). Set **Web Password** (`NEUTRONSYNC_WEB_PASSWORD`, at least 12 characters) before the first start — without it the health check stays unhealthy and the log says so in one line. Defaults map `/config` to `/mnt/user/appdata/neutronsync` and `/data` to `/mnt/user`; narrow `/data` to the shares you sync. See [`packaging/unraid/README.md`](packaging/unraid/README.md).
+Install from the template (`ghcr.io/wilhelmza/neutronsync:latest`). The template lives in [WilhelmZA/unraid-templates](https://github.com/WilhelmZA/unraid-templates). **Web Password** is optional. On first visit, create a password using the setup code from the container log. Defaults map `/config` to `/mnt/user/appdata/neutronsync` and `/data` to `/mnt/user`; narrow `/data` to the shares you sync. See [`packaging/unraid/README.md`](packaging/unraid/README.md).
 
 ### Plain Docker
 
@@ -277,6 +277,12 @@ docker build -f docker/Dockerfile -t neutronsync:dev .
 ```
 
 ### First-start password and where things live
+
+Start without a password variable and open the web interface. Enter the one-time code from `NeutronSync setup code: ...` in the container log. Enter your new password twice, using at least 12 characters. The code changes on each start and stops working after setup. Failed setup attempts are rate-limited like logins. Health checks work before setup; sync controls remain locked.
+
+Optionally set `NEUTRONSYNC_WEB_PASSWORD` or `NEUTRONSYNC_WEB_PASSWORD_FILE` to seed the first password and skip setup. These variables never replace an existing password. Use **Account → Change web password** to change it; enter the current password and the new password twice. Other browser sessions are signed out.
+
+For recovery, set a valid password variable and `NEUTRONSYNC_WEB_PASSWORD_RESET=1`, then restart. Remove the reset flag after recovery so later starts do not reset the password again. Alternatively, remove the password variables, delete `/config/web/auth.json`, and restart to return to setup. Proxy mode (`NEUTRONSYNC_WEB_AUTH=proxy`) has no login or setup page.
 
 | Path | Purpose |
 | --- | --- |

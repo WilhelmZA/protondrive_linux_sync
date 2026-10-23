@@ -25,6 +25,7 @@ from neutronsync_web.pages import (
     folders,
     login,
     settings_page,
+    trash,
 )
 from neutronsync_web.pages.layout import require_session
 from neutronsync_web.settings import ConfigError, load_settings
@@ -57,6 +58,15 @@ def register_routes() -> None:
 
     app.add_static_files("/static", str(STATIC))
 
+    @app.middleware("http")
+    async def setup_guard(request, call_next):
+        path = request.url.path
+        if ctx.get_auth().needs_setup and not (
+            path in ("/setup", "/healthz") or path.startswith(("/static/", "/_nicegui/"))
+        ):
+            return RedirectResponse("/setup")
+        return await call_next(request)
+
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
         live = ctx.get_live()
@@ -65,6 +75,8 @@ def register_routes() -> None:
 
     def guarded(page_render):
         def wrapper():
+            if ctx.get_auth().needs_setup:
+                return RedirectResponse("/setup")
             if not require_session():
                 path = "/"
                 try:
@@ -76,6 +88,12 @@ def register_routes() -> None:
             return None
 
         return wrapper
+
+    @ui.page("/setup")
+    def page_setup():
+        if not ctx.get_auth().needs_setup:
+            return RedirectResponse("/" if ctx.get_auth().mode == "proxy" else "/login")
+        login.render(setup=True)
 
     @ui.page("/login")
     def page_login() -> None:
@@ -95,6 +113,10 @@ def register_routes() -> None:
     @ui.page("/conflicts")
     def page_conflicts():
         return guarded(conflicts.render)()
+
+    @ui.page("/trash")
+    def page_trash():
+        return guarded(trash.render)()
 
     @ui.page("/settings")
     def page_settings():

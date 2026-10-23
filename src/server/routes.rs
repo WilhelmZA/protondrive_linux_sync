@@ -57,6 +57,7 @@ pub fn router(ctx: Arc<Ctx>) -> Router {
         .route("/api/v1/remote/list", get(remote_list))
         .route("/api/v1/local/list", get(local_list))
         .route("/api/v1/logs", get(logs))
+        .merge(super::trash::router())
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
@@ -65,7 +66,7 @@ pub fn router(ctx: Arc<Ctx>) -> Router {
 }
 
 /// Compare two secrets in time that depends only on their lengths.
-fn same_secret(a: &[u8], b: &[u8]) -> bool {
+pub(super) fn same_secret(a: &[u8], b: &[u8]) -> bool {
     let mut diff = a.len() ^ b.len();
     for (i, x) in a.iter().enumerate() {
         diff |= (*x ^ b.get(i).copied().unwrap_or(0)) as usize;
@@ -78,7 +79,7 @@ fn same_secret(a: &[u8], b: &[u8]) -> bool {
 /// them; the server-side clients this API is for (curl, a web app's backend)
 /// send neither. Refusing them is what stops a page the user happens to open
 /// from driving a server that has no token.
-fn from_a_browser(req: &Request) -> bool {
+pub(super) fn from_a_browser(req: &Request) -> bool {
     let h = req.headers();
     h.contains_key(header::ORIGIN)
         || h.get("sec-fetch-site")
@@ -89,8 +90,8 @@ fn from_a_browser(req: &Request) -> bool {
 /// On a loopback listener, the `Host` a request names must be a loopback
 /// name. A page served from another name that resolves to 127.0.0.1 (DNS
 /// rebinding) is refused, so it cannot read the state either.
-fn host_allowed(ctx: &Ctx, req: &Request) -> bool {
-    if !ctx.loopback {
+pub(super) fn host_allowed(loopback: bool, req: &Request) -> bool {
+    if !loopback {
         return true;
     }
     let Some(host) = req
@@ -123,7 +124,7 @@ async fn gate(State(ctx): Ctl, req: Request, next: Next) -> Response {
             return ApiError::forbidden("Requests from web pages are not accepted.")
                 .into_response();
         }
-        if !host_allowed(&ctx, &req) {
+        if !host_allowed(ctx.loopback, &req) {
             ctx.refused("unexpected Host name");
             return ApiError::forbidden("Requests for that host name are not accepted.")
                 .into_response();

@@ -407,6 +407,21 @@ class ApiClient:
     async def held_delete(self, pair: str) -> None:
         await self._request("POST", f"/api/v1/held/{pair}/delete", json={"confirm": True})
 
+    async def trash(self) -> list[dict[str, Any]]:
+        return await self._request("GET", "/api/v1/trash") or []
+
+    async def trash_restore(self, pair: str, item_id: str) -> None:
+        from urllib.parse import quote
+
+        path = f"/api/v1/trash/{quote(pair, safe='')}/{quote(item_id, safe='')}/restore"
+        await self._request("POST", path)
+
+    async def trash_delete(self, pair: str, item_id: str, *, confirm: bool = False) -> None:
+        from urllib.parse import quote
+
+        path = f"/api/v1/trash/{quote(pair, safe='')}/{quote(item_id, safe='')}/delete"
+        await self._request("POST", path, json={"confirm": confirm})
+
     async def conflicts(self) -> list[ConflictItem]:
         data = await self._request("GET", "/api/v1/conflicts")
         return [ConflictItem.from_dict(c) for c in data or []]

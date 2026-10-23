@@ -16,7 +16,9 @@ mod error;
 mod files;
 mod openapi;
 mod publish;
+mod recovery;
 mod routes;
+mod trash;
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -310,7 +312,13 @@ pub fn run(opts: ServeOptions) -> Result<ExitCode> {
         pair_roots.clone()
     };
 
-    let cfg = config::load(opts.config.as_deref())?;
+    let cfg = match config::load(opts.config.as_deref()) {
+        Ok(cfg) => cfg,
+        Err(err) => match recovery::wait_for_config(&opts, listen, token.clone(), err)? {
+            Some(cfg) => cfg,
+            None => return Ok(ExitCode::SUCCESS),
+        },
+    };
     let config_path = cfg
         .source_path
         .clone()

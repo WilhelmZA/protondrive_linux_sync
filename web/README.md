@@ -25,8 +25,9 @@ uv sync --locked
 | `NEUTRONSYNC_WEB_HOST` | `127.0.0.1` | Address the web app listens on |
 | `NEUTRONSYNC_WEB_PORT` | `8080` | Port the web app listens on |
 | `NEUTRONSYNC_WEB_AUTH` | `password` | `password` or `proxy` |
-| `NEUTRONSYNC_WEB_PASSWORD` | (required on first start in password mode) | Admin password, 12 characters or more |
+| `NEUTRONSYNC_WEB_PASSWORD` | (none) | Optional first-password seed, 12 characters or more |
 | `NEUTRONSYNC_WEB_PASSWORD_FILE` | (none) | File containing the password |
+| `NEUTRONSYNC_WEB_PASSWORD_RESET` | (none) | Set to `1` to replace the saved password with the seed on startup; remove after recovery |
 | `NEUTRONSYNC_WEB_DATA` | `~/.local/state/neutronsync-web` | Session secret and password hash |
 
 A bad value stops startup with one plain line naming the variable.
@@ -37,7 +38,9 @@ A bad value stops startup with one plain line naming the variable.
 
 For a machine on a home LAN with no reverse proxy. One admin password, no usernames. On first start the password is hashed with scrypt into `$NEUTRONSYNC_WEB_DATA/auth.json` (mode 0600). The plaintext is never stored.
 
-To change the password, set `NEUTRONSYNC_WEB_PASSWORD` to the new value and restart. If it does not match the stored hash, the hash is replaced.
+Without a password seed, the web interface starts and redirects to **Create your password**. Enter the one-time setup code from the startup log and enter a password of at least 12 characters twice. The code changes on each start and expires after setup. Failed setup attempts are rate-limited like logins. `/healthz` remains available.
+
+The password variables only seed an empty password store. Change the password under **Account → Change web password** using the current password. Other browser sessions are signed out. For recovery, set a valid seed and `NEUTRONSYNC_WEB_PASSWORD_RESET=1`, then restart. Remove the reset flag afterward. Alternatively, remove the seed variables, delete `$NEUTRONSYNC_WEB_DATA/auth.json`, and restart to return to setup.
 
 ### Proxy
 

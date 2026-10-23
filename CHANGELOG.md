@@ -4,8 +4,16 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+- The web interface lists local trash per synced folder, restores files without overwriting an existing path, and permanently deletes entries after confirmation (#44).
+- First-start password setup uses a one-time code from the container log. The Account page changes the web password and signs out other sessions. Environment passwords seed new installations unless an explicit reset is requested (#43).
+
 ### Fixed
 - The container image builds again: the Dockerfile now copies `examples/`, which `Cargo.toml` needs for the OpenAPI generator.
+- Updated Tokio to 1.54.1 to fix the interval timer race in the yanked 1.54.0 release and restore the dependency check.
+- Invalid configuration starts a protected diagnostics API instead of leaving the web interface with a connection error. The engine retries after the configuration file is corrected (#42).
+- The signed-out API test sets its fake session before the startup account probe, removing a race in CI.
+- Remote folder moves and renames populate new subtrees before the watcher acknowledges the change, even when local file watches are unavailable.
 
 ## [0.9.0] - 2026-10-22
 

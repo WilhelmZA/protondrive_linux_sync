@@ -882,6 +882,39 @@
           }
         },
         "type": "object"
+      },
+      "TrashItem": {
+        "properties": {
+          "deleted_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "original_path": {
+            "type": "string"
+          },
+          "pair": {
+            "type": "string"
+          },
+          "size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "pair",
+          "name",
+          "original_path",
+          "size",
+          "deleted_at"
+        ],
+        "type": "object"
       }
     },
     "securitySchemes": {
@@ -899,7 +932,7 @@
       "name": "MIT"
     },
     "title": "NeutronSync HTTP API",
-    "version": "0.8.2"
+    "version": "0.9.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -2103,6 +2136,176 @@
               }
             },
             "description": "Error. `error.code` is the stable name."
+          }
+        }
+      }
+    },
+    "/api/v1/trash": {
+      "get": {
+        "operationId": "trashList",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/TrashItem"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Local trash entries restricted to configured folder pairs."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error."
+          }
+        }
+      }
+    },
+    "/api/v1/trash/{pair}/{id}/delete": {
+      "post": {
+        "operationId": "trashDelete",
+        "parameters": [
+          {
+            "description": "Synced folder name.",
+            "in": "path",
+            "name": "pair",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Opaque trash entry id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfirmBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Payload and trash metadata permanently removed."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Requires confirm true. Nothing was deleted."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "No such entry in that pair."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error."
+          }
+        }
+      }
+    },
+    "/api/v1/trash/{pair}/{id}/restore": {
+      "post": {
+        "operationId": "trashRestore",
+        "parameters": [
+          {
+            "description": "Synced folder name.",
+            "in": "path",
+            "name": "pair",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Opaque trash entry id.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Restored to the original path without overwriting."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "No such entry in that pair."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Destination exists, unsafe path, or filesystem error."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            },
+            "description": "Error."
           }
         }
       }

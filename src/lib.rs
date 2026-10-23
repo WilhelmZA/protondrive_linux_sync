@@ -32,6 +32,7 @@ pub mod service;
 pub mod state;
 pub mod stats;
 pub mod trash;
+pub mod trash_browser;
 pub mod tray_policy;
 #[cfg(feature = "gui")]
 pub mod updater;

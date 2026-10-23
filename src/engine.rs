@@ -800,8 +800,8 @@ pub fn run_sync_streaming(
     }
 }
 
-/// Reconcile a specific SET of folders in a pair concurrently (shallow, no
-/// descent). Used by the watch daemon for the startup local-change / hot phases
+/// Reconcile a specific SET of folders in a pair concurrently, descending only
+/// into newly discovered directories. Used by the watch daemon for local-change / hot phases
 /// and change-event bursts, so a batch of folders runs through a worker pool
 /// (like the streaming walk) instead of one slow CLI cold-start at a time. Each
 /// folder is the same scoped, positive-confirmation shallow reconcile; workers
@@ -860,6 +860,7 @@ pub fn run_sync_shallow_many(
     };
     let queue: Mutex<std::collections::VecDeque<String>> =
         Mutex::new(folders.iter().cloned().collect());
+    let queued: Mutex<HashSet<String>> = Mutex::new(folders.iter().cloned().collect());
     // One allowance for the whole batch: ten folders deleting 30 files each
     // share one count, and the first folder that does not fit holds the rest.
     let allowance = Arc::new(DeleteAllowance::for_run(cfg, tracked_files(&base), false));
@@ -907,9 +908,22 @@ pub fn run_sync_shallow_many(
                         });
                     }
                     match eng.sync_pair_shallow_with_base(pair, &folder, &base) {
-                        Ok((r, _children)) => {
+                        Ok((r, children)) => {
                             applied.fetch_add(r.applied, Ordering::Relaxed);
                             errors.fetch_add(r.errors.len(), Ordering::Relaxed);
+                            // A moved or renamed remote directory has no baseline
+                            // at its destination. Populate its subtree before the
+                            // feed cursor advances, without relying on inotify
+                            // echoes or walking unchanged sibling directories.
+                            let mut queued = queued.lock().unwrap();
+                            let mut queue = queue.lock().unwrap();
+                            for child in children {
+                                if !base.get(&child).is_some_and(|entry| entry.is_dir)
+                                    && queued.insert(child.clone())
+                                {
+                                    queue.push_back(child);
+                                }
+                            }
                         }
                         Err(e) => {
                             errors.fetch_add(1, Ordering::Relaxed);

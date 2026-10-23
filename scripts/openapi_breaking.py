@@ -218,6 +218,11 @@ def compare(old: dict, new: dict) -> list[str]:
 
     old_params = parameters(old)
     new_params = parameters(new)
+    old_operations = {
+        f"{method.upper()} {path}"
+        for path, methods in old_paths.items()
+        for method in methods
+    }
     for key, (was_required, old_type) in old_params.items():
         if key not in new_params:
             problems.append(f"removed {key}")
@@ -228,7 +233,11 @@ def compare(old: dict, new: dict) -> list[str]:
         if now_required and not was_required:
             problems.append(f"made required: {key}")
     for key, (now_required, _) in new_params.items():
-        if key not in old_params and now_required:
+        if (
+            key not in old_params
+            and now_required
+            and key.split(" param ", 1)[0] in old_operations
+        ):
             problems.append(f"added required {key}")
 
     old_anchors = operation_anchors(old)
@@ -302,6 +311,26 @@ def self_test() -> None:
     added["components"]["schemas"]["Envelope"]["properties"]["extra"] = {"type": "boolean"}
     if compare(base, added):
         raise SystemExit(f"optional field should pass: {compare(base, added)}")
+
+    new_operation = {
+        "parameters": [
+            {"name": "id", "in": "path", "required": True, "schema": {"type": "string"}}
+        ],
+        "responses": {"200": {"description": "OK"}},
+    }
+    added_path = json.loads(json.dumps(base))
+    added_path["paths"]["/api/v1/items/{id}"] = {"post": new_operation}
+    if compare(base, added_path):
+        raise SystemExit("required parameters on a new path should pass")
+    added_method = json.loads(json.dumps(base))
+    added_method["paths"]["/api/v1/state"]["post"] = new_operation
+    if compare(base, added_method):
+        raise SystemExit("required parameters on a new method should pass")
+    added_parameter = json.loads(json.dumps(base))
+    added_parameter["paths"]["/api/v1/state"]["get"]["parameters"].append(
+        {"name": "token", "in": "query", "required": True, "schema": {"type": "string"}}
+    )
+    check(added_parameter, "added required")
 
     removed_path = json.loads(json.dumps(base))
     del removed_path["paths"]["/api/v1/state"]

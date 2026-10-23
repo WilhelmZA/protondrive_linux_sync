@@ -32,3 +32,28 @@ def test_empty_web_auth_means_password(monkeypatch: pytest.MonkeyPatch, tmp_path
     monkeypatch.setenv("NEUTRONSYNC_WEB_DATA", str(tmp_path))
     s = load_settings()
     assert s.web_auth == "password"
+
+
+def test_password_file_seed_and_explicit_reset(monkeypatch, tmp_path) -> None:
+    from neutronsync_web.auth import AuthStore
+
+    seed = tmp_path / "seed"
+    seed.write_text("file-seed-password\n")
+    monkeypatch.setenv("NEUTRONSYNC_WEB_DATA", str(tmp_path / "auth"))
+    monkeypatch.setenv("NEUTRONSYNC_WEB_AUTH", "password")
+    monkeypatch.setenv("NEUTRONSYNC_WEB_PASSWORD", "ignored-environment-password")
+    monkeypatch.setenv("NEUTRONSYNC_WEB_PASSWORD_FILE", str(seed))
+    monkeypatch.delenv("NEUTRONSYNC_WEB_PASSWORD_RESET", raising=False)
+    settings = load_settings()
+    assert not settings.web_password_reset
+    store = AuthStore(settings)
+    store.prepare()
+    assert store.verify_password("file-seed-password")
+    store.change_password("file-seed-password", "changed-password", "changed-password")
+    restarted = AuthStore(load_settings())
+    restarted.prepare()
+    assert restarted.verify_password("changed-password")
+    monkeypatch.setenv("NEUTRONSYNC_WEB_PASSWORD_RESET", "1")
+    reset = AuthStore(load_settings())
+    reset.prepare()
+    assert reset.verify_password("file-seed-password")

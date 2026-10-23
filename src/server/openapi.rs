@@ -96,6 +96,9 @@ impl utoipa::Modify for BearerAuth {
         held,
         held_restore,
         held_delete,
+        trash_list,
+        trash_restore,
+        trash_delete,
         conflicts,
         conflict_dismiss,
         conflicts_dismiss_all,
@@ -340,6 +343,40 @@ fn held_restore() {}
     )
 )]
 fn held_delete() {}
+
+#[utoipa::path(
+    get, path = "/api/v1/trash", operation_id = "trashList",
+    responses(
+        (status = 200, description = "Local trash entries restricted to configured folder pairs.", body = Vec<crate::trash_browser::TrashItem>),
+        (status = "default", description = "Error.", body = ApiErrorBody)
+    )
+)]
+fn trash_list() {}
+
+#[utoipa::path(
+    post, path = "/api/v1/trash/{pair}/{id}/restore", operation_id = "trashRestore",
+    params(("pair" = String, Path, description = "Synced folder name."), ("id" = String, Path, description = "Opaque trash entry id.")),
+    responses(
+        (status = 200, description = "Restored to the original path without overwriting.", body = serde_json::Value),
+        (status = 404, description = "No such entry in that pair.", body = ApiErrorBody),
+        (status = 409, description = "Destination exists, unsafe path, or filesystem error.", body = ApiErrorBody),
+        (status = "default", description = "Error.", body = ApiErrorBody)
+    )
+)]
+fn trash_restore() {}
+
+#[utoipa::path(
+    post, path = "/api/v1/trash/{pair}/{id}/delete", operation_id = "trashDelete",
+    params(("pair" = String, Path, description = "Synced folder name."), ("id" = String, Path, description = "Opaque trash entry id.")),
+    request_body = ConfirmBody,
+    responses(
+        (status = 200, description = "Payload and trash metadata permanently removed.", body = serde_json::Value),
+        (status = 400, description = "Requires confirm true. Nothing was deleted.", body = ApiErrorBody),
+        (status = 404, description = "No such entry in that pair.", body = ApiErrorBody),
+        (status = "default", description = "Error.", body = ApiErrorBody)
+    )
+)]
+fn trash_delete() {}
 
 #[utoipa::path(
     get,

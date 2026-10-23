@@ -17,6 +17,7 @@ LOGO = Path(__file__).resolve().parent.parent / "static" / "logo.png"
 NAV = [
     ("/", "Activity", "sync"),
     ("/folders", "Folders", "folder"),
+    ("/trash", "Trash", "delete"),
     ("/conflicts", "Conflicts", "warning"),
     ("/settings", "Settings", "settings"),
     ("/account", "Account", "person"),
@@ -151,6 +152,13 @@ def page_shell(title: str, body: Callable[[], None], *, live_body: bool = True) 
     def chrome() -> None:
         st = live.state
         content = content_holder["el"]
+        if st.status == ConnStatus.INVALID_CONFIG:
+            if content is not None:
+                content.set_visibility(False)
+            with ui.column().classes("ns-frame q-pa-lg"):
+                ui.label("NeutronSync configuration error").classes("text-h6")
+                ui.label(st.last_error).classes("ns-err")
+            return
         if st.status == ConnStatus.UNSUPPORTED:
             if content is not None:
                 content.set_visibility(False)
@@ -259,7 +267,15 @@ def page_shell(title: str, body: Callable[[], None], *, live_body: bool = True) 
     # Markers are diffed in tick(); clearing them on every rev remounted the
     # Auto sync switch and dropped clicks (planner HOLD / AC-15).
     tick()
-    ui.timer(0.25, tick)
+
+    def session_tick() -> None:
+        if not require_session():
+            ui.context.client.remove_all_elements()
+            ui.navigate.to("/setup" if ctx.get_auth().needs_setup else "/login")
+            return
+        tick()
+
+    ui.timer(0.25, session_tick)
 
 
 def require_session() -> bool:
@@ -267,9 +283,14 @@ def require_session() -> bool:
     auth = ctx.get_auth()
     if auth.mode == "proxy":
         return True
+    if auth.needs_setup:
+        return False
     if not app.storage.user.get("signed_in"):
         return False
-    if auth.session_expired(app.storage.user.get("signed_at")):
+    if (
+        auth.session_expired(app.storage.user.get("signed_at"))
+        or app.storage.user.get("session_version") != auth.session_version
+    ):
         app.storage.user.clear()
         return False
     return True

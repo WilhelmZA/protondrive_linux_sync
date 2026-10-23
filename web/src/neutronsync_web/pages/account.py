@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-from nicegui import ui
+import asyncio
+import time
+
+from nicegui import app, ui
+from nicegui.client import Client
 
 from neutronsync_web import ctx
 from neutronsync_web.api import ApiError, SignInStep
-from neutronsync_web.pages.layout import page_shell
+from neutronsync_web.auth import FAIL_DELAY, client_address
+from neutronsync_web.pages.layout import page_shell, require_session
 
 _FORMS: dict[str, dict] = {}
 
@@ -42,6 +47,9 @@ def render() -> None:
     form = _form_for_client()
 
     def body() -> None:
+        if ctx.get_auth().mode == "password":
+            password_form()
+
         @ui.refreshable
         def form_ui() -> None:
             live = ctx.get_live()
@@ -236,3 +244,48 @@ def render() -> None:
             form_ui()
 
     page_shell("Account", body, live_body=False)
+
+
+def password_form() -> None:
+    """Change the web password without changing Proton credentials."""
+    auth = ctx.get_auth()
+    with ui.column().classes("ns-auth"):
+        ui.label("Change web password").classes("ns-auth-title")
+        current = ui.input("Current password", password=True, password_toggle_button=True)
+        password = ui.input("New password", password=True, password_toggle_button=True)
+        confirmation = ui.input("Confirm new password", password=True, password_toggle_button=True)
+        message = ui.label("").classes("ns-err")
+
+        async def submit() -> None:
+            if not require_session():
+                ui.navigate.to("/login")
+                return
+            addr = client_address(ui.context.client.request)
+            if auth.rate_limited(addr):
+                message.set_text("Too many attempts. Try again in a few minutes.")
+                return
+            try:
+                auth.change_password(
+                    current.value or "", password.value or "", confirmation.value or ""
+                )
+            except ValueError as exc:
+                auth.record_failure(addr)
+                message.set_text(str(exc))
+                await asyncio.sleep(FAIL_DELAY)
+                return
+            finally:
+                current.value = ""
+                password.value = ""
+                confirmation.value = ""
+            auth.clear_failures(addr)
+            app.storage.user["session_version"] = auth.session_version
+            app.storage.user["signed_at"] = time.time()
+            # Remove old controls immediately, including their server-side handlers.
+            # Reloading an old browser session then checks the new session version.
+            for client in list(Client.instances.values()):
+                if client is not ui.context.client:
+                    client.remove_all_elements()
+                    client.run_javascript("window.location.replace('/login')")
+            message.set_text("Web password changed. Other sessions are signed out.")
+
+        ui.button("Change web password", on_click=submit).props("color=primary")

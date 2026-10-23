@@ -31,7 +31,7 @@ pub fn trash_local(path: &Path, gio: Option<&Path>) -> Result<()> {
     xdg_trash(path)
 }
 
-fn data_home() -> PathBuf {
+pub(crate) fn data_home() -> PathBuf {
     if let Ok(v) = std::env::var("XDG_DATA_HOME") {
         if !v.is_empty() {
             return PathBuf::from(v);
