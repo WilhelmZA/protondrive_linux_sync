@@ -92,6 +92,7 @@ remote = "/my-files/test"
             .unwrap();
         self.child = Some(
             Command::new(env!("CARGO_BIN_EXE_neutronsync"))
+                .env_remove("NEUTRONSYNC_FAKE_AUTH")
                 .arg("--config")
                 .arg(self.dir.path().join("config.toml"))
                 .arg("watch")
@@ -148,6 +149,26 @@ impl Drop for Harness {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+#[test]
+fn locked_keyring_is_reprobed_and_sync_resumes_without_a_window_or_signal() {
+    let mut h = Harness::new();
+    h.file("a", "file", "unlocked");
+    h.write("controls.json", json!({"keyring_locked": true}));
+    h.start();
+    h.wait(|| h.log().contains("system keyring is locked"));
+    assert!(!h.cfg.pairs[0].local.join("a/file").exists());
+    h.write("controls.json", json!({"keyring_locked": false}));
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while h.cursor().as_deref() != Some("0") {
+        assert!(Instant::now() < deadline, "timed out: {}", h.log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(h.local("a/file"), "unlocked");
+    assert!(h.log().contains("keyring unlocked — resuming"));
+    assert!(!h.log().contains("session signed out"));
+    assert!(!h.cfg.state_dir.join("auth-refresh").exists());
 }
 
 #[test]

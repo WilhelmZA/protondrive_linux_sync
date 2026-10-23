@@ -2001,6 +2001,66 @@ fn sync_while_signed_out_does_not_change_pair_phase() {
     lab.wait_for_sidecars();
 }
 
+fn headless_account_recovery(auto_sync: bool, keyring_locked: bool) {
+    let lab = Lab::new();
+    if auto_sync {
+        fs::write(
+            lab.path("config.toml"),
+            lab.config_text()
+                .replace("auto_sync = false", "auto_sync = true"),
+        )
+        .unwrap();
+    }
+    lab.remote("unlock.txt", "unlock.txt", "file", "test", "resumed");
+    lab.controls(json!({"keyring_locked": keyring_locked, "signed_in": false}));
+    let server = lab.serve(&[]);
+    wait_for("unavailable account", Duration::from_secs(10), || {
+        let s = server.state();
+        s["state"]["account"]["checked"] == true
+            && s["state"]["account"]["checking"] == false
+            && s["state"]["account"]["keyring_locked"] == keyring_locked
+    });
+    assert_eq!(server.state()["state"]["signed_out"], !keyring_locked);
+    assert!(!lab.local_root().join("unlock.txt").exists());
+    lab.controls(json!({"keyring_locked": false}));
+    // No window, account endpoint, refresh request, or auth signal. The
+    // publisher must discover the session even with auto-sync disabled.
+    wait_for("headless account recovery", Duration::from_secs(27), || {
+        let s = server.state();
+        s["state"]["account"]["signed_in"] == true
+            && s["state"]["account"]["keyring_locked"] == false
+            && s["state"]["signed_out"] == false
+    });
+    if auto_sync {
+        wait_for("sync after unlock", Duration::from_secs(10), || {
+            fs::read_to_string(lab.local_root().join("unlock.txt"))
+                .ok()
+                .as_deref()
+                == Some("resumed")
+        });
+    } else {
+        assert!(!lab.local_root().join("unlock.txt").exists());
+        assert_eq!(server.state()["state"]["watching"], false);
+    }
+    assert_eq!(server.stop().0, 0);
+    lab.wait_for_sidecars();
+}
+
+#[test]
+fn headless_keyring_unlock_refreshes_account_without_a_watcher() {
+    headless_account_recovery(false, true);
+}
+
+#[test]
+fn headless_keyring_unlock_refreshes_account_and_resumes_sync() {
+    headless_account_recovery(true, true);
+}
+
+#[test]
+fn headless_session_recovery_refreshes_account_without_a_watcher() {
+    headless_account_recovery(false, false);
+}
+
 #[test]
 fn settings_put_rejects_negative_numbers_with_field_name() {
     let lab = Lab::new();

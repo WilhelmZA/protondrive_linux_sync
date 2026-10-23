@@ -260,10 +260,13 @@ def scripted_auth(method, params):
     """
     script = os.environ.get("NEUTRONSYNC_FAKE_AUTH", "").strip()
     if method == "auth.status":
-        signed_in = read_json("controls.json", {}).get("signed_in", True)
+        controls = read_json("controls.json", {})
+        time.sleep(controls.get("status_delay", 0))
+        locked = controls.get("keyring_locked", False)
+        signed_in = controls.get("signed_in", True) and not locked
         if script == "signed_out":
             signed_in = False
-        return dict(signed_in=signed_in, account=str(os.getpid()))
+        return dict(signed_in=signed_in, keyring_locked=locked, account=str(os.getpid()))
     if method == "auth.logout":
         controls = read_json("controls.json", {})
         controls["signed_in"] = False

@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +26,8 @@ use crate::watcher;
 const ACTIVITY_CAP: usize = 500;
 /// Settled conflicts kept for the desktop notifier when nothing drains them.
 const SETTLED_CAP: usize = 1000;
+/// Recheck sessions without a window, including when no watcher is enabled.
+const ACCOUNT_REPROBE: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
@@ -554,6 +557,7 @@ pub struct Controller {
     watch_stop: Mutex<Option<Arc<AtomicBool>>>,
     stats: Option<Arc<Stats>>,
     settled: SettledQueue,
+    account_probe_at: Mutex<Option<Instant>>,
 }
 
 impl Controller {
@@ -627,6 +631,7 @@ impl Controller {
             watch_stop: Mutex::new(None),
             stats,
             settled: Arc::new(Mutex::new(Vec::new())),
+            account_probe_at: Mutex::new(None),
         };
         c.refresh_account(false);
         c
@@ -650,6 +655,7 @@ impl Controller {
     /// daemon's work. Best-effort and atomic (write-temp-then-rename); the
     /// activity feed is trimmed to keep the file small.
     pub fn publish_status(&self) {
+        self.poll_account();
         let mut snap = self.snapshot();
         const KEEP: usize = 100;
         if snap.activity.len() > KEEP {
@@ -878,9 +884,31 @@ impl Controller {
     /// background thread. When `signal_watch` is true and the probe confirms a
     /// session, nudge the tray daemon's watcher to resume immediately.
     pub fn refresh_account(&self, signal_watch: bool) {
+        self.start_account_probe(signal_watch, false);
+    }
+
+    /// Backend heartbeat for the tray and server publishers. A watcher probes
+    /// its own session but does not update the controller's account snapshot.
+    /// Keep this independent of window frames, requests, and auto-sync policy.
+    pub fn poll_account(&self) {
+        self.start_account_probe(false, true);
+    }
+
+    fn start_account_probe(&self, signal_watch: bool, only_if_due: bool) {
         let cfg = self.cfg.lock().unwrap().clone();
         let state = self.state.clone();
-        state.lock().unwrap().account.checking = true;
+        {
+            let mut last = self.account_probe_at.lock().unwrap();
+            let mut s = state.lock().unwrap();
+            // Manual requests and both publishers share one in-flight probe.
+            if s.account.checking
+                || (only_if_due && last.is_some_and(|t| t.elapsed() < ACCOUNT_REPROBE))
+            {
+                return;
+            }
+            s.account.checking = true;
+            *last = Some(Instant::now());
+        }
         thread::spawn(move || {
             let result = crate::driveapi::DriveApi::new(&cfg).and_then(|api| api.status());
             let (usable, signed_in, keyring_locked, account, version) = match result {
@@ -896,6 +924,7 @@ impl Controller {
                 Err(error) => (false, false, false, String::new(), error.to_string()),
             };
             let mut s = state.lock().unwrap();
+            let recovered = s.account.checked && !s.account.signed_in && signed_in;
             s.account = AccountState {
                 checked: true,
                 backend_ready: usable,
@@ -910,7 +939,7 @@ impl Controller {
                 s.signed_out = !signed_in && !keyring_locked;
             }
             drop(s);
-            if signal_watch && signed_in {
+            if signed_in && (signal_watch || recovered) {
                 crate::auth_signal::signal(&cfg.state_dir);
             }
         });

@@ -149,7 +149,12 @@ pub fn start(
                 break;
             }
             let r = revisions.clone();
-            let Ok(mut envelope) = tokio::task::spawn_blocking(move || r.current()).await else {
+            let Ok(mut envelope) = tokio::task::spawn_blocking(move || {
+                r.ctrl.poll_account();
+                r.current()
+            })
+            .await
+            else {
                 continue;
             };
             if envelope.rev == sent {

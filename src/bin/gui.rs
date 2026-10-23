@@ -3418,22 +3418,7 @@ impl App {
         };
         if let Some(notes) = notes {
             ui.add_space(10.0);
-            ui.scope(|ui| {
-                ui.set_max_width((ui.available_width() - 15.0).max(200.0));
-                card_frame().show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(
-                        RichText::new("WHAT'S NEW")
-                            .font(FontId::new(11.0, ff_bold()))
-                            .color(pal().accent),
-                    );
-                    ui.add_space(6.0);
-                    egui::ScrollArea::vertical()
-                        .id_salt("release_notes")
-                        .max_height(260.0)
-                        .show(ui, |ui| release_notes(ui, &notes));
-                });
-            });
+            release_notes_card(ui, &notes);
         }
 
         // Decide the follow-up action without holding the lock across the UI.
@@ -4175,6 +4160,23 @@ fn spawn_update_install(
             Err(e) => UpdateState::Failed(format!("{e}")),
         };
         ctx.request_repaint();
+    });
+}
+
+/// Let the About page scroll the entire card, including long release notes.
+fn release_notes_card(ui: &mut egui::Ui, notes: &str) {
+    ui.scope(|ui| {
+        ui.set_max_width((ui.available_width() - 15.0).max(200.0));
+        card_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new("WHAT'S NEW")
+                    .font(FontId::new(11.0, ff_bold()))
+                    .color(pal().accent),
+            );
+            ui.add_space(6.0);
+            release_notes(ui, notes);
+        });
     });
 }
 
@@ -6175,6 +6177,39 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{paint_state_dot, plain_markdown, speed_limit_label, Color32, DARK};
+    use eframe::egui;
+
+    #[test]
+    fn release_notes_expand_within_the_about_page_scroll_area() {
+        let ctx = egui::Context::default();
+        super::install_fonts(&ctx);
+        let notes = format!(
+            "## Next release\n### Fixed\n{}",
+            "- A release note.\n".repeat(40)
+        );
+        let mut card_rect = egui::Rect::NOTHING;
+        let mut action_rect = egui::Rect::NOTHING;
+        let mut content_height = 0.0;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_max_size(egui::vec2(700.0, 400.0));
+            let page = egui::ScrollArea::vertical()
+                .id_salt("about_page")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    // Earlier About sections leave little room at the viewport bottom.
+                    ui.add_space(280.0);
+                    card_rect = ui
+                        .scope(|ui| super::release_notes_card(ui, &notes))
+                        .response
+                        .rect;
+                    action_rect = ui.button("Open release page").rect;
+                });
+            content_height = page.content_size.y;
+        });
+        assert!(card_rect.height() > 400.0, "{card_rect:?}");
+        assert!(action_rect.top() >= card_rect.bottom());
+        assert!(content_height >= card_rect.height() + action_rect.height());
+    }
 
     #[test]
     fn state_dot_sits_in_the_lower_right_quarter_with_a_dark_outline() {
