@@ -201,6 +201,23 @@ awk -v v="$ver" '
 	{ print }
 ' clients/typescript/package.json >clients/typescript/package.json.new && mv clients/typescript/package.json.new clients/typescript/package.json
 
+# Keep generated metadata aligned with the version before committing the tag.
+python3 - "$ver" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+version = sys.argv[1]
+spec = Path("docs/openapi.json")
+text = spec.read_text()
+old = json.loads(text)["info"]["version"]
+spec.write_text(text.replace(f'"version": "{old}"', f'"version": "{version}"', 1))
+lock = Path("clients/typescript/package-lock.json")
+text = lock.read_text()
+old = json.loads(text)["version"]
+lock.write_text(text.replace(f'"version": "{old}"', f'"version": "{version}"', 2))
+PY
+
 grep -q "^__version__ = \"$ver\"$" web/src/neutronsync_web/__init__.py &&
 	grep -q "^version = \"$ver\"$" web/pyproject.toml &&
 	grep -q "^version = \"$ver\"$" clients/python/pyproject.toml &&
@@ -236,7 +253,7 @@ else
 fi
 printf '%s\n' "$notes" >>"$msg"
 
-git add -A -- Cargo.toml Cargo.lock CHANGELOG.md web/pyproject.toml web/uv.lock web/src/neutronsync_web/__init__.py clients/python/pyproject.toml clients/python/uv.lock clients/typescript/package.json sidecar/src/build-version.ts
+git add -A -- Cargo.toml Cargo.lock CHANGELOG.md web/pyproject.toml web/uv.lock web/src/neutronsync_web/__init__.py clients/python/pyproject.toml clients/python/uv.lock clients/typescript/package.json clients/typescript/package-lock.json docs/openapi.json sidecar/src/build-version.ts
 
 if [ -n "$subject" ]; then
 	git commit -q -F "$msg"
