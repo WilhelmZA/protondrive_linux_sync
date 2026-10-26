@@ -19,6 +19,12 @@ ignore = [
     # the timing side channel on RSA decryption cannot leak anything. No fixed
     # rsa release exists.
     { id = "RUSTSEC-2023-0071", reason = "pgp pulls in rsa, but NeutronSync never performs an RSA private-key operation" },
+    # neutronsync -> pgp -> elliptic-curve 0.13 / cx448 -> crypto-bigint 0.5.
+    # The updater only verifies ed25519 signatures with an embedded public key;
+    # no secret-integer operation ever runs, so a timing leak in 0.5 cannot
+    # disclose a NeutronSync secret. Patch is >=0.7.6; pgp 0.21 (latest) still
+    # pins the 0.5 line, so no compatible update exists.
+    { id = "RUSTSEC-2026-0387", reason = "pgp pulls in crypto-bigint 0.5 via elliptic-curve 0.13; NeutronSync only verifies ed25519 with a public key" },
     # neutronsync -> eframe -> winit -> smithay-client-toolkit -> wayland-scanner
     # (proc-macro) -> quick-xml. Runs at compile time over the Wayland protocol
     # XML files bundled in the crate, never over input from outside the build.

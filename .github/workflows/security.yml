@@ -75,6 +75,7 @@ jobs:
           tags: neutronsync:security
           build-args: |
             NEUTRONSYNC_BUILD_SHA=${{ github.sha }}
+            APT_REFRESH=${{ github.run_id }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

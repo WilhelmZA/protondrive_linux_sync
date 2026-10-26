@@ -76,7 +76,13 @@ LABEL org.opencontainers.image.title="NeutronSync" \
 # Apply Debian security updates the base image does not carry yet, then
 # ca-certificates, tzdata, gio (libglib2.0-bin), xz-utils only long enough to
 # unpack s6-overlay; purge xz-utils afterwards so it is not in the final image.
-RUN apt-get update && apt-get upgrade -y --no-install-recommends \
+# APT_REFRESH is unused except as a cache key: weekly Security and Release
+# pass github.run_id so a GHA cache hit cannot freeze this layer across a
+# Debian DSA (CVE-2026-84782 sat in cache as 3.0.22-1~deb12u1 after the
+# bookworm-security fix). Local builds leave it empty and keep the layer.
+ARG APT_REFRESH=
+RUN : "${APT_REFRESH}" \
+	&& apt-get update && apt-get upgrade -y --no-install-recommends \
 	&& apt-get install -y --no-install-recommends \
 	ca-certificates tzdata libglib2.0-bin xz-utils curl \
 	&& curl -fsSL -o /tmp/s6-overlay-noarch.tar.xz \

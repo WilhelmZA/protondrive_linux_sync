@@ -314,6 +314,7 @@ jobs:
           build-args: |
             NEUTRONSYNC_BUILD_SHA=${{ steps.meta.outputs.sha_short }}
             VERSION=${{ steps.meta.outputs.version }}
+            APT_REFRESH=${{ github.run_id }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -340,6 +341,7 @@ jobs:
           build-args: |
             NEUTRONSYNC_BUILD_SHA=${{ steps.meta.outputs.sha_short }}
             VERSION=${{ steps.meta.outputs.version }}
+            APT_REFRESH=${{ github.run_id }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: true
