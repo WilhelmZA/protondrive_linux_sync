@@ -229,6 +229,15 @@ cat >sidecar/src/build-version.ts <<EOF
 export const neutronsyncDriveVersion = '${ver}-dev';
 EOF
 
+# The Unraid Community Apps listing shows packaging/unraid/README.md, and both
+# READMEs name a version tag as the pinning example. Keep it on this release.
+sed -i "s#\\(ghcr\\.io/wilhelmza/neutronsync:\\)[0-9][0-9A-Za-z.-]*#\\1$ver#" packaging/unraid/README.md
+sed -i "s#\\(version tag such as \`:\\)[0-9][0-9A-Za-z.-]*#\\1$ver#" README.md
+
+grep -qF "ghcr.io/wilhelmza/neutronsync:$ver\`" packaging/unraid/README.md &&
+	grep -qF "version tag such as \`:$ver\`" README.md ||
+	die "failed to update the version pinning example in the READMEs; check it by hand"
+
 # ---------------------------------------------------------------- changelog
 
 awk -v v="$ver" -v d="$today" '
@@ -253,7 +262,7 @@ else
 fi
 printf '%s\n' "$notes" >>"$msg"
 
-git add -A -- Cargo.toml Cargo.lock CHANGELOG.md web/pyproject.toml web/uv.lock web/src/neutronsync_web/__init__.py clients/python/pyproject.toml clients/python/uv.lock clients/typescript/package.json clients/typescript/package-lock.json docs/openapi.json sidecar/src/build-version.ts
+git add -A -- Cargo.toml Cargo.lock CHANGELOG.md web/pyproject.toml web/uv.lock web/src/neutronsync_web/__init__.py clients/python/pyproject.toml clients/python/uv.lock clients/typescript/package.json clients/typescript/package-lock.json docs/openapi.json sidecar/src/build-version.ts README.md packaging/unraid/README.md
 
 if [ -n "$subject" ]; then
 	git commit -q -F "$msg"
