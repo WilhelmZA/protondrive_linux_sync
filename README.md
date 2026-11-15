@@ -312,7 +312,7 @@ Set `NEUTRONSYNC_WEB_AUTH=proxy` and terminate TLS/login at Traefik or Caddy. In
 
 Every release tag builds and signs `ghcr.io/wilhelmza/neutronsync:<version>` and `:edge`. Promoting a release to stable moves `:latest` to that version. Unraid follows `latest`, so it picks up promoted releases only.
 
-To follow every pre-release instead, set the Unraid **Repository** field (or the compose `image:`) to `ghcr.io/wilhelmza/neutronsync:edge`, or to a version tag such as `:0.9.2` to stay on one.
+To follow every pre-release instead, set the Unraid **Repository** field (or the compose `image:`) to `ghcr.io/wilhelmza/neutronsync:edge`, or to a version tag such as `:0.10.0` to stay on one.
 
 ## Updates
 

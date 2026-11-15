@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-15
+
 ### Security
 - Upgrade bundled SQLite through rusqlite 0.41 to fix CVE-2026-119375 (RUSTSEC-2026-0459).
 

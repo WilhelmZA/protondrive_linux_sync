@@ -45,4 +45,4 @@ With `local_delete = "trash"` (the default), a local file removed because it was
 
 Unraid follows the `latest` tag. That tag moves when a release is promoted to stable (`scripts/promote.sh`), not when a pre-release is published.
 
-To follow every pre-release, change **Repository** to `ghcr.io/wilhelmza/neutronsync:edge`; to stay on one version, use a version tag such as `ghcr.io/wilhelmza/neutronsync:0.9.2`.
+To follow every pre-release, change **Repository** to `ghcr.io/wilhelmza/neutronsync:edge`; to stay on one version, use a version tag such as `ghcr.io/wilhelmza/neutronsync:0.10.0`.
