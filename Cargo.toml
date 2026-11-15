@@ -35,7 +35,7 @@ eframe = { version = "0.35", optional = true }
 egui-phosphor = { version = "0.13", optional = true, default-features = false, features = ["regular"] }
 rfd = { version = "0.17.2", optional = true }
 notify-debouncer-full = "0.7.0"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 winit = { version = "0.30", optional = true }
 # Without the default `libxdo` feature: it only serves muda's predefined
 # copy/paste items, which the tray menu does not use, and it ties the GUI to

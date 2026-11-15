@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Security
+- Upgrade bundled SQLite through rusqlite 0.41 to fix CVE-2026-119375 (RUSTSEC-2026-0459).
+
+### Fixed
+- Replace the yanked async-executor 1.14.0 dependency to restore the CI dependency check.
+
 ## [0.9.2] - 2026-10-23
 
 ### Fixed
